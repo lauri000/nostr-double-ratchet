@@ -24,6 +24,7 @@ import {
 } from "./utils"
 import { decryptInviteResponse, createSessionFromAccept } from "./inviteUtils"
 import { getEventHash } from "nostr-tools"
+import { MessageQueue } from "./MessageQueue"
 
 export type OnEventCallback = (event: Rumor, from: string) => void
 
@@ -87,7 +88,8 @@ export class SessionManager {
 
   // Data
   private userRecords: Map<string, UserRecord> = new Map()
-  private messageHistory: Map<string, Rumor[]> = new Map()
+  private outbox: MessageQueue<Rumor>
+  private outboxProcessing: boolean = false
   // Map delegate device pubkeys to their owner's pubkey
   private delegateToOwner: Map<string, string> = new Map()
   // Track processed InviteResponse event IDs to prevent replay
@@ -217,6 +219,12 @@ export class SessionManager {
     this.inviteKeys = inviteKeys
     this.storage = storage || new InMemoryStorageAdapter()
     this.versionPrefix = `v${this.storageVersion}`
+
+    this.outbox = new MessageQueue<Rumor>({
+      storage: this.storage,
+      queueKey: "outbox",
+      keyPrefix: this.versionPrefix + "/queue",
+    })
   }
 
   async init() {
@@ -246,6 +254,13 @@ export class SessionManager {
     // Setup sessions with our own other devices
     // Use ownerPublicKey to find sibling devices (important for delegates)
     this.setupUser(this.ownerPublicKey)
+
+    // Expand templates for any known devices on startup
+    const known = this.userRecords.get(this.ownerPublicKey)?.knownDeviceIdentities || []
+    if (known.length > 0) {
+      this.outbox.expandGroup(this.ownerPublicKey, known).catch(() => {})
+      this.processOutbox().catch(() => {})
+    }
   }
 
   /**
@@ -327,6 +342,9 @@ export class SessionManager {
 
           this.attachSessionSubscription(ownerPubkey, deviceRecord, session, true)
           this.storeUserRecord(ownerPubkey).catch(() => {})
+          // Expand queued templates for this owner/device and process outbox
+          this.outbox.expandGroup(ownerPubkey, [deviceRecord.deviceId]).catch(() => {})
+          this.processOutbox().catch(() => {})
         } catch {
         }
       }
@@ -501,6 +519,13 @@ export class SessionManager {
           const list = AppKeys.fromEvent(event)
           // Update delegate mapping whenever we receive an AppKeys
           this.updateDelegateMapping(pubkey, list)
+          // Expand queued templates for this user with current devices
+          const targets = list
+            .getAllDevices()
+            .map(d => d.identityPubkey)
+            .filter(id => id !== this.deviceId)
+          this.outbox.expandGroup(pubkey, targets).catch(() => {})
+          this.processOutbox().catch(() => {})
           onAppKeys(list)
         } catch {
           // Invalid event, ignore
@@ -650,7 +675,10 @@ export class SessionManager {
         .then(() => {
           this.attachSessionSubscription(userPubkey, deviceRecord, session)
         })
-        .then(() => this.sendMessageHistory(userPubkey, device.identityPubkey))
+        .then(() => {
+          this.outbox.expandGroup(userPubkey, [device.identityPubkey]).catch(() => {})
+          this.processOutbox().catch(() => {})
+        })
         .catch(() => {})
     }
 
@@ -731,6 +759,8 @@ export class SessionManager {
       for (const device of devices) {
         subscribeToDeviceInvite(device)
       }
+      // Process any now-sendable outbox items
+      this.processOutbox().catch(() => {})
     })
   }
 
@@ -854,8 +884,6 @@ export class SessionManager {
       this.inviteSubscriptions.delete(appKeysKey)
     }
 
-    this.messageHistory.delete(userPubkey)
-
     await Promise.allSettled([
       this.deleteUserSessionsFromStorage(userPubkey),
       this.storage.del(this.userRecordKey(userPubkey)),
@@ -881,28 +909,50 @@ export class SessionManager {
     await Promise.all(keys.map((key) => this.storage.del(key)))
   }
 
-  private async sendMessageHistory(
-    recipientPublicKey: string,
-    deviceId: string
-  ): Promise<void> {
-    const history = this.messageHistory.get(recipientPublicKey) || []
-    const userRecord = this.userRecords.get(recipientPublicKey)
-    if (!userRecord) {
-      return
-    }
-    const device = userRecord.devices.get(deviceId)
-    if (!device) {
-      return
-    }
-    for (const event of history) {
-      const { activeSession } = device
+  // Outbox processor: take one item, send via its device session, ack/fail, repeat
+  private async processOutbox(): Promise<void> {
+    if (this.outboxProcessing) return
+    this.outboxProcessing = true
+    try {
+      while (true) {
+        const item = await this.outbox.reserveNext()
+        if (!item) break
 
-      if (!activeSession) {
-        continue
+        const target = item.target
+        if (!target) {
+          await this.outbox.ack(item.id)
+          continue
+        }
+
+        const owner = this.resolveToOwner(target)
+        const userRecord = this.userRecords.get(owner)
+
+        // If device is not authorized anymore, drop item (skip check for single-device owner===target)
+        if (owner !== target && !this.isDeviceAuthorized(owner, target)) {
+          await this.outbox.ack(item.id)
+          continue
+        }
+
+        const device = userRecord?.devices.get(target)
+        const session = device?.activeSession
+        if (!session) {
+          // Ensure setup and retry shortly
+          this.setupUser(owner)
+          await this.outbox.fail(item.id, { nextAvailableAt: Date.now() + 500 })
+          continue
+        }
+
+        try {
+          const { event: verifiedEvent } = session.sendEvent(item.payload)
+          await this.storeUserRecord(owner).catch(() => {})
+          await this.nostrPublish(verifiedEvent)
+          await this.outbox.ack(item.id)
+        } catch {
+          await this.outbox.fail(item.id, { nextAvailableAt: Date.now() + 1000 })
+        }
       }
-      const { event: verifiedEvent } = activeSession.sendEvent(event)
-      await this.nostrPublish(verifiedEvent)
-      await this.storeUserRecord(recipientPublicKey)
+    } finally {
+      this.outboxProcessing = false
     }
   }
 
@@ -912,69 +962,31 @@ export class SessionManager {
   ): Promise<Rumor | undefined> {
     await this.init()
 
-    // Add to message history queue (will be sent when session is established)
     const completeEvent = event as Rumor
-    // Use ownerPublicKey for history targets so delegates share history with owner
-    const historyTargets = new Set([recipientIdentityKey, this.ownerPublicKey])
-    for (const key of historyTargets) {
-      const existing = this.messageHistory.get(key) || []
-      this.messageHistory.set(key, [...existing, completeEvent])
-    }
 
-    const userRecord = this.getOrCreateUserRecord(recipientIdentityKey)
-    // Use ownerPublicKey to find sibling devices (important for delegates)
-    const ourUserRecord = this.getOrCreateUserRecord(this.ownerPublicKey)
-
+    // Ensure we are subscribed to both recipient and our own device group
     this.setupUser(recipientIdentityKey)
-    // Use ownerPublicKey to setup sessions with sibling devices
     this.setupUser(this.ownerPublicKey)
 
-    const recipientDevices = Array.from(userRecord.devices.values())
-    const ownDevices = Array.from(ourUserRecord.devices.values())
+    // Persist immediately as templates for both recipient and our sender copies
+    await Promise.allSettled([
+      this.outbox.enqueueForGroup(completeEvent, recipientIdentityKey),
+      this.outbox.enqueueForGroup(completeEvent, this.ownerPublicKey),
+    ])
 
-    // Merge and deduplicate by deviceId, excluding our own sending device
-    // This fixes the self-message bug where sending to yourself would duplicate devices
-    const deviceMap = new Map<string, DeviceRecord>()
-    for (const d of [...recipientDevices, ...ownDevices]) {
-      if (d.deviceId !== this.deviceId) {  // Exclude sender's own device
-        deviceMap.set(d.deviceId, d)
-      }
+    // Expand with any currently known devices (device records), excluding our own sending device
+    const recipientDevices = Array.from(this.userRecords.get(recipientIdentityKey)?.devices.keys() || [])
+    const ourDevices = Array.from(this.userRecords.get(this.ownerPublicKey)?.devices.keys() || [])
+    const knownTargets = Array.from(new Set([...recipientDevices, ...ourDevices].filter(d => d !== this.deviceId)))
+    if (knownTargets.length > 0) {
+      // Expand both groups using the same known target set; duplicates are filtered by expandGroup
+      await Promise.allSettled([
+        this.outbox.expandGroup(recipientIdentityKey, knownTargets),
+        this.outbox.expandGroup(this.ownerPublicKey, knownTargets),
+      ])
     }
-    const devices = Array.from(deviceMap.values())
+    this.processOutbox().catch(() => {})
 
-    // Ratchet all sessions synchronously first, then persist state BEFORE network I/O.
-    //
-    // This is important for apps that "fire and forget" sendEvent() (e.g. UI click handlers):
-    // if the page reloads/crashes while publishes are still in-flight, we still want the
-    // updated session keys to be on disk so the next incoming message can be decrypted.
-    const toPublish: Parameters<NostrPublish>[0][] = []
-    for (const device of devices) {
-      const { activeSession } = device
-      if (!activeSession) continue
-
-      // Check if device is still authorized
-      const deviceOwner = this.resolveToOwner(device.deviceId)
-      if (deviceOwner !== device.deviceId && !this.isDeviceAuthorized(deviceOwner, device.deviceId)) {
-        continue
-      }
-
-      try {
-        const { event: verifiedEvent } = activeSession.sendEvent(event)
-        toPublish.push(verifiedEvent)
-      } catch {
-        // Ignore send errors for a single device.
-      }
-    }
-
-    // Persist recipient + owner records before publishing (best-effort).
-    await this.storeUserRecord(recipientIdentityKey).catch(() => {})
-    if (this.ownerPublicKey !== recipientIdentityKey) {
-      await this.storeUserRecord(this.ownerPublicKey).catch(() => {})
-    }
-
-    await Promise.allSettled(toPublish.map((evt) => this.nostrPublish(evt).catch(() => {})))
-
-    // Return the event with computed ID (same as library would compute)
     return completeEvent
   }
 
