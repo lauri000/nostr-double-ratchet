@@ -229,20 +229,13 @@ export class MessageQueue<T> {
 
   private async delItem(id: string): Promise<void> {
     const keys = await this.listItemKeys()
-    const match = keys.find(async (k) => {
-      const it = await this.storage.get<QueueItem<T>>(k)
-      return it?.id === id
-    })
-    // The above uses async inside find; replace with explicit loop for correctness
-    let keyToDelete: string | undefined
     for (const k of keys) {
       const it = await this.storage.get<QueueItem<T>>(k)
       if (it?.id === id) {
-        keyToDelete = k
-        break
+        await this.storage.del(k)
+        return
       }
     }
-    if (keyToDelete) await this.storage.del(keyToDelete)
   }
 
   private isAvailableToLock(item: QueueItem<T>, now: number): boolean {

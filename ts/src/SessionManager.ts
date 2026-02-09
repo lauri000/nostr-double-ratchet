@@ -90,6 +90,7 @@ export class SessionManager {
   private userRecords: Map<string, UserRecord> = new Map()
   private outbox: MessageQueue<Rumor>
   private outboxProcessing: boolean = false
+  private outboxRetryTimer: ReturnType<typeof setTimeout> | null = null
   // Map delegate device pubkeys to their owner's pubkey
   private delegateToOwner: Map<string, string> = new Map()
   // Track processed InviteResponse event IDs to prevent replay
@@ -508,6 +509,7 @@ export class SessionManager {
     pubkey: string,
     onAppKeys: (list: AppKeys) => void
   ): Unsubscribe {
+    let latestCreatedAt = 0
     return this.nostrSubscribe(
       {
         kinds: [APP_KEYS_EVENT_KIND],
@@ -516,6 +518,11 @@ export class SessionManager {
       },
       (event) => {
         try {
+          // Only process events at least as new as the latest we've seen
+          // (protects against out-of-order delivery or stale replays)
+          if (event.created_at < latestCreatedAt) return
+          latestCreatedAt = event.created_at
+
           const list = AppKeys.fromEvent(event)
           // Update delegate mapping whenever we receive an AppKeys
           this.updateDelegateMapping(pubkey, list)
@@ -736,7 +743,6 @@ export class SessionManager {
     this.attachAppKeysSubscription(userPubkey, async (appKeys) => {
       const devices = appKeys.getAllDevices()
       const activeDeviceIds = new Set(devices.map(d => d.identityPubkey))
-
       // Handle devices no longer in list (revoked or AppKeys recreated from scratch)
       const userRecord = this.userRecords.get(userPubkey)
       if (userRecord) {
@@ -831,6 +837,11 @@ export class SessionManager {
   }
 
   close() {
+    if (this.outboxRetryTimer) {
+      clearTimeout(this.outboxRetryTimer)
+      this.outboxRetryTimer = null
+    }
+
     for (const unsubscribe of this.inviteSubscriptions.values()) {
       unsubscribe()
     }
@@ -909,6 +920,31 @@ export class SessionManager {
     await Promise.all(keys.map((key) => this.storage.del(key)))
   }
 
+  /**
+   * Find a device record across all user records by target device ID.
+   * Returns the owner pubkey, device record, and active session if available.
+   * Always returns the correct owner even if no active session exists yet.
+   */
+  private findDeviceForTarget(target: string): { owner: string; device?: DeviceRecord; session?: Session } | undefined {
+    // Try resolveToOwner first (fast path)
+    const resolvedOwner = this.resolveToOwner(target)
+    const directRecord = this.userRecords.get(resolvedOwner)
+    const directDevice = directRecord?.devices.get(target)
+    if (directDevice) {
+      return { owner: resolvedOwner, device: directDevice, session: directDevice.activeSession }
+    }
+
+    // Fallback: scan all user records (handles case where delegateToOwner isn't populated yet)
+    for (const [pubkey, record] of this.userRecords) {
+      const device = record.devices.get(target)
+      if (device) {
+        return { owner: pubkey, device, session: device.activeSession }
+      }
+    }
+
+    return undefined
+  }
+
   // Outbox processor: take one item, send via its device session, ack/fail, repeat
   private async processOutbox(): Promise<void> {
     if (this.outboxProcessing) return
@@ -924,21 +960,20 @@ export class SessionManager {
           continue
         }
 
-        const owner = this.resolveToOwner(target)
-        const userRecord = this.userRecords.get(owner)
+        const found = this.findDeviceForTarget(target)
+        const owner = found?.owner ?? this.resolveToOwner(target)
+        const session = found?.session
+
+        if (!session) {
+          // Ensure setup with correct owner and retry shortly
+          this.setupUser(owner)
+          await this.outbox.fail(item.id, { nextAvailableAt: Date.now() + 200 })
+          continue
+        }
 
         // If device is not authorized anymore, drop item (skip check for single-device owner===target)
         if (owner !== target && !this.isDeviceAuthorized(owner, target)) {
           await this.outbox.ack(item.id)
-          continue
-        }
-
-        const device = userRecord?.devices.get(target)
-        const session = device?.activeSession
-        if (!session) {
-          // Ensure setup and retry shortly
-          this.setupUser(owner)
-          await this.outbox.fail(item.id, { nextAvailableAt: Date.now() + 500 })
           continue
         }
 
@@ -953,6 +988,20 @@ export class SessionManager {
       }
     } finally {
       this.outboxProcessing = false
+    }
+
+    // Schedule retry for items still in backoff
+    this.scheduleOutboxRetry()
+  }
+
+  private async scheduleOutboxRetry(): Promise<void> {
+    const remaining = await this.outbox.size()
+    if (remaining > 0) {
+      if (this.outboxRetryTimer) clearTimeout(this.outboxRetryTimer)
+      this.outboxRetryTimer = setTimeout(() => {
+        this.outboxRetryTimer = null
+        this.processOutbox().catch(() => {})
+      }, 300)
     }
   }
 
@@ -974,16 +1023,21 @@ export class SessionManager {
       this.outbox.enqueueForGroup(completeEvent, this.ownerPublicKey),
     ])
 
-    // Expand with any currently known devices (device records), excluding our own sending device
-    const recipientDevices = Array.from(this.userRecords.get(recipientIdentityKey)?.devices.keys() || [])
-    const ourDevices = Array.from(this.userRecords.get(this.ownerPublicKey)?.devices.keys() || [])
-    const knownTargets = Array.from(new Set([...recipientDevices, ...ourDevices].filter(d => d !== this.deviceId)))
-    if (knownTargets.length > 0) {
-      // Expand both groups using the same known target set; duplicates are filtered by expandGroup
-      await Promise.allSettled([
-        this.outbox.expandGroup(recipientIdentityKey, knownTargets),
-        this.outbox.expandGroup(this.ownerPublicKey, knownTargets),
-      ])
+    // Expand each group with only its relevant devices (excluding our own sending device)
+    const recipientDeviceIds = Array.from(this.userRecords.get(recipientIdentityKey)?.devices.keys() || [])
+      .filter(d => d !== this.deviceId)
+    const ourDeviceIds = Array.from(this.userRecords.get(this.ownerPublicKey)?.devices.keys() || [])
+      .filter(d => d !== this.deviceId)
+
+    const expandPromises: Promise<unknown>[] = []
+    if (recipientDeviceIds.length > 0) {
+      expandPromises.push(this.outbox.expandGroup(recipientIdentityKey, recipientDeviceIds))
+    }
+    if (ourDeviceIds.length > 0) {
+      expandPromises.push(this.outbox.expandGroup(this.ownerPublicKey, ourDeviceIds))
+    }
+    if (expandPromises.length > 0) {
+      await Promise.allSettled(expandPromises)
     }
     this.processOutbox().catch(() => {})
 

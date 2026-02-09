@@ -121,21 +121,18 @@ export class ControlledMockRelay {
 
     // Handle replaceable events (kinds 10000-19999) and parameterized replaceable events (30000-39999)
     // Keep only latest per pubkey + kind + d-tag
-    const isReplaceable = (event.kind >= 10000 && event.kind < 20000) ||
-                          (event.kind >= 30000 && event.kind < 40000)
+    const isReplaceable = (verifiedEvent.kind >= 10000 && verifiedEvent.kind < 20000) ||
+                          (verifiedEvent.kind >= 30000 && verifiedEvent.kind < 40000)
     if (isReplaceable) {
-      const dTag = event.tags?.find((t) => t[0] === "d")?.[1]
+      const dTag = verifiedEvent.tags?.find((t) => t[0] === "d")?.[1]
       this.deliveredEvents = this.deliveredEvents.filter((e) => {
-        if (e.kind !== event.kind || e.pubkey !== event.pubkey) return true
+        if (e.kind !== verifiedEvent.kind || e.pubkey !== verifiedEvent.pubkey) return true
         const existingDTag = e.tags?.find((t: string[]) => t[0] === "d")?.[1]
         return existingDTag !== dTag
       })
     }
 
     this.deliveredEvents.push(verifiedEvent)
-    const activeSubs = Array.from(this.subscriptions.values()).filter(s => !s.closed)
-    const subFilters = activeSubs.map(s => s.filters.map(f => f.authors?.map(a => a.slice(0, 8)).join(',') || 'none').join(';')).join(' | ')
-    console.warn(`[ControlledMockRelay] Event (pubkey=${verifiedEvent.pubkey?.slice(0, 8)}) published, ${activeSubs.length} subs: [${subFilters}]`)
 
     for (const sub of this.subscriptions.values()) {
       if (!sub.closed) {
@@ -380,8 +377,6 @@ export class ControlledMockRelay {
     // Check if event matches any of the subscription's filters
     const matches = sub.filters.some((filter) => matchFilter(filter, event))
     if (!matches) {
-      const filterInfo = sub.filters.map(f => `authors:${f.authors?.map(a => a.slice(0, 8)).join(',') || 'none'}, kinds:${f.kinds?.join(',') || 'any'}`).join('; ')
-      console.warn(`[ControlledMockRelay] Event (pubkey=${event.pubkey?.slice(0, 8)}, kind=${event.kind}) doesn't match ${sub.id} (${filterInfo})`)
       return
     }
 
@@ -394,7 +389,6 @@ export class ControlledMockRelay {
       filters: sub.filters,
     })
 
-    console.warn(`[ControlledMockRelay] Event (pubkey=${event.pubkey?.slice(0, 8)}, kind=${event.kind}) DELIVERED to ${sub.id}`)
     sub.onEvent(event)
   }
 
@@ -450,8 +444,6 @@ export class ControlledMockRelay {
         .filter(s => !s.closed && !replayedTo.has(s.id))
 
       if (newSubs.length === 0) break
-
-      console.warn(`[ControlledMockRelay] replayWithCascade: iteration ${iteration}, replaying to ${newSubs.length} new sub(s): ${newSubs.map(s => s.id).join(', ')}`)
 
       for (const sub of newSubs) {
         replayedTo.add(sub.id)

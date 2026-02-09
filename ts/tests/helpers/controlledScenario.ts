@@ -380,14 +380,16 @@ async function sendMessage(
   // Send the message (with auto-deliver mode in sessionManager, it delivers immediately)
   await senderDevice.manager.sendMessage(recipientActor.publicKey, message)
 
-  // Small delay to allow async publishing to complete
-  await new Promise(r => setTimeout(r, 0))
+  // Allow async outbox processing to complete (multiple microtask rounds + timers)
+  const eventCountBefore = context.relay.getAllEvents().length
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 10))
+    if (context.relay.getAllEvents().length > eventCountBefore) break
+  }
 
   // Find the event ID of what we just sent (most recent event)
   const allEvents = context.relay.getAllEvents()
   const sentEvent = allEvents[allEvents.length - 1]
-
-  console.log(`[sendMessage] sent "${message.slice(0,30)}" ref=${ref} eventCount=${allEvents.length} lastEvent=${sentEvent?.id?.slice(0,8)}`)
 
   if (sentEvent && ref) {
     context.eventRefs.set(ref, sentEvent.id)
@@ -582,9 +584,7 @@ function waitForMessage(
 ): Promise<void> {
   const { existingOk } = options
   const currentCount = device.messageCounts.get(message) ?? 0
-  console.log(`[waitForMessage] device=${device.deviceId} message="${message.slice(0,30)}" currentCount=${currentCount} existingOk=${existingOk}`)
   if (existingOk && currentCount > 0) {
-    console.log(`[waitForMessage] immediately resolved (already exists)`)
     return Promise.resolve()
   }
 
