@@ -125,6 +125,23 @@ export interface ReactionPayload {
   emoji: string;
 }
 
+export interface DeviceDeliveryInfo {
+  deviceId: string;
+  sent: boolean;
+  sentAt?: number;
+}
+
+export interface MessageDeliveryStatus {
+  messageId: string;
+  isComplete: boolean;
+  devices: DeviceDeliveryInfo[];
+}
+
+export type DeliveryStatusChangeEvent = {
+  messageId: string;
+  status: MessageDeliveryStatus;
+}
+
 export type ReceiptType = "delivered" | "seen";
 
 export interface ReceiptPayload {

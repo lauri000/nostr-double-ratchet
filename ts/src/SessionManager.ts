@@ -10,6 +10,8 @@ import {
   TYPING_KIND,
   ReceiptType,
   ExpirationOptions,
+  MessageDeliveryStatus,
+  DeliveryStatusChangeEvent,
 } from "./types"
 import { StorageAdapter, InMemoryStorageAdapter } from "./StorageAdapter"
 import { AppKeys, DeviceEntry } from "./AppKeys"
@@ -97,6 +99,8 @@ export class SessionManager {
   private processedInviteResponses: Set<string> = new Set()
   // Cached AppKeys for authorization checks
   private cachedAppKeys: Map<string, AppKeys> = new Map()
+  // Delivery status tracking
+  private deliveryStatusListeners: Set<(event: DeliveryStatusChangeEvent) => void> = new Set()
 
   // Expiration defaults (persisted)
   private defaultExpiration: ExpirationOptions | undefined
@@ -836,6 +840,60 @@ export class SessionManager {
     await this.storage.put(this.expirationGroupKey(groupId), options).catch(() => {})
   }
 
+  // --- Delivery Status API ---
+
+  private deliveryStatusKey(messageId: string): string {
+    return `${this.versionPrefix}/delivery-status/${messageId}`
+  }
+
+  private deliveryStatusPrefix(): string {
+    return `${this.versionPrefix}/delivery-status/`
+  }
+
+  private async saveDeliveryStatus(status: MessageDeliveryStatus): Promise<void> {
+    await this.storage.put(this.deliveryStatusKey(status.messageId), status)
+    const event: DeliveryStatusChangeEvent = { messageId: status.messageId, status }
+    for (const listener of this.deliveryStatusListeners) {
+      try { listener(event) } catch { /* ignore */ }
+    }
+  }
+
+  private async initDeliveryStatus(messageId: string, deviceIds: string[]): Promise<void> {
+    const status: MessageDeliveryStatus = {
+      messageId,
+      isComplete: deviceIds.length === 0,
+      devices: deviceIds.map(deviceId => ({ deviceId, sent: false })),
+    }
+    await this.saveDeliveryStatus(status)
+  }
+
+  private async markDeviceDelivered(messageId: string, deviceId: string): Promise<void> {
+    const status = await this.storage.get<MessageDeliveryStatus>(this.deliveryStatusKey(messageId))
+    if (!status) return
+    const device = status.devices.find(d => d.deviceId === deviceId)
+    if (device && !device.sent) {
+      device.sent = true
+      device.sentAt = Date.now()
+      status.isComplete = status.devices.every(d => d.sent)
+      await this.saveDeliveryStatus(status)
+    }
+  }
+
+  async getDeliveryStatus(messageId: string): Promise<MessageDeliveryStatus | undefined> {
+    return this.storage.get<MessageDeliveryStatus>(this.deliveryStatusKey(messageId))
+  }
+
+  async getAllDeliveryStatuses(): Promise<MessageDeliveryStatus[]> {
+    const keys = await this.storage.list(this.deliveryStatusPrefix())
+    const results = await Promise.all(keys.map(k => this.storage.get<MessageDeliveryStatus>(k)))
+    return results.filter(Boolean) as MessageDeliveryStatus[]
+  }
+
+  onDeliveryStatusChange(callback: (event: DeliveryStatusChangeEvent) => void): Unsubscribe {
+    this.deliveryStatusListeners.add(callback)
+    return () => { this.deliveryStatusListeners.delete(callback) }
+  }
+
   close() {
     if (this.outboxRetryTimer) {
       clearTimeout(this.outboxRetryTimer)
@@ -982,6 +1040,10 @@ export class SessionManager {
           await this.storeUserRecord(owner).catch(() => {})
           await this.nostrPublish(verifiedEvent)
           await this.outbox.ack(item.id)
+          // Track delivery
+          if (item.payload?.id && target) {
+            this.markDeviceDelivered(item.payload.id, target).catch(() => {})
+          }
         } catch {
           await this.outbox.fail(item.id, { nextAvailableAt: Date.now() + 1000 })
         }
@@ -1039,6 +1101,13 @@ export class SessionManager {
     if (expandPromises.length > 0) {
       await Promise.allSettled(expandPromises)
     }
+
+    // Initialize delivery tracking
+    const allTargetDevices = [...recipientDeviceIds, ...ourDeviceIds]
+    if (completeEvent.id && allTargetDevices.length > 0) {
+      this.initDeliveryStatus(completeEvent.id, allTargetDevices).catch(() => {})
+    }
+
     this.processOutbox().catch(() => {})
 
     return completeEvent
