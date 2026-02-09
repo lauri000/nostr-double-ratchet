@@ -24,7 +24,7 @@ describe("MessageQueue", () => {
     const r1 = await q.reserveNext()
     expect(r1?.payload).toBe("msgA")
     const r2 = await q.reserveNext()
-    // r1 is still locked (sending), second reserve returns the next available
+    // r1 is already sending, second reserve returns the next pending item
     expect(r2?.payload).toBe("msgB")
 
     // Ack second then first; size should go to 0 after both acks
@@ -79,25 +79,6 @@ describe("MessageQueue", () => {
     const q2 = new MessageQueue<string>({ storage, queueKey: "mq4", now: clock.now })
     const it = await q2.reserveNext()
     expect(it?.payload).toBe("persist me")
-  })
-
-  it("recovers stuck locks after timeout", async () => {
-    const storage = new InMemoryStorageAdapter()
-    const clock = fixedNow()
-    const q = new MessageQueue<string>({ storage, queueKey: "mq5", now: clock.now, lockTimeoutMs: 500 })
-
-    await q.enqueueForTargets("stuck", ["t1"])
-    const reserved = await q.reserveNext()
-    expect(reserved?.status).toBe("sending")
-
-    // Lock is held - should not be available
-    expect(await q.reserveNext()).toBeUndefined()
-
-    // Advance past timeout
-    clock.advance(501)
-    const recovered = await q.reserveNext()
-    expect(recovered?.payload).toBe("stuck")
-    expect(recovered?.id).toBe(reserved!.id)
   })
 
   it("enqueueForTargets creates one item per target", async () => {

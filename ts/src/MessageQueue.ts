@@ -1,6 +1,6 @@
 import { StorageAdapter } from "./StorageAdapter"
 
-export type QueueStatus = "pending" | "sending" | "sent" | "failed"
+export type QueueStatus = "pending" | "sending"
 
 export interface QueueItem<T> {
   id: string
@@ -13,9 +13,6 @@ export interface QueueItem<T> {
   target?: string
   /** Template/grouping key for deferred target expansion (e.g., owner pubkey) */
   targetGroupKey?: string
-  /** Internal lock for reservations */
-  lockId?: string
-  lockedAt?: number
   /** Template items track which targets have already been expanded */
   expandedTargets?: string[]
 }
@@ -28,7 +25,6 @@ export interface EnqueueOptions {
 }
 
 export interface FailOptions {
-  error?: unknown
   /** Set next available time (ms since epoch). If omitted, item becomes available immediately. */
   nextAvailableAt?: number
 }
@@ -42,8 +38,6 @@ export interface MessageQueueOptions {
   keyPrefix?: string
   /** Timestamp provider (ms) */
   now?: () => number
-  /** Lock timeout (ms) to recover stuck reservations */
-  lockTimeoutMs?: number
 }
 
 /**
@@ -55,14 +49,12 @@ export class MessageQueue<T> {
   private readonly queueKey: string
   private readonly prefix: string
   private readonly now: () => number
-  private readonly lockTimeoutMs: number
 
   constructor(opts: MessageQueueOptions) {
     this.storage = opts.storage
     this.queueKey = opts.queueKey
     this.prefix = (opts.keyPrefix ?? "v1/queue") + "/" + this.queueKey
     this.now = opts.now ?? (() => Date.now())
-    this.lockTimeoutMs = opts.lockTimeoutMs ?? 60_000
   }
 
   // -------------
@@ -136,21 +128,17 @@ export class MessageQueue<T> {
   /** Reserve the next available item (FIFO by createdAt). */
   async reserveNext(): Promise<QueueItem<T> | undefined> {
     const items = await this.listItems()
-    // Filter to pending or expired locks
     const now = this.now()
     const candidates = items
       .filter((it) => !it.targetGroupKey) // templates are never sendable
+      .filter((it) => it.status === "pending")
       .filter((it) => (it.availableAt ?? 0) <= now)
-      .filter((it) => this.isAvailableToLock(it, now))
       .sort((a, b) => a.createdAt - b.createdAt)
 
     const next = candidates[0]
     if (!next) return undefined
 
-    // Lock it
     next.status = "sending"
-    next.lockId = this.makeId()
-    next.lockedAt = now
     await this.putItem(next)
     return next
   }
@@ -169,8 +157,6 @@ export class MessageQueue<T> {
     if (!item) return
     item.status = "pending"
     item.attempts += 1
-    item.lockId = undefined
-    item.lockedAt = undefined
     if (opt.nextAvailableAt !== undefined) item.availableAt = opt.nextAvailableAt
     await this.putItem(item)
   }
@@ -236,14 +222,6 @@ export class MessageQueue<T> {
         return
       }
     }
-  }
-
-  private isAvailableToLock(item: QueueItem<T>, now: number): boolean {
-    if (item.status === "pending") return true
-    if (item.status !== "sending") return false
-    // Recover if locked too long
-    if (!item.lockedAt) return true
-    return now - item.lockedAt > this.lockTimeoutMs
   }
 
   private makeId(): string {
