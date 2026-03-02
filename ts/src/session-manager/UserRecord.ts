@@ -1,18 +1,18 @@
 import { AppKeys } from "../AppKeys"
 import { APP_KEYS_EVENT_KIND } from "../types"
 import type { Rumor } from "../types"
-import { DeviceRecordActor } from "./DeviceRecordActor"
+import { DeviceRecord } from "./DeviceRecord"
 import type {
-  Unsubscribe,
   UserRecord as UserRecordShape,
   UserRecordDeps,
   UserSetupState,
+  Unsubscribe,
 } from "./types"
 
-export class UserRecordActor implements UserRecordShape {
+export class UserRecord implements UserRecordShape {
   public appKeys?: AppKeys
   public state: UserSetupState = "new"
-  public devices: Map<string, DeviceRecordActor> = new Map()
+  public devices: Map<string, DeviceRecord> = new Map()
   public setupPromise?: Promise<void>
 
   private appKeysSubscription?: Unsubscribe
@@ -24,10 +24,14 @@ export class UserRecordActor implements UserRecordShape {
   ) {}
 
   private setState(nextState: UserSetupState): void {
+    if (this.state === nextState) {
+      return
+    }
     this.state = nextState
+    this.deps.onSetupStateChange(this.publicKey)
   }
 
-  ensureDevice(deviceId: string, createdAt?: number): DeviceRecordActor {
+  ensureDevice(deviceId: string, createdAt?: number): DeviceRecord {
     if (!deviceId) {
       throw new Error("Device record must include a deviceId")
     }
@@ -35,7 +39,7 @@ export class UserRecordActor implements UserRecordShape {
     if (existing) {
       return existing
     }
-    const device = new DeviceRecordActor(deviceId, {
+    const device = new DeviceRecord(deviceId, {
       ownerPubkey: this.publicKey,
       user: this,
       nostr: this.deps.nostr,
@@ -90,7 +94,15 @@ export class UserRecordActor implements UserRecordShape {
     this.ensureAppKeysSubscription()
 
     if (!this.appKeys) {
-      this.setState("new")
+      this.setState("fetching-appkeys")
+      const appKeys = await this.fetchAppKeys().catch(() => null)
+      if (appKeys) {
+        await this.onAppKeys(appKeys)
+      }
+    }
+
+    if (!this.appKeys) {
+      this.setState("stale")
       return
     }
 
@@ -162,6 +174,42 @@ export class UserRecordActor implements UserRecordShape {
     )
   }
 
+  private fetchAppKeys(timeoutMs = 2000): Promise<AppKeys | null> {
+    return new Promise((resolve) => {
+      let latestEvent: { created_at: number; appKeys: AppKeys } | null = null
+      let resolved = false
+
+      const resolveResult = () => {
+        if (resolved) return
+        resolved = true
+        unsubscribe()
+        resolve(latestEvent?.appKeys ?? null)
+      }
+
+      const timeout = setTimeout(resolveResult, timeoutMs)
+      const unsubscribe = this.deps.nostr.subscribe(
+        {
+          kinds: [APP_KEYS_EVENT_KIND],
+          authors: [this.publicKey],
+          "#d": ["double-ratchet/app-keys"],
+        },
+        (event) => {
+          if (resolved) return
+          try {
+            const appKeys = AppKeys.fromEvent(event)
+            if (!latestEvent || event.created_at >= latestEvent.created_at) {
+              latestEvent = { created_at: event.created_at, appKeys }
+            }
+            clearTimeout(timeout)
+            setTimeout(resolveResult, 100)
+          } catch {
+            // Ignore invalid AppKeys events.
+          }
+        }
+      )
+    })
+  }
+
   private async expandDiscoveryQueue(): Promise<void> {
     const entries = await this.deps.discoveryQueue.getForTarget(this.publicKey)
     if (entries.length === 0) {
@@ -174,16 +222,11 @@ export class UserRecordActor implements UserRecordShape {
     }
 
     for (const entry of entries) {
-      let expandedForAllDevices = true
-      for (const deviceId of deviceIds) {
-        try {
+      try {
+        for (const deviceId of deviceIds) {
           await this.deps.messageQueue.add(deviceId, entry.event)
-        } catch {
-          expandedForAllDevices = false
         }
-      }
-
-      if (expandedForAllDevices) {
+      } finally {
         await this.deps.discoveryQueue.remove(entry.id).catch(() => {})
       }
     }

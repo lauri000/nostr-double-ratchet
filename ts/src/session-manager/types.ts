@@ -1,4 +1,5 @@
 import type { AppKeys } from "../AppKeys"
+import type { MessageOrigin } from "../MessageOrigin"
 import type { MessageQueue } from "../MessageQueue"
 import type { Session } from "../Session"
 import type {
@@ -8,7 +9,6 @@ import type {
   Rumor,
   Unsubscribe,
 } from "../types"
-import type { MessageOrigin } from "../MessageOrigin"
 
 export type OnEventMeta = {
   fromDeviceId?: string
@@ -24,19 +24,6 @@ export type OnEventCallback = (event: Rumor, from: string, meta?: OnEventMeta) =
 export interface InviteCredentials {
   ephemeralKeypair: { publicKey: string; privateKey: Uint8Array }
   sharedSecret: string
-}
-
-export interface DeviceRecord {
-  deviceId: string
-  activeSession?: Session
-  inactiveSessions: Session[]
-  createdAt: number
-}
-
-export interface UserRecord {
-  publicKey: string
-  devices: Map<string, DeviceRecord>
-  appKeys?: AppKeys
 }
 
 export interface AcceptInviteOptions {
@@ -74,6 +61,13 @@ export type UserSetupState =
   | "ready"
   | "stale"
 
+export interface UserSetupStatus {
+  ownerPublicKey: string
+  state: UserSetupState
+  ready: boolean
+  appKeysKnown: boolean
+}
+
 export type DeviceSetupState =
   | "new"
   | "waiting-for-invite"
@@ -85,6 +79,20 @@ export type DeviceSetupState =
 export interface NostrFacade {
   subscribe: NostrSubscribe
   publish: (event: Parameters<NostrPublish>[0]) => Promise<void>
+}
+
+export interface DeviceRecord {
+  deviceId: string
+  activeSession?: Session
+  inactiveSessions: Session[]
+  createdAt: number
+}
+
+export interface UserRecord {
+  publicKey: string
+  devices: Map<string, DeviceRecord>
+  /** Full AppKeys for this user - single source of truth for device list */
+  appKeys?: AppKeys
 }
 
 export interface DeviceRecordUserHooks {
@@ -119,6 +127,7 @@ export interface UserRecordDeps {
   ourDeviceId: string
   ourOwnerPubkey: string
   identityKey: IdentityKey
+  onSetupStateChange: (ownerPubkey: string) => void
 }
 
 export type { Unsubscribe }

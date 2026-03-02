@@ -7,7 +7,7 @@ import type {
   Unsubscribe,
 } from "./types"
 
-export class DeviceRecordActor implements DeviceRecordShape {
+export class DeviceRecord implements DeviceRecordShape {
   private static readonly MAX_INACTIVE_SESSIONS = 10
 
   public activeSession?: Session
@@ -162,9 +162,8 @@ export class DeviceRecordActor implements DeviceRecordShape {
 
     if (!this.sessionSubscriptions.has(session.name)) {
       const unsub = session.onEvent((event) => {
-        const owner = this.deps.ownerPubkey
         const isAuthorizedDevice =
-          owner === this.deviceId ||
+          this.deps.ownerPubkey === this.deviceId ||
           this.deps.user.isDeviceAuthorized(this.deviceId) ||
           this.activeSession?.name === session.name
         if (!isAuthorizedDevice) {
@@ -189,10 +188,10 @@ export class DeviceRecordActor implements DeviceRecordShape {
   }
 
   private trimInactiveSessions(): void {
-    if (this.inactiveSessions.length <= DeviceRecordActor.MAX_INACTIVE_SESSIONS) {
+    if (this.inactiveSessions.length <= DeviceRecord.MAX_INACTIVE_SESSIONS) {
       return
     }
-    const removed = this.inactiveSessions.splice(DeviceRecordActor.MAX_INACTIVE_SESSIONS)
+    const removed = this.inactiveSessions.splice(DeviceRecord.MAX_INACTIVE_SESSIONS)
     for (const session of removed) {
       const unsub = this.sessionSubscriptions.get(session.name)
       if (unsub) {
@@ -218,7 +217,7 @@ export class DeviceRecordActor implements DeviceRecordShape {
         await this.deps.nostr.publish(event)
         await this.deps.messageQueue.removeByTargetAndEventId(this.deviceId, entry.event.id)
       } catch {
-        // Keep entry for future retry.
+        // Keep entry for future retry
       }
     }
 
