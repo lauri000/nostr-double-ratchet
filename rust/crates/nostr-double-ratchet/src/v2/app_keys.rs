@@ -85,28 +85,32 @@ impl AppKeys {
             return Err(Error::InvalidEvent("Missing app-keys d tag".to_string()));
         }
 
-        let mut devices = Vec::new();
-        for tag in event.tags.iter() {
-            let vals = tag.clone().to_vec();
-            if vals.first().map(|s| s.as_str()) != Some("device") {
-                continue;
-            }
-            if vals.len() < 3 {
-                continue;
-            }
+        let tag_values = event
+            .tags
+            .iter()
+            .map(|tag| tag.clone().to_vec())
+            .collect::<Vec<_>>();
 
-            let pk_hex = vals[1].clone();
-            let created_at_str = vals[2].clone();
-            let created_at = created_at_str
-                .parse::<u64>()
-                .unwrap_or_else(|_| event.created_at.as_u64());
+        let valid_device_values = tag_values
+            .into_iter()
+            .filter(|vals| vals.first().map(|s| s.as_str()) == Some("device"))
+            .filter(|vals| vals.len() >= 3)
+            .collect::<Vec<_>>();
 
-            let pk = crate::utils::pubkey_from_hex(&pk_hex)?;
-            devices.push(DeviceEntry {
-                identity_pubkey: pk,
-                created_at,
-            });
-        }
+        let devices = valid_device_values
+            .into_iter()
+            .map(|vals| {
+                let pk_hex = vals[1].clone();
+                let created_at = vals[2]
+                    .parse::<u64>()
+                    .unwrap_or_else(|_| event.created_at.as_u64());
+                let pk = crate::utils::pubkey_from_hex(&pk_hex)?;
+                Ok(DeviceEntry {
+                    identity_pubkey: pk,
+                    created_at,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(AppKeys::new(devices))
     }
