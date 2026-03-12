@@ -11,15 +11,6 @@ pub struct DeviceEntry {
     pub created_at: u64,
 }
 
-impl DeviceEntry {
-    pub fn new(identity_pubkey: PublicKey, created_at: u64) -> Self {
-        Self {
-            identity_pubkey,
-            created_at,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct AppKeys {
     devices: HashMap<PublicKey, DeviceEntry>,
@@ -51,27 +42,22 @@ impl AppKeys {
     }
 
     pub fn get_event(&self, owner_pubkey: PublicKey) -> UnsignedEvent {
-        let mut tags = Vec::new();
-        let d_tag =
-            Tag::parse(&["d".to_string(), APP_KEYS_D_TAG.to_string()]).unwrap_or_else(|_| {
-                Tag::parse(&["d".to_string(), APP_KEYS_D_TAG.to_string()]).unwrap()
-            });
-        tags.push(d_tag);
-        tags.push(
+        let tags = vec![
+            Tag::parse(&["d".to_string(), APP_KEYS_D_TAG.to_string()])
+                .expect("static app-keys d tag should always parse"),
             Tag::parse(&["version".to_string(), "1".to_string()])
-                .unwrap_or_else(|_| Tag::parse(&["version".to_string(), "1".to_string()]).unwrap()),
-        );
-
-        for device in self.get_all_devices() {
-            let device_tag = Tag::parse(&[
+                .expect("static version tag should always parse"),
+        ]
+        .into_iter()
+        .chain(self.devices.values().map(|device| {
+            Tag::parse(&[
                 "device".to_string(),
                 hex::encode(device.identity_pubkey.to_bytes()),
                 device.created_at.to_string(),
             ])
-            .map_err(|e| Error::InvalidEvent(e.to_string()))
-            .unwrap();
-            tags.push(device_tag);
-        }
+            .expect("device tag should always parse")
+        }))
+        .collect::<Vec<_>>();
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -116,7 +102,10 @@ impl AppKeys {
                 .unwrap_or_else(|_| event.created_at.as_u64());
 
             let pk = crate::utils::pubkey_from_hex(&pk_hex)?;
-            devices.push(DeviceEntry::new(pk, created_at));
+            devices.push(DeviceEntry {
+                identity_pubkey: pk,
+                created_at,
+            });
         }
 
         Ok(AppKeys::new(devices))
@@ -163,7 +152,10 @@ impl AppKeys {
             .filter_map(|d| {
                 crate::utils::pubkey_from_hex(&d.identity_pubkey)
                     .ok()
-                    .map(|pk| DeviceEntry::new(pk, d.created_at))
+                    .map(|pk| DeviceEntry {
+                        identity_pubkey: pk,
+                        created_at: d.created_at,
+                    })
             })
             .collect();
 
