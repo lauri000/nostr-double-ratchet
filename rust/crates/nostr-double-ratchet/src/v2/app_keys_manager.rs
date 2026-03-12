@@ -1,10 +1,8 @@
 use crate::v2::app_keys::{AppKeys, DeviceEntry};
-use crate::{utils, Error, Result};
+use crate::Result;
 use nostr::{Event, PublicKey, UnsignedEvent};
-use std::collections::HashSet;
 
 pub const APP_KEYS_STORAGE_KEY: &str = "v2/app-keys-manager/app-keys";
-pub const TRUSTED_DEVICES_STORAGE_KEY: &str = "v2/app-keys-manager/trusted-devices";
 
 #[derive(Debug, Clone)]
 pub enum AppKeysInput {
@@ -15,16 +13,7 @@ pub enum AppKeysInput {
     AddDeviceKey {
         device: DeviceEntry,
     },
-    UpdateDeviceKey {
-        device: DeviceEntry,
-    },
     RemoveDeviceKey {
-        identity_pubkey: PublicKey,
-    },
-    TrustDeviceKey {
-        identity_pubkey: PublicKey,
-    },
-    RevokeDeviceKey {
         identity_pubkey: PublicKey,
     },
     PublishAppKeys {
@@ -69,25 +58,10 @@ pub enum AppKeysNotification {
     DeviceAddIgnoredAlreadyExists {
         identity_pubkey: PublicKey,
     },
-    DeviceUpdated {
-        identity_pubkey: PublicKey,
-    },
     DeviceRemoved {
         identity_pubkey: PublicKey,
     },
     DeviceRemoveIgnoredMissing {
-        identity_pubkey: PublicKey,
-    },
-    DeviceTrusted {
-        identity_pubkey: PublicKey,
-    },
-    DeviceTrustIgnoredAlreadyTrusted {
-        identity_pubkey: PublicKey,
-    },
-    DeviceRevoked {
-        identity_pubkey: PublicKey,
-    },
-    DeviceRevokeIgnoredNotTrusted {
         identity_pubkey: PublicKey,
     },
     AppKeysSet,
@@ -119,9 +93,7 @@ pub enum AppKeysNotification {
 #[derive(Debug, Clone)]
 pub struct AppKeysManager {
     app_keys: AppKeys,
-    trusted_devices: HashSet<PublicKey>,
     initialized: bool,
-    app_keys_loaded: bool,
 }
 
 impl Default for AppKeysManager {
@@ -134,9 +106,7 @@ impl AppKeysManager {
     pub fn new() -> Self {
         Self {
             app_keys: AppKeys::new(Vec::new()),
-            trusted_devices: HashSet::new(),
             initialized: false,
-            app_keys_loaded: false,
         }
     }
 
@@ -156,28 +126,13 @@ impl AppKeysManager {
         self.app_keys.get_device(identity_pubkey)
     }
 
-    pub fn trusted_device_keys(&self) -> Vec<PublicKey> {
-        self.trusted_devices.iter().copied().collect()
-    }
-
-    pub fn is_device_key_trusted(&self, identity_pubkey: &PublicKey) -> bool {
-        self.trusted_devices.contains(identity_pubkey)
-    }
-
     pub fn apply(&mut self, input: AppKeysInput) -> Result<Vec<AppKeysEffect>> {
         match input {
             AppKeysInput::Start => self.apply_start(),
             AppKeysInput::SetAppKeys { app_keys } => self.apply_set_app_keys(app_keys),
             AppKeysInput::AddDeviceKey { device } => self.apply_add_device_key(device),
-            AppKeysInput::UpdateDeviceKey { device } => self.apply_update_device_key(device),
             AppKeysInput::RemoveDeviceKey { identity_pubkey } => {
                 self.apply_remove_device_key(identity_pubkey)
-            }
-            AppKeysInput::TrustDeviceKey { identity_pubkey } => {
-                self.apply_trust_device_key(identity_pubkey)
-            }
-            AppKeysInput::RevokeDeviceKey { identity_pubkey } => {
-                self.apply_revoke_device_key(identity_pubkey)
             }
             AppKeysInput::PublishAppKeys { owner_pubkey } => self.apply_publish(owner_pubkey),
             AppKeysInput::ApplyAppKeysEvent { event } => self.apply_app_keys_event(event),
@@ -217,13 +172,9 @@ impl AppKeysManager {
         }
 
         self.initialized = true;
-        self.app_keys_loaded = false;
         Ok(vec![
             AppKeysEffect::RequestStorageRead {
                 key: APP_KEYS_STORAGE_KEY.to_string(),
-            },
-            AppKeysEffect::RequestStorageRead {
-                key: TRUSTED_DEVICES_STORAGE_KEY.to_string(),
             },
             AppKeysEffect::Notify(AppKeysNotification::Started),
         ])
@@ -231,13 +182,9 @@ impl AppKeysManager {
 
     fn apply_set_app_keys(&mut self, app_keys: AppKeys) -> Result<Vec<AppKeysEffect>> {
         self.app_keys = app_keys;
-        self.app_keys_loaded = true;
-        self.trusted_devices
-            .retain(|pk| self.app_keys.get_device(pk).is_some());
 
         Ok(vec![
             self.request_storage_write_app_keys()?,
-            self.request_storage_write_trusted_devices()?,
             AppKeysEffect::Notify(AppKeysNotification::AppKeysSet),
         ])
     }
@@ -253,21 +200,9 @@ impl AppKeysManager {
 
         let identity_pubkey = device.identity_pubkey;
         self.app_keys.add_device(device);
-        self.app_keys_loaded = true;
         Ok(vec![
             self.request_storage_write_app_keys()?,
             AppKeysEffect::Notify(AppKeysNotification::DeviceAdded { identity_pubkey }),
-        ])
-    }
-
-    fn apply_update_device_key(&mut self, device: DeviceEntry) -> Result<Vec<AppKeysEffect>> {
-        let identity_pubkey = device.identity_pubkey;
-        self.app_keys.remove_device(&identity_pubkey);
-        self.app_keys.add_device(device);
-        self.app_keys_loaded = true;
-        Ok(vec![
-            self.request_storage_write_app_keys()?,
-            AppKeysEffect::Notify(AppKeysNotification::DeviceUpdated { identity_pubkey }),
         ])
     }
 
@@ -275,64 +210,16 @@ impl AppKeysManager {
         &mut self,
         identity_pubkey: PublicKey,
     ) -> Result<Vec<AppKeysEffect>> {
-        let existed = self.app_keys.get_device(&identity_pubkey).is_some();
-        if existed {
-            self.app_keys.remove_device(&identity_pubkey);
-            self.app_keys_loaded = true;
-        }
-        let trusted_removed = self.trusted_devices.remove(&identity_pubkey);
-
-        let mut effects = Vec::new();
-        if existed {
-            effects.push(self.request_storage_write_app_keys()?);
-            effects.push(AppKeysEffect::Notify(AppKeysNotification::DeviceRemoved {
-                identity_pubkey,
-            }));
-        } else {
-            effects.push(AppKeysEffect::Notify(
-                AppKeysNotification::DeviceRemoveIgnoredMissing { identity_pubkey },
-            ));
-        }
-        if trusted_removed {
-            effects.push(self.request_storage_write_trusted_devices()?);
-            effects.push(AppKeysEffect::Notify(AppKeysNotification::DeviceRevoked {
-                identity_pubkey,
-            }));
-        }
-
-        Ok(effects)
-    }
-
-    fn apply_trust_device_key(&mut self, identity_pubkey: PublicKey) -> Result<Vec<AppKeysEffect>> {
         if self.app_keys.get_device(&identity_pubkey).is_none() {
-            return Err(Error::InvalidEvent("Unknown device key".to_string()));
-        }
-
-        if !self.trusted_devices.insert(identity_pubkey) {
             return Ok(vec![AppKeysEffect::Notify(
-                AppKeysNotification::DeviceTrustIgnoredAlreadyTrusted { identity_pubkey },
+                AppKeysNotification::DeviceRemoveIgnoredMissing { identity_pubkey },
             )]);
         }
 
+        self.app_keys.remove_device(&identity_pubkey);
         Ok(vec![
-            self.request_storage_write_trusted_devices()?,
-            AppKeysEffect::Notify(AppKeysNotification::DeviceTrusted { identity_pubkey }),
-        ])
-    }
-
-    fn apply_revoke_device_key(
-        &mut self,
-        identity_pubkey: PublicKey,
-    ) -> Result<Vec<AppKeysEffect>> {
-        if !self.trusted_devices.remove(&identity_pubkey) {
-            return Ok(vec![AppKeysEffect::Notify(
-                AppKeysNotification::DeviceRevokeIgnoredNotTrusted { identity_pubkey },
-            )]);
-        }
-
-        Ok(vec![
-            self.request_storage_write_trusted_devices()?,
-            AppKeysEffect::Notify(AppKeysNotification::DeviceRevoked { identity_pubkey }),
+            self.request_storage_write_app_keys()?,
+            AppKeysEffect::Notify(AppKeysNotification::DeviceRemoved { identity_pubkey }),
         ])
     }
 
@@ -357,13 +244,8 @@ impl AppKeysManager {
         }
 
         self.app_keys = merged;
-        self.app_keys_loaded = true;
-        self.trusted_devices
-            .retain(|pk| self.app_keys.get_device(pk).is_some());
-
         Ok(vec![
             self.request_storage_write_app_keys()?,
-            self.request_storage_write_trusted_devices()?,
             AppKeysEffect::Notify(AppKeysNotification::AppKeysMergedFromEvent),
         ])
     }
@@ -375,11 +257,6 @@ impl AppKeysManager {
         error: Option<String>,
     ) -> Result<Vec<AppKeysEffect>> {
         if let Some(error) = error {
-            if key == APP_KEYS_STORAGE_KEY {
-                self.app_keys_loaded = true;
-                self.trusted_devices
-                    .retain(|pk| self.app_keys.get_device(pk).is_some());
-            }
             return Ok(vec![AppKeysEffect::Notify(
                 AppKeysNotification::StorageReadFailed { key, error },
             )]);
@@ -390,29 +267,6 @@ impl AppKeysManager {
                 self.app_keys = match value {
                     Some(json) => AppKeys::deserialize(&json)?,
                     None => AppKeys::new(Vec::new()),
-                };
-                self.app_keys_loaded = true;
-                self.trusted_devices
-                    .retain(|pk| self.app_keys.get_device(pk).is_some());
-                Ok(vec![AppKeysEffect::Notify(
-                    AppKeysNotification::StorageReadApplied { key },
-                )])
-            }
-            TRUSTED_DEVICES_STORAGE_KEY => {
-                let trusted_pubkeys = match value {
-                    Some(json) => serde_json::from_str::<Vec<String>>(&json)?
-                        .into_iter()
-                        .filter_map(|pk_hex| utils::pubkey_from_hex(&pk_hex).ok())
-                        .collect::<HashSet<_>>(),
-                    None => HashSet::new(),
-                };
-                self.trusted_devices = if self.app_keys_loaded {
-                    trusted_pubkeys
-                        .into_iter()
-                        .filter(|pk| self.app_keys.get_device(pk).is_some())
-                        .collect()
-                } else {
-                    trusted_pubkeys
                 };
 
                 Ok(vec![AppKeysEffect::Notify(
@@ -431,43 +285,19 @@ impl AppKeysManager {
             value: self.app_keys.serialize()?,
         })
     }
-
-    fn request_storage_write_trusted_devices(&self) -> Result<AppKeysEffect> {
-        let mut trusted = self
-            .trusted_devices
-            .iter()
-            .map(|pk| hex::encode(pk.to_bytes()))
-            .collect::<Vec<_>>();
-        trusted.sort_unstable();
-
-        Ok(AppKeysEffect::RequestStorageWrite {
-            key: TRUSTED_DEVICES_STORAGE_KEY.to_string(),
-            value: serde_json::to_string(&trusted)?,
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         AppKeysEffect, AppKeysInput, AppKeysManager, AppKeysNotification, DeviceEntry,
-        APP_KEYS_STORAGE_KEY, TRUSTED_DEVICES_STORAGE_KEY,
+        APP_KEYS_STORAGE_KEY,
     };
-    use crate::{v2::app_keys::AppKeys, Error, APP_KEYS_EVENT_KIND};
+    use crate::{v2::app_keys::AppKeys, APP_KEYS_EVENT_KIND};
     use nostr::{Event, EventBuilder, Kind, PublicKey, Tag};
 
     fn make_pubkey() -> PublicKey {
         nostr::Keys::generate().public_key()
-    }
-
-    fn collect_notifications(effects: &[AppKeysEffect]) -> Vec<&AppKeysNotification> {
-        effects
-            .iter()
-            .filter_map(|effect| match effect {
-                AppKeysEffect::Notify(notification) => Some(notification),
-                _ => None,
-            })
-            .collect()
     }
 
     fn make_signed_app_keys_event(devices: Vec<DeviceEntry>) -> Event {
@@ -480,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn start_emits_storage_reads_once() {
+    fn start_emits_storage_read_once() {
         let mut manager = AppKeysManager::new();
         let first = manager
             .apply(AppKeysInput::Start)
@@ -493,10 +323,6 @@ mod tests {
         ));
         assert!(matches!(
             first.get(1),
-            Some(AppKeysEffect::RequestStorageRead { key }) if key == TRUSTED_DEVICES_STORAGE_KEY
-        ));
-        assert!(matches!(
-            first.get(2),
             Some(AppKeysEffect::Notify(AppKeysNotification::Started))
         ));
 
@@ -579,20 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn trust_unknown_device_key_returns_error() {
-        let mut manager = AppKeysManager::new();
-        let unknown = make_pubkey();
-        let err = manager
-            .apply(AppKeysInput::TrustDeviceKey {
-                identity_pubkey: unknown,
-            })
-            .expect_err("trusting unknown key should fail");
-
-        assert!(matches!(err, Error::InvalidEvent(_)));
-    }
-
-    #[test]
-    fn remove_device_key_prunes_trust_and_emits_both_storage_writes() {
+    fn remove_device_key_updates_state_and_emits_storage_write() {
         let mut manager = AppKeysManager::new();
         let pk = make_pubkey();
         manager
@@ -603,11 +416,6 @@ mod tests {
                 },
             })
             .expect("add should succeed");
-        manager
-            .apply(AppKeysInput::TrustDeviceKey {
-                identity_pubkey: pk,
-            })
-            .expect("trust should succeed");
 
         let effects = manager
             .apply(AppKeysInput::RemoveDeviceKey {
@@ -616,79 +424,60 @@ mod tests {
             .expect("remove should succeed");
 
         assert!(manager.get_device_key(&pk).is_none());
-        assert!(!manager.is_device_key_trusted(&pk));
-
-        let storage_writes = effects
-            .iter()
-            .filter(|effect| matches!(effect, AppKeysEffect::RequestStorageWrite { .. }))
-            .count();
-        assert_eq!(storage_writes, 2);
-
-        let notifications = collect_notifications(&effects);
-        assert!(notifications.iter().any(|notification| {
-            matches!(
-                notification,
-                AppKeysNotification::DeviceRemoved { identity_pubkey } if *identity_pubkey == pk
-            )
-        }));
-        assert!(notifications.iter().any(|notification| {
-            matches!(
-                notification,
-                AppKeysNotification::DeviceRevoked { identity_pubkey } if *identity_pubkey == pk
-            )
-        }));
+        assert_eq!(effects.len(), 2);
+        assert!(matches!(
+            effects.first(),
+            Some(AppKeysEffect::RequestStorageWrite { key, .. }) if key == APP_KEYS_STORAGE_KEY
+        ));
+        assert!(matches!(
+            effects.get(1),
+            Some(AppKeysEffect::Notify(AppKeysNotification::DeviceRemoved { identity_pubkey })) if *identity_pubkey == pk
+        ));
     }
 
     #[test]
-    fn set_app_keys_prunes_unknown_trust_and_emits_writes() {
+    fn remove_missing_device_key_only_notifies() {
+        let mut manager = AppKeysManager::new();
+        let missing_pk = make_pubkey();
+
+        let effects = manager
+            .apply(AppKeysInput::RemoveDeviceKey {
+                identity_pubkey: missing_pk,
+            })
+            .expect("remove should succeed");
+
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects.first(),
+            Some(AppKeysEffect::Notify(
+                AppKeysNotification::DeviceRemoveIgnoredMissing { identity_pubkey }
+            )) if *identity_pubkey == missing_pk
+        ));
+    }
+
+    #[test]
+    fn set_app_keys_replaces_state_and_emits_write() {
         let mut manager = AppKeysManager::new();
         let pk_a = make_pubkey();
         let pk_b = make_pubkey();
 
         manager
-            .apply(AppKeysInput::AddDeviceKey {
-                device: DeviceEntry {
-                    identity_pubkey: pk_a,
-                    created_at: 1,
-                },
-            })
-            .expect("add a should succeed");
-        manager
-            .apply(AppKeysInput::AddDeviceKey {
-                device: DeviceEntry {
-                    identity_pubkey: pk_b,
-                    created_at: 2,
-                },
-            })
-            .expect("add b should succeed");
-        manager
-            .apply(AppKeysInput::TrustDeviceKey {
-                identity_pubkey: pk_a,
-            })
-            .expect("trust a should succeed");
-        manager
-            .apply(AppKeysInput::TrustDeviceKey {
-                identity_pubkey: pk_b,
-            })
-            .expect("trust b should succeed");
-
-        let effects = manager
             .apply(AppKeysInput::SetAppKeys {
-                app_keys: AppKeys::new(vec![DeviceEntry {
-                    identity_pubkey: pk_a,
-                    created_at: 3,
-                }]),
+                app_keys: AppKeys::new(vec![
+                    DeviceEntry {
+                        identity_pubkey: pk_a,
+                        created_at: 3,
+                    },
+                    DeviceEntry {
+                        identity_pubkey: pk_b,
+                        created_at: 4,
+                    },
+                ]),
             })
             .expect("set should succeed");
 
         assert!(manager.get_device_key(&pk_a).is_some());
-        assert!(manager.get_device_key(&pk_b).is_none());
-        assert!(manager.is_device_key_trusted(&pk_a));
-        assert!(!manager.is_device_key_trusted(&pk_b));
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            AppKeysEffect::Notify(AppKeysNotification::AppKeysSet)
-        )));
+        assert!(manager.get_device_key(&pk_b).is_some());
     }
 
     #[test]
@@ -726,10 +515,9 @@ mod tests {
     }
 
     #[test]
-    fn storage_read_results_apply_state_and_filter_unknown_trusted_keys() {
+    fn storage_read_result_applies_app_keys_state() {
         let mut manager = AppKeysManager::new();
         let known_pk = make_pubkey();
-        let unknown_pk = make_pubkey();
 
         let app_keys_json = AppKeys::new(vec![DeviceEntry {
             identity_pubkey: known_pk,
@@ -738,12 +526,6 @@ mod tests {
         .serialize()
         .expect("app keys should serialize");
 
-        let trusted_json = serde_json::to_string(&vec![
-            hex::encode(known_pk.to_bytes()),
-            hex::encode(unknown_pk.to_bytes()),
-        ])
-        .expect("trusted list should serialize");
-
         manager
             .apply(AppKeysInput::StorageReadResult {
                 key: APP_KEYS_STORAGE_KEY.to_string(),
@@ -751,59 +533,29 @@ mod tests {
                 error: None,
             })
             .expect("app keys read callback should succeed");
-        manager
-            .apply(AppKeysInput::StorageReadResult {
-                key: TRUSTED_DEVICES_STORAGE_KEY.to_string(),
-                value: Some(trusted_json),
-                error: None,
-            })
-            .expect("trusted read callback should succeed");
 
         assert!(manager.get_device_key(&known_pk).is_some());
-        assert!(manager.is_device_key_trusted(&known_pk));
-        assert!(!manager.is_device_key_trusted(&unknown_pk));
     }
 
     #[test]
-    fn trusted_storage_read_before_app_keys_storage_read_keeps_valid_trust() {
+    fn storage_read_unknown_key_is_ignored() {
         let mut manager = AppKeysManager::new();
-        let known_pk = make_pubkey();
-        let unknown_pk = make_pubkey();
 
-        let app_keys_json = AppKeys::new(vec![DeviceEntry {
-            identity_pubkey: known_pk,
-            created_at: 5,
-        }])
-        .serialize()
-        .expect("app keys should serialize");
-
-        let trusted_json = serde_json::to_string(&vec![
-            hex::encode(known_pk.to_bytes()),
-            hex::encode(unknown_pk.to_bytes()),
-        ])
-        .expect("trusted list should serialize");
-
-        manager
+        let effects = manager
             .apply(AppKeysInput::StorageReadResult {
-                key: TRUSTED_DEVICES_STORAGE_KEY.to_string(),
-                value: Some(trusted_json),
+                key: "some/other/key".to_string(),
+                value: Some("{}".to_string()),
                 error: None,
             })
-            .expect("trusted read callback should succeed");
+            .expect("unknown key should be ignored");
 
-        assert!(manager.is_device_key_trusted(&known_pk));
-        assert!(manager.is_device_key_trusted(&unknown_pk));
-
-        manager
-            .apply(AppKeysInput::StorageReadResult {
-                key: APP_KEYS_STORAGE_KEY.to_string(),
-                value: Some(app_keys_json),
-                error: None,
-            })
-            .expect("app keys read callback should succeed");
-
-        assert!(manager.is_device_key_trusted(&known_pk));
-        assert!(!manager.is_device_key_trusted(&unknown_pk));
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects.first(),
+            Some(AppKeysEffect::Notify(
+                AppKeysNotification::StorageReadIgnoredUnknownKey { key }
+            )) if key == "some/other/key"
+        ));
     }
 
     #[test]
