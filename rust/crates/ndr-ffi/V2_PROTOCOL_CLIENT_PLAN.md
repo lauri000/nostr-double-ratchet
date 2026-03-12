@@ -100,29 +100,67 @@ nostr-double-ratchet
 
 ## Implementation Slices
 
-1. Create `ndr-ffi` v2 surface types:
-   - `ProtocolClientV2`
-   - `AppKeysApiV2`
-   - `RuntimeApiV2`
+1. Create `ndr-ffi` surface types under the `v2` namespace:
+   - `ProtocolClient`
+   - `AppKeysApi`
+   - `RuntimeApi`
 2. Define runtime effect protocol:
-   - `HostEffectV2` categories (nostr + storage + app-facing)
+   - `HostEffect` categories (nostr + storage + app-facing)
    - `drain_effects()` behavior and ordering guarantees
 3. Build runtime shell first (component 1):
    - runtime queue + correlation id tracking
    - nostr callback stubs
    - storage callback stubs
-4. Wire `AppKeysApiV2` to `nostr-double-ratchet` v2 `AppKeysManager` (component 2).
+4. Wire `AppKeysApi` to `nostr-double-ratchet` v2 `AppKeysManager` (component 2).
 5. Add `subscription_router` and logical routing maps (component 3).
 6. Add storage request/response routing through runtime (component 4).
-7. Defer `SessionsApiV2` and `SessionManager` integration to a later slice (component 5+).
+7. Defer `SessionsApi` and `SessionManager` integration to a later slice (component 5+).
 
 ## Component-By-Component Order
 
-1. `RuntimeApiV2` skeleton and effect queue contract.
-2. `AppKeysApiV2` to `v2::AppKeysManager` state transitions.
+1. `RuntimeApi` skeleton and effect queue contract.
+2. `AppKeysApi` to `v2::AppKeysManager` state transitions.
 3. Nostr routing (`sub_id`/request id maps).
 4. Storage routing (correlation id/result handling).
-5. `SessionsApiV2` placeholder -> real integration.
+5. `SessionsApi` placeholder -> real integration.
+
+## v2 Dependency Boundary
+
+`ndr-ffi/src/v2/*` must not depend on old transport/storage integration contracts.
+
+Specifically:
+
+- Do not use legacy `NostrPubSub`.
+- Do not use legacy `StorageAdapter`.
+- Do not instantiate managers through old adapter-based constructors.
+
+Instead, v2 wiring should be:
+
+- runtime receives normalized host callbacks,
+- runtime routes explicit inputs to v2 managers,
+- managers return explicit effects/intents,
+- runtime enqueues host effects for `drain_effects()`.
+
+## Runtime <-> AppKeysManager Plan (No Legacy Adapters)
+
+1. Add v2 input/effect contracts in `nostr-double-ratchet/src/v2`:
+   - `AppKeysInput`
+   - `AppKeysEffect`
+2. Refactor `AppKeysManager` to process explicit inputs and return explicit effects:
+   - no hidden transport/storage side effects
+   - no direct host callback dependencies
+3. Runtime owns I/O lifecycle:
+   - maps subscription/publish/storage correlation ids
+   - feeds callback results back as inputs
+   - emits host-facing effects via queue
+4. `on_nostr_event` runtime flow:
+   - resolve route by `sub_id`
+   - map to `AppKeysInput::NostrEvent`
+   - apply manager
+   - enqueue resulting host effects
+5. `AppKeysApi` methods call manager through runtime-owned serialized context:
+   - `add/update/remove/trust/revoke/list/get`
+   - each method emits effects through the same runtime queue path
 
 ## Non-Goals (This Slice)
 
