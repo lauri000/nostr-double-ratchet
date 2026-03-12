@@ -14,6 +14,7 @@ use nostr_double_ratchet::{
 };
 
 mod error;
+pub mod v2;
 pub use error::NdrError;
 
 /// Returns the version of the ndr-ffi crate.

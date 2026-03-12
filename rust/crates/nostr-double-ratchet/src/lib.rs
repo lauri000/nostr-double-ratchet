@@ -18,6 +18,7 @@ pub mod storage;
 pub mod types;
 pub mod user_record;
 pub mod utils;
+pub mod v2;
 
 pub use app_keys::{is_app_keys_event, AppKeys, DeviceEntry};
 pub use app_keys_manager::AppKeysManager;
