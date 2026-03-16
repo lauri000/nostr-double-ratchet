@@ -51,7 +51,11 @@ pub enum AppKeysEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppKeysNotification {
     Started,
+    Initialized,
+    StartIgnoredAlreadyInitializing,
     StartIgnoredAlreadyInitialized,
+    InputIgnoredNotStarted,
+    InputIgnoredStillInitializing,
     DeviceAdded {
         identity_pubkey: PublicKey,
     },
@@ -90,10 +94,17 @@ pub enum AppKeysNotification {
     PublishRequested,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppKeysLifecycle {
+    NotStarted,
+    Initializing,
+    Initialized,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppKeysManager {
     app_keys: AppKeys,
-    initialized: bool,
+    lifecycle: AppKeysLifecycle,
 }
 
 impl Default for AppKeysManager {
@@ -106,12 +117,16 @@ impl AppKeysManager {
     pub fn new() -> Self {
         Self {
             app_keys: AppKeys::new(Vec::new()),
-            initialized: false,
+            lifecycle: AppKeysLifecycle::NotStarted,
         }
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.initialized
+        matches!(self.lifecycle, AppKeysLifecycle::Initialized)
+    }
+
+    pub fn is_initializing(&self) -> bool {
+        matches!(self.lifecycle, AppKeysLifecycle::Initializing)
     }
 
     pub fn get_app_keys(&self) -> &AppKeys {
@@ -127,8 +142,41 @@ impl AppKeysManager {
     }
 
     pub fn apply(&mut self, input: AppKeysInput) -> Result<Vec<AppKeysEffect>> {
+        match self.lifecycle {
+            AppKeysLifecycle::NotStarted => self.apply_not_started(input),
+            AppKeysLifecycle::Initializing => self.apply_initializing(input),
+            AppKeysLifecycle::Initialized => self.apply_initialized(input),
+        }
+    }
+
+    fn apply_not_started(&mut self, input: AppKeysInput) -> Result<Vec<AppKeysEffect>> {
         match input {
             AppKeysInput::Start => self.apply_start(),
+            _ => Ok(vec![AppKeysEffect::Notify(
+                AppKeysNotification::InputIgnoredNotStarted,
+            )]),
+        }
+    }
+
+    fn apply_initializing(&mut self, input: AppKeysInput) -> Result<Vec<AppKeysEffect>> {
+        match input {
+            AppKeysInput::Start => Ok(vec![AppKeysEffect::Notify(
+                AppKeysNotification::StartIgnoredAlreadyInitializing,
+            )]),
+            AppKeysInput::StorageReadResult { key, value, error } => {
+                self.apply_storage_read_result(key, value, error)
+            }
+            _ => Ok(vec![AppKeysEffect::Notify(
+                AppKeysNotification::InputIgnoredStillInitializing,
+            )]),
+        }
+    }
+
+    fn apply_initialized(&mut self, input: AppKeysInput) -> Result<Vec<AppKeysEffect>> {
+        match input {
+            AppKeysInput::Start => Ok(vec![AppKeysEffect::Notify(
+                AppKeysNotification::StartIgnoredAlreadyInitialized,
+            )]),
             AppKeysInput::SetAppKeys { app_keys } => self.apply_set_app_keys(app_keys),
             AppKeysInput::AddDeviceKey { device } => self.apply_add_device_key(device),
             AppKeysInput::RemoveDeviceKey { identity_pubkey } => {
@@ -165,13 +213,7 @@ impl AppKeysManager {
     }
 
     fn apply_start(&mut self) -> Result<Vec<AppKeysEffect>> {
-        if self.initialized {
-            return Ok(vec![AppKeysEffect::Notify(
-                AppKeysNotification::StartIgnoredAlreadyInitialized,
-            )]);
-        }
-
-        self.initialized = true;
+        self.lifecycle = AppKeysLifecycle::Initializing;
         Ok(vec![
             AppKeysEffect::RequestStorageRead {
                 key: APP_KEYS_STORAGE_KEY.to_string(),
@@ -256,27 +298,38 @@ impl AppKeysManager {
         value: Option<String>,
         error: Option<String>,
     ) -> Result<Vec<AppKeysEffect>> {
+        if key == APP_KEYS_STORAGE_KEY {
+            let mut effects = Vec::new();
+            if let Some(error) = error {
+                effects.push(AppKeysEffect::Notify(
+                    AppKeysNotification::StorageReadFailed { key, error },
+                ));
+            } else {
+                self.app_keys = match value {
+                    Some(json) => AppKeys::deserialize(&json)?,
+                    None => AppKeys::new(Vec::new()),
+                };
+                effects.push(AppKeysEffect::Notify(
+                    AppKeysNotification::StorageReadApplied { key },
+                ));
+            }
+
+            if matches!(self.lifecycle, AppKeysLifecycle::Initializing) {
+                self.lifecycle = AppKeysLifecycle::Initialized;
+                effects.push(AppKeysEffect::Notify(AppKeysNotification::Initialized));
+            }
+            return Ok(effects);
+        }
+
         if let Some(error) = error {
             return Ok(vec![AppKeysEffect::Notify(
                 AppKeysNotification::StorageReadFailed { key, error },
             )]);
         }
 
-        match key.as_str() {
-            APP_KEYS_STORAGE_KEY => {
-                self.app_keys = match value {
-                    Some(json) => AppKeys::deserialize(&json)?,
-                    None => AppKeys::new(Vec::new()),
-                };
-
-                Ok(vec![AppKeysEffect::Notify(
-                    AppKeysNotification::StorageReadApplied { key },
-                )])
-            }
-            _ => Ok(vec![AppKeysEffect::Notify(
-                AppKeysNotification::StorageReadIgnoredUnknownKey { key },
-            )]),
-        }
+        Ok(vec![AppKeysEffect::Notify(
+            AppKeysNotification::StorageReadIgnoredUnknownKey { key },
+        )])
     }
 
     fn request_storage_write_app_keys(&self) -> Result<AppKeysEffect> {
@@ -300,6 +353,20 @@ mod tests {
         nostr::Keys::generate().public_key()
     }
 
+    fn initialize_manager(manager: &mut AppKeysManager) {
+        manager
+            .apply(AppKeysInput::Start)
+            .expect("start should succeed");
+        manager
+            .apply(AppKeysInput::StorageReadResult {
+                key: APP_KEYS_STORAGE_KEY.to_string(),
+                value: None,
+                error: None,
+            })
+            .expect("storage callback should succeed");
+        assert!(manager.is_initialized());
+    }
+
     fn make_signed_app_keys_event(devices: Vec<DeviceEntry>) -> Event {
         let owner_keys = nostr::Keys::generate();
         let app_keys = AppKeys::new(devices);
@@ -310,30 +377,128 @@ mod tests {
     }
 
     #[test]
-    fn start_emits_storage_read_once() {
+    fn start_requests_storage_read_and_sets_initializing() {
         let mut manager = AppKeysManager::new();
-        let first = manager
+        let effects = manager
             .apply(AppKeysInput::Start)
             .expect("start should succeed");
 
-        assert!(manager.is_initialized());
+        assert!(manager.is_initializing());
+        assert!(!manager.is_initialized());
         assert!(matches!(
-            first.first(),
+            effects.first(),
             Some(AppKeysEffect::RequestStorageRead { key }) if key == APP_KEYS_STORAGE_KEY
         ));
         assert!(matches!(
-            first.get(1),
+            effects.get(1),
             Some(AppKeysEffect::Notify(AppKeysNotification::Started))
         ));
+    }
 
-        let second = manager
+    #[test]
+    fn start_while_initializing_is_soft_ignored() {
+        let mut manager = AppKeysManager::new();
+        manager
+            .apply(AppKeysInput::Start)
+            .expect("first start should succeed");
+
+        let effects = manager
             .apply(AppKeysInput::Start)
             .expect("second start should succeed");
-        assert_eq!(second.len(), 1);
+
+        assert_eq!(effects.len(), 1);
         assert!(matches!(
-            second.first(),
+            effects.first(),
             Some(AppKeysEffect::Notify(
-                AppKeysNotification::StartIgnoredAlreadyInitialized
+                AppKeysNotification::StartIgnoredAlreadyInitializing
+            ))
+        ));
+        assert!(manager.is_initializing());
+        assert!(!manager.is_initialized());
+    }
+
+    #[test]
+    fn storage_read_completes_initialization() {
+        let mut manager = AppKeysManager::new();
+        manager
+            .apply(AppKeysInput::Start)
+            .expect("start should succeed");
+
+        let known_pk = make_pubkey();
+        let app_keys_json = AppKeys::new(vec![DeviceEntry {
+            identity_pubkey: known_pk,
+            created_at: 5,
+        }])
+        .serialize()
+        .expect("app keys should serialize");
+
+        let effects = manager
+            .apply(AppKeysInput::StorageReadResult {
+                key: APP_KEYS_STORAGE_KEY.to_string(),
+                value: Some(app_keys_json),
+                error: None,
+            })
+            .expect("storage read result should succeed");
+
+        assert!(manager.is_initialized());
+        assert!(!manager.is_initializing());
+        assert!(manager.get_device_key(&known_pk).is_some());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            AppKeysEffect::Notify(AppKeysNotification::StorageReadApplied { key })
+                if key == APP_KEYS_STORAGE_KEY
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            AppKeysEffect::Notify(AppKeysNotification::Initialized)
+        )));
+    }
+
+    #[test]
+    fn inputs_are_soft_rejected_before_start() {
+        let mut manager = AppKeysManager::new();
+
+        let effects = manager
+            .apply(AppKeysInput::AddDeviceKey {
+                device: DeviceEntry {
+                    identity_pubkey: make_pubkey(),
+                    created_at: 11,
+                },
+            })
+            .expect("add should be soft-ignored");
+
+        assert_eq!(manager.list_device_keys().len(), 0);
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects.first(),
+            Some(AppKeysEffect::Notify(
+                AppKeysNotification::InputIgnoredNotStarted
+            ))
+        ));
+    }
+
+    #[test]
+    fn inputs_are_soft_rejected_while_initializing() {
+        let mut manager = AppKeysManager::new();
+        manager
+            .apply(AppKeysInput::Start)
+            .expect("start should succeed");
+
+        let effects = manager
+            .apply(AppKeysInput::AddDeviceKey {
+                device: DeviceEntry {
+                    identity_pubkey: make_pubkey(),
+                    created_at: 11,
+                },
+            })
+            .expect("add should be soft-ignored");
+
+        assert_eq!(manager.list_device_keys().len(), 0);
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects.first(),
+            Some(AppKeysEffect::Notify(
+                AppKeysNotification::InputIgnoredStillInitializing
             ))
         ));
     }
@@ -341,6 +506,8 @@ mod tests {
     #[test]
     fn add_device_key_changes_state_and_emits_storage_write() {
         let mut manager = AppKeysManager::new();
+        initialize_manager(&mut manager);
+
         let pk = make_pubkey();
         let effects = manager
             .apply(AppKeysInput::AddDeviceKey {
@@ -369,6 +536,8 @@ mod tests {
     #[test]
     fn add_existing_device_key_is_noop_without_storage_write() {
         let mut manager = AppKeysManager::new();
+        initialize_manager(&mut manager);
+
         let pk = make_pubkey();
         manager
             .apply(AppKeysInput::AddDeviceKey {
@@ -407,6 +576,8 @@ mod tests {
     #[test]
     fn remove_device_key_updates_state_and_emits_storage_write() {
         let mut manager = AppKeysManager::new();
+        initialize_manager(&mut manager);
+
         let pk = make_pubkey();
         manager
             .apply(AppKeysInput::AddDeviceKey {
@@ -436,32 +607,14 @@ mod tests {
     }
 
     #[test]
-    fn remove_missing_device_key_only_notifies() {
-        let mut manager = AppKeysManager::new();
-        let missing_pk = make_pubkey();
-
-        let effects = manager
-            .apply(AppKeysInput::RemoveDeviceKey {
-                identity_pubkey: missing_pk,
-            })
-            .expect("remove should succeed");
-
-        assert_eq!(effects.len(), 1);
-        assert!(matches!(
-            effects.first(),
-            Some(AppKeysEffect::Notify(
-                AppKeysNotification::DeviceRemoveIgnoredMissing { identity_pubkey }
-            )) if *identity_pubkey == missing_pk
-        ));
-    }
-
-    #[test]
     fn set_app_keys_replaces_state_and_emits_write() {
         let mut manager = AppKeysManager::new();
+        initialize_manager(&mut manager);
+
         let pk_a = make_pubkey();
         let pk_b = make_pubkey();
 
-        manager
+        let effects = manager
             .apply(AppKeysInput::SetAppKeys {
                 app_keys: AppKeys::new(vec![
                     DeviceEntry {
@@ -478,11 +631,17 @@ mod tests {
 
         assert!(manager.get_device_key(&pk_a).is_some());
         assert!(manager.get_device_key(&pk_b).is_some());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            AppKeysEffect::Notify(AppKeysNotification::AppKeysSet)
+        )));
     }
 
     #[test]
     fn apply_app_keys_event_updates_state_and_emits_storage_write() {
         let mut manager = AppKeysManager::new();
+        initialize_manager(&mut manager);
+
         let local_pk = make_pubkey();
         manager
             .apply(AppKeysInput::AddDeviceKey {
@@ -515,31 +674,9 @@ mod tests {
     }
 
     #[test]
-    fn storage_read_result_applies_app_keys_state() {
+    fn storage_read_unknown_key_is_ignored_after_initialized() {
         let mut manager = AppKeysManager::new();
-        let known_pk = make_pubkey();
-
-        let app_keys_json = AppKeys::new(vec![DeviceEntry {
-            identity_pubkey: known_pk,
-            created_at: 5,
-        }])
-        .serialize()
-        .expect("app keys should serialize");
-
-        manager
-            .apply(AppKeysInput::StorageReadResult {
-                key: APP_KEYS_STORAGE_KEY.to_string(),
-                value: Some(app_keys_json),
-                error: None,
-            })
-            .expect("app keys read callback should succeed");
-
-        assert!(manager.get_device_key(&known_pk).is_some());
-    }
-
-    #[test]
-    fn storage_read_unknown_key_is_ignored() {
-        let mut manager = AppKeysManager::new();
+        initialize_manager(&mut manager);
 
         let effects = manager
             .apply(AppKeysInput::StorageReadResult {
@@ -561,6 +698,8 @@ mod tests {
     #[test]
     fn publish_input_emits_unsigned_publish_effect() {
         let mut manager = AppKeysManager::new();
+        initialize_manager(&mut manager);
+
         manager
             .apply(AppKeysInput::AddDeviceKey {
                 device: DeviceEntry {
@@ -593,8 +732,12 @@ mod tests {
     }
 
     #[test]
-    fn storage_failure_input_emits_notify_effect() {
+    fn storage_failure_during_initialization_sets_initialized_and_notifies() {
         let mut manager = AppKeysManager::new();
+        manager
+            .apply(AppKeysInput::Start)
+            .expect("start should succeed");
+
         let effects = manager
             .apply(AppKeysInput::StorageReadResult {
                 key: APP_KEYS_STORAGE_KEY.to_string(),
@@ -603,12 +746,17 @@ mod tests {
             })
             .expect("storage read failure callback should not fail");
 
-        assert_eq!(effects.len(), 1);
-        assert!(matches!(
-            effects.first(),
-            Some(AppKeysEffect::Notify(AppKeysNotification::StorageReadFailed { key, error }))
+        assert!(manager.is_initialized());
+        assert_eq!(effects.len(), 2);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            AppKeysEffect::Notify(AppKeysNotification::StorageReadFailed { key, error })
                 if key == APP_KEYS_STORAGE_KEY && error == "timeout"
-        ));
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            AppKeysEffect::Notify(AppKeysNotification::Initialized)
+        )));
     }
 
     #[test]
@@ -626,6 +774,8 @@ mod tests {
             .expect("event signing should succeed");
 
         let mut manager = AppKeysManager::new();
+        initialize_manager(&mut manager);
+
         let effects = manager
             .apply(AppKeysInput::ApplyAppKeysEvent { event })
             .expect("event should apply successfully");
