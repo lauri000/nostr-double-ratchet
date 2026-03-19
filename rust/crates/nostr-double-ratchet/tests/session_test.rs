@@ -1,5 +1,5 @@
 use nostr::Keys;
-use nostr_double_ratchet::{Result, Session};
+use nostr_double_ratchet::{Invite, InviteActor, Result, SessionActor as Session};
 
 #[test]
 fn test_session_init() -> Result<()> {
@@ -175,11 +175,10 @@ fn test_send_reaction_format() {
     let alice_keys = nostr::Keys::generate();
     let bob_keys = nostr::Keys::generate();
 
-    let invite =
-        nostr_double_ratchet::Invite::create_new(alice_keys.public_key(), None, None).unwrap();
+    let invite = Invite::create_new(alice_keys.public_key(), None, None).unwrap();
 
     // Bob accepts - after accept, BOB can send first (he's the ratchet initiator)
-    let (mut bob_session, _response) = invite
+    let (mut bob_session, _response) = InviteActor::new(invite.clone())
         .accept(
             bob_keys.public_key(),
             bob_keys.secret_key().to_secret_bytes(),
@@ -216,11 +215,10 @@ fn test_reaction_roundtrip() {
     let alice_keys = nostr::Keys::generate();
     let bob_keys = nostr::Keys::generate();
 
-    let invite =
-        nostr_double_ratchet::Invite::create_new(alice_keys.public_key(), None, None).unwrap();
+    let invite = Invite::create_new(alice_keys.public_key(), None, None).unwrap();
 
     // Bob accepts the invite - after accept, BOB can send first!
-    let (mut bob_session, response) = invite
+    let (mut bob_session, response) = InviteActor::new(invite.clone())
         .accept(
             bob_keys.public_key(),
             bob_keys.secret_key().to_secret_bytes(),
@@ -229,7 +227,7 @@ fn test_reaction_roundtrip() {
         .unwrap();
 
     // Alice processes the response - Alice needs to receive first
-    let mut alice_session = invite
+    let mut alice_session = InviteActor::new(invite.clone())
         .process_invite_response(&response, alice_keys.secret_key().to_secret_bytes())
         .unwrap()
         .unwrap()

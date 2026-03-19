@@ -1,5 +1,7 @@
 use nostr::Keys;
-use nostr_double_ratchet::{AppKeys, DeviceEntry, Invite, Result, SessionManagerEvent};
+use nostr_double_ratchet::{
+    AppKeys, DeviceEntry, Invite, InviteActor, Result, SessionManagerEvent,
+};
 
 #[test]
 fn test_invite_listen_and_accept() -> Result<()> {
@@ -15,7 +17,7 @@ fn test_invite_listen_and_accept() -> Result<()> {
 
     let owner_keys = Keys::generate();
     let owner_pk = owner_keys.public_key();
-    let (_bob_session, acceptance_event) = invite.accept_with_owner(
+    let (_bob_session, acceptance_event) = InviteActor::new(invite.clone()).accept_with_owner(
         bob_pk,
         bob_sk,
         Some("bob-device".to_string()),
@@ -28,11 +30,13 @@ fn test_invite_listen_and_accept() -> Result<()> {
     // Simulate receiving the acceptance event
     // In real usage, this would be handled by the relay/subscription system
     // For this test, we'll directly process it
-    invite.listen(&event_tx)?;
+    InviteActor::new(invite.clone()).listen(&event_tx)?;
 
     // Since we can't mock the subscription system easily, we'll directly test
     // invite response processing via process_invite_response
-    if let Some(response) = invite.process_invite_response(&acceptance_event, alice_sk)? {
+    if let Some(response) =
+        InviteActor::new(invite.clone()).process_invite_response(&acceptance_event, alice_sk)?
+    {
         assert_eq!(response.invitee_identity.to_bytes(), bob_pk.to_bytes());
         assert_eq!(response.device_id, Some("bob-device".to_string()));
         assert_eq!(
@@ -64,7 +68,7 @@ fn test_from_user_subscription() -> Result<()> {
     // Create event channel for from_user()
     let (event_tx, _event_rx) = crossbeam_channel::unbounded::<SessionManagerEvent>();
 
-    Invite::from_user(alice_pk, &event_tx)?;
+    InviteActor::from_user(alice_pk, &event_tx)?;
 
     // Test that we can parse the invite from the signed event
     let parsed_invite = Invite::from_event(&signed_event)?;
@@ -86,15 +90,18 @@ fn test_listen_without_device_id() -> Result<()> {
     let bob_pk = bob_keys.public_key();
     let bob_sk = bob_keys.secret_key().to_secret_bytes();
 
-    let (_bob_session, acceptance_event) = invite.accept_with_owner(bob_pk, bob_sk, None, None)?;
+    let (_bob_session, acceptance_event) =
+        InviteActor::new(invite.clone()).accept_with_owner(bob_pk, bob_sk, None, None)?;
 
     // Create event channel for listen()
     let (event_tx, _event_rx) = crossbeam_channel::unbounded::<SessionManagerEvent>();
 
-    invite.listen(&event_tx)?;
+    InviteActor::new(invite.clone()).listen(&event_tx)?;
 
     // Directly process the invite response
-    if let Some(response) = invite.process_invite_response(&acceptance_event, alice_sk)? {
+    if let Some(response) =
+        InviteActor::new(invite.clone()).process_invite_response(&acceptance_event, alice_sk)?
+    {
         assert_eq!(response.invitee_identity.to_bytes(), bob_pk.to_bytes());
         assert_eq!(response.device_id, None);
         assert!(response.owner_public_key.is_none());
@@ -119,13 +126,13 @@ fn test_owner_claim_verification_requires_app_keys_for_multi_device() -> Result<
     let owner_keys = Keys::generate();
     let owner_pk = owner_keys.public_key();
 
-    let (_session, response_event) = invite.accept_with_owner(
+    let (_session, response_event) = InviteActor::new(invite.clone()).accept_with_owner(
         device_pk,
         device_sk,
         Some("device-1".to_string()),
         Some(owner_pk),
     )?;
-    let response = invite
+    let response = InviteActor::new(invite.clone())
         .process_invite_response(&response_event, alice_sk)?
         .expect("expected invite response");
 
@@ -152,9 +159,13 @@ fn test_owner_claim_verification_allows_single_device_without_app_keys() -> Resu
     let device_pk = device_keys.public_key();
     let device_sk = device_keys.secret_key().to_secret_bytes();
 
-    let (_session, response_event) =
-        invite.accept_with_owner(device_pk, device_sk, None, Some(device_pk))?;
-    let response = invite
+    let (_session, response_event) = InviteActor::new(invite.clone()).accept_with_owner(
+        device_pk,
+        device_sk,
+        None,
+        Some(device_pk),
+    )?;
+    let response = InviteActor::new(invite.clone())
         .process_invite_response(&response_event, alice_sk)?
         .expect("expected invite response");
 

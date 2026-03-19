@@ -5,7 +5,7 @@ mod common;
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
 
-use nostr_double_ratchet::{Invite, INVITE_EVENT_KIND};
+use nostr_double_ratchet::{InviteActor, INVITE_EVENT_KIND};
 
 /// Run ndr CLI command and return JSON output
 async fn run_ndr(data_dir: &std::path::Path, args: &[&str]) -> serde_json::Value {
@@ -85,7 +85,7 @@ async fn test_publish_fetch_and_message_both_ways() {
         .expect("Expected invite event");
 
     let invite =
-        Invite::from_event(invite_event).expect("Failed to parse invite from fetched event");
+        InviteActor::from_event(invite_event).expect("Failed to parse invite from fetched event");
 
     assert_eq!(invite.inviter.to_hex(), alice_pubkey.to_hex());
     let fetched_url = invite.get_url("https://iris.to").unwrap();
@@ -117,7 +117,7 @@ async fn test_publish_fetch_and_message_both_ways() {
     );
 
     let stored = &stored_invites[0];
-    let alice_invite = Invite::deserialize(&stored.serialized)
+    let alice_invite = InviteActor::deserialize(&stored.serialized)
         .expect("Failed to deserialize Alice's stored invite");
 
     let response = alice_invite

@@ -3,8 +3,8 @@ use crossbeam_channel::{Receiver, TryRecvError};
 use nostr::ToBech32;
 use nostr_double_ratchet::{
     CreateGroupOptions, FanoutGroupMetadataOptions, FileStorageAdapter, GroupManager,
-    GroupManagerOptions, GroupSendEvent, Session, SessionManager, SessionManagerEvent,
-    StorageAdapter, CHAT_MESSAGE_KIND, REACTION_KIND,
+    GroupManagerOptions, GroupSendEvent, SessionActor as Session, SessionManager,
+    SessionManagerEvent, StorageAdapter, CHAT_MESSAGE_KIND, REACTION_KIND,
 };
 use nostr_sdk::Client;
 use serde::Serialize;

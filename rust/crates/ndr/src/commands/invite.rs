@@ -252,7 +252,8 @@ pub async fn accept(
         .map_err(|e| anyhow::anyhow!("Invalid event JSON: {}", e))?;
 
     // Process the acceptance - creates session
-    let result = invite.process_invite_response(&event, our_private_key)?;
+    let result = nostr_double_ratchet::InviteActor::new(invite.clone())
+        .process_invite_response(&event, our_private_key)?;
 
     let response = result.ok_or_else(|| anyhow::anyhow!("Failed to process invite acceptance"))?;
     let resolved_owner = response.resolved_owner_pubkey();
@@ -442,7 +443,7 @@ mod tests {
         let owner_keys = nostr::Keys::generate();
         let owner_pubkey = owner_keys.public_key();
 
-        let (_session, response_event) = invite
+        let (_session, response_event) = nostr_double_ratchet::InviteActor::new(invite.clone())
             .accept_with_owner(
                 owner_pubkey,
                 owner_keys.secret_key().to_secret_bytes(),
@@ -493,7 +494,7 @@ mod tests {
         let device_keys = nostr::Keys::generate();
         let owner_keys = nostr::Keys::generate();
 
-        let (_session, response_event) = invite
+        let (_session, response_event) = nostr_double_ratchet::InviteActor::new(invite.clone())
             .accept_with_owner(
                 device_keys.public_key(),
                 device_keys.secret_key().to_secret_bytes(),

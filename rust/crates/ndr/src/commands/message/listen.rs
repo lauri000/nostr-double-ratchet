@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 
 use nostr_double_ratchet::{
-    FileStorageAdapter, NdrRuntime, OneToManyChannel, Session, SessionManager, SessionManagerEvent,
-    StorageAdapter, CHAT_MESSAGE_KIND, CHAT_SETTINGS_KIND, GROUP_METADATA_KIND, REACTION_KIND,
-    RECEIPT_KIND, TYPING_KIND,
+    FileStorageAdapter, InviteActor, NdrRuntime, OneToManyChannel, Session,
+    SessionActor as LiveSession, SessionManager, SessionManagerEvent, StorageAdapter,
+    CHAT_MESSAGE_KIND, CHAT_SETTINGS_KIND, GROUP_METADATA_KIND, REACTION_KIND, RECEIPT_KIND,
+    TYPING_KIND,
 };
 
 use crate::commands::owner_claim::{
@@ -1643,7 +1644,9 @@ pub async fn listen(
                         Err(_) => continue,
                     };
 
-                    match invite.process_invite_response(&event, our_private_key) {
+                    match InviteActor::new(invite.clone())
+                        .process_invite_response(&event, our_private_key)
+                    {
                         Ok(Some(response)) => {
                             let resolved_owner = response.resolved_owner_pubkey();
                             let their_pubkey = match resolve_verified_owner_pubkey(
@@ -1728,16 +1731,10 @@ pub async fn listen(
                                     &existing_chat.session_state
                                 ) {
                                     Ok(existing_state) => {
-                                        let existing_can_send = Session::new(
-                                            existing_state.clone(),
-                                            existing_chat.id.clone(),
-                                        )
-                                        .can_send();
-                                        let response_can_send = Session::new(
-                                            response_state.clone(),
-                                            existing_chat.id.clone(),
-                                        )
-                                        .can_send();
+                                        let existing_can_send =
+                                            Session::new(existing_state.clone()).can_send();
+                                        let response_can_send =
+                                            Session::new(response_state.clone()).can_send();
                                         if existing_can_send && !response_can_send {
                                             existing_state
                                         } else {
@@ -1974,19 +1971,18 @@ pub async fn listen(
                             serde_json::from_str::<nostr_double_ratchet::SessionState>(
                                 &existing_chat.session_state,
                             )
-                            .map(|state| Session::new(state, existing_chat.id.clone()).can_send())
+                            .map(|state| Session::new(state).can_send())
                             .unwrap_or(false);
                         existing_can_send || existing_chat.last_message_at.is_some()
                     }) {
                         continue;
                     }
 
-                    if let Ok((mut accept_session, response_event)) = invite.accept_with_owner(
-                        my_pubkey_key,
-                        our_private_key,
-                        None,
-                        Some(owner_pubkey),
-                    ) {
+                    if let Ok((mut accept_session, response_event)) = InviteActor::new(
+                        invite.clone(),
+                    )
+                    .accept_with_owner(my_pubkey_key, our_private_key, None, Some(owner_pubkey))
+                    {
                         // Merge into existing chat if present; otherwise create one.
                         let mut chat = if let Some(mut existing_chat) =
                             storage.get_chat_by_pubkey(&signer_owner_hex)?
@@ -1996,16 +1992,10 @@ pub async fn listen(
                                     &existing_chat.session_state,
                                 ) {
                                     Ok(existing_state) => {
-                                        let existing_can_send = Session::new(
-                                            existing_state.clone(),
-                                            existing_chat.id.clone(),
-                                        )
-                                        .can_send();
-                                        let accepted_can_send = Session::new(
-                                            accept_session.state.clone(),
-                                            existing_chat.id.clone(),
-                                        )
-                                        .can_send();
+                                        let existing_can_send =
+                                            Session::new(existing_state.clone()).can_send();
+                                        let accepted_can_send =
+                                            Session::new(accept_session.state.clone()).can_send();
                                         if existing_can_send && !accepted_can_send {
                                             existing_state
                                         } else {
@@ -2236,7 +2226,7 @@ pub async fn listen(
                             Err(_) => continue,
                         };
 
-                    let mut session = Session::new(session_state, chat.id.clone());
+                    let mut session = LiveSession::new(session_state, chat.id.clone());
 
                     match session.receive(&event) {
                         Ok(Some(decrypted_event_json)) => {

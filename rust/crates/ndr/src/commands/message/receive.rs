@@ -1,7 +1,8 @@
 use anyhow::Result;
 
 use nostr_double_ratchet::{
-    Session, CHAT_MESSAGE_KIND, CHAT_SETTINGS_KIND, REACTION_KIND, RECEIPT_KIND, TYPING_KIND,
+    SessionActor as Session, CHAT_MESSAGE_KIND, CHAT_SETTINGS_KIND, REACTION_KIND, RECEIPT_KIND,
+    TYPING_KIND,
 };
 
 use crate::output::Output;

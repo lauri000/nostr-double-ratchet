@@ -4,10 +4,11 @@ use crate::output::Output;
 use crate::storage::Storage;
 use crate::storage::StoredChat;
 use nostr::JsonUtil;
+use nostr_double_ratchet::InviteActor;
 use std::sync::Once;
 use tempfile::TempDir;
 
-fn create_test_session() -> nostr_double_ratchet::Session {
+fn create_test_session() -> nostr_double_ratchet::SessionActor {
     // Create an invite
     let alice_keys = nostr::Keys::generate();
     let bob_keys = nostr::Keys::generate();
@@ -17,7 +18,7 @@ fn create_test_session() -> nostr_double_ratchet::Session {
 
     // Bob accepts the invite - this creates a session where Bob can send
     let bob_pk = bob_keys.public_key();
-    let (bob_session, _response) = invite
+    let (bob_session, _response) = InviteActor::new(invite.clone())
         .accept_with_owner(
             bob_pk,
             bob_keys.secret_key().to_secret_bytes(),
@@ -32,8 +33,8 @@ fn create_test_session() -> nostr_double_ratchet::Session {
 fn create_test_session_pair() -> (
     nostr::Keys,
     nostr::Keys,
-    nostr_double_ratchet::Session,
-    nostr_double_ratchet::Session,
+    nostr_double_ratchet::SessionActor,
+    nostr_double_ratchet::SessionActor,
 ) {
     // Create an invite
     let alice_keys = nostr::Keys::generate();
@@ -44,7 +45,7 @@ fn create_test_session_pair() -> (
 
     // Bob accepts: Bob becomes the initiator (can send first).
     let bob_pk = bob_keys.public_key();
-    let (bob_session, response) = invite
+    let (bob_session, response) = InviteActor::new(invite.clone())
         .accept_with_owner(
             bob_pk,
             bob_keys.secret_key().to_secret_bytes(),
@@ -54,7 +55,7 @@ fn create_test_session_pair() -> (
         .unwrap();
 
     // Alice processes response: Alice must receive first.
-    let alice_session = invite
+    let alice_session = InviteActor::new(invite.clone())
         .process_invite_response(&response, alice_keys.secret_key().to_secret_bytes())
         .unwrap()
         .unwrap()
@@ -187,7 +188,7 @@ async fn test_send_fans_out_to_all_known_recipient_devices_in_session_manager() 
         None,
     )
     .unwrap();
-    let (session1, _) = invite1
+    let (session1, _) = InviteActor::new(invite1.clone())
         .accept_with_owner(
             sender_keys.public_key(),
             sender_keys.secret_key().to_secret_bytes(),
@@ -202,7 +203,7 @@ async fn test_send_fans_out_to_all_known_recipient_devices_in_session_manager() 
         None,
     )
     .unwrap();
-    let (session2, _) = invite2
+    let (session2, _) = InviteActor::new(invite2.clone())
         .accept_with_owner(
             sender_keys.public_key(),
             sender_keys.secret_key().to_secret_bytes(),

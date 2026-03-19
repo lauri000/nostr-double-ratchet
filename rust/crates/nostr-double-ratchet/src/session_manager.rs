@@ -1,8 +1,8 @@
 use crate::{
     apply_app_keys_snapshot, is_app_keys_event, resolve_invite_owner_routing, AppKeys,
-    AppKeysSnapshotDecision, DeviceEntry, InMemoryStorage, Invite, MessageQueue, NostrPubSub,
-    OneToManyChannel, Result, SenderKeyDistribution, SenderKeyState, StorageAdapter, UserRecord,
-    GROUP_SENDER_KEY_DISTRIBUTION_KIND,
+    AppKeysSnapshotDecision, DeviceEntry, InMemoryStorage, Invite, InviteActor, MessageQueue,
+    NostrPubSub, OneToManyChannel, Result, SenderKeyDistribution, SenderKeyState, StorageAdapter,
+    UserRecord, GROUP_SENDER_KEY_DISTRIBUTION_KIND,
 };
 use nostr::{Keys, PublicKey, Tag, UnsignedEvent};
 use serde::{Deserialize, Serialize};
@@ -133,7 +133,7 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    fn session_can_receive(session: &crate::Session) -> bool {
+    fn session_can_receive(session: &crate::SessionActor) -> bool {
         session.state.receiving_chain_key.is_some()
             || session.state.their_current_nostr_public_key.is_some()
             || session.state.receiving_chain_message_number > 0
@@ -355,7 +355,7 @@ impl SessionManager {
         });
 
         // Subscribe to invite responses using Invite's own filter (with #p tag)
-        invite.listen_with_pubsub(self.pubsub.as_ref())?;
+        InviteActor::new(invite.clone()).listen_with_pubsub(self.pubsub.as_ref())?;
 
         // Publish our invite (signed with device identity key)
         if let Ok(unsigned) = invite.get_event() {
@@ -662,7 +662,7 @@ impl SessionManager {
         device_id: Option<String>,
         state: crate::SessionState,
     ) -> Result<()> {
-        let mut session = crate::Session::new(state, "imported".to_string());
+        let mut session = crate::SessionActor::new(state, "imported".to_string());
         session.set_pubsub(self.pubsub.clone());
         let _ = session.subscribe_to_messages();
 
@@ -796,7 +796,8 @@ impl SessionManager {
                 continue;
             }
 
-            let Ok(Some(response)) = invite.process_invite_response(&event, our_identity_key)
+            let Ok(Some(response)) =
+                InviteActor::new(invite.clone()).process_invite_response(&event, our_identity_key)
             else {
                 continue;
             };
@@ -992,12 +993,13 @@ impl SessionManager {
         }
 
         let result = (|| -> Result<AcceptInviteResult> {
-            let (mut session, response_event) = invite.accept_with_owner(
-                self.our_public_key,
-                self.our_identity_key,
-                Some(self.device_id.clone()),
-                Some(self.owner_public_key),
-            )?;
+            let (mut session, response_event) = InviteActor::new(invite.clone())
+                .accept_with_owner(
+                    self.our_public_key,
+                    self.our_identity_key,
+                    Some(self.device_id.clone()),
+                    Some(self.owner_public_key),
+                )?;
 
             self.pubsub.publish_signed(response_event)?;
 
@@ -2103,7 +2105,8 @@ impl SessionManager {
                 continue;
             }
 
-            let Ok(Some(response)) = invite.process_invite_response(&event, our_identity_key)
+            let Ok(Some(response)) =
+                InviteActor::new(invite.clone()).process_invite_response(&event, our_identity_key)
             else {
                 continue;
             };
@@ -2184,7 +2187,7 @@ impl SessionManager {
             return;
         }
 
-        let _ = Invite::from_user_with_pubsub(device_pubkey, self.pubsub.as_ref());
+        let _ = InviteActor::from_user_with_pubsub(device_pubkey, self.pubsub.as_ref());
     }
 
     fn upsert_device_record(record: &mut UserRecord, device_id: &str) {
@@ -2404,7 +2407,7 @@ impl SessionManager {
     }
 
     fn sign_bootstrap_schedule(
-        session: &mut crate::Session,
+        session: &mut crate::SessionActor,
         bootstrap_messages: &[UnsignedEvent],
     ) -> Vec<nostr::Event> {
         let mut bootstrap_events = Vec::new();
@@ -2636,14 +2639,14 @@ impl SessionManager {
 
                 if let Some(state) = device.active_session {
                     let mut session =
-                        crate::Session::new(state, format!("session-{}", device.device_id));
+                        crate::SessionActor::new(state, format!("session-{}", device.device_id));
                     session.set_pubsub(self.pubsub.clone());
                     let _ = session.subscribe_to_messages();
                     device_record.active_session = Some(session);
                 }
 
                 for state in device.inactive_sessions {
-                    let mut session = crate::Session::new(
+                    let mut session = crate::SessionActor::new(
                         state,
                         format!("session-{}-inactive", device.device_id),
                     );
@@ -2723,8 +2726,7 @@ impl SessionManager {
             }
 
             if let Some(state) = self.invite_state.lock().unwrap().as_ref() {
-                match state
-                    .invite
+                match InviteActor::new(state.invite.clone())
                     .process_invite_response(&event, state.our_identity_key)
                 {
                     Ok(Some(response)) => {

@@ -198,8 +198,8 @@ pub async fn accept(url: &str, config: &Config, storage: &Storage, output: &Outp
     let owner_pubkey = nostr_double_ratchet::utils::pubkey_from_hex(&owner_pubkey_hex)?;
     let owner_private_key = config.private_key_bytes()?;
 
-    let (_session, response_event) =
-        invite.accept_with_owner(owner_pubkey, owner_private_key, None, Some(owner_pubkey))?;
+    let (_session, response_event) = nostr_double_ratchet::InviteActor::new(invite.clone())
+        .accept_with_owner(owner_pubkey, owner_private_key, None, Some(owner_pubkey))?;
 
     // Publish to relays if configured
     let relays = config.resolved_relays();

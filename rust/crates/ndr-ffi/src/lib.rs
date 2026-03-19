@@ -8,8 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nostr_double_ratchet::{
     AppKeys, CreateGroupOptions, DeviceEntry, FileStorageAdapter, GroupData, GroupDecryptedEvent,
-    GroupSendEvent, InMemoryStorage, Invite, NdrRuntime, Session, SessionManagerEvent,
-    SessionState, StorageAdapter,
+    GroupSendEvent, InMemoryStorage, Invite, InviteActor, NdrRuntime, SessionActor,
+    SessionManagerEvent, SessionState, StorageAdapter,
 };
 
 mod error;
@@ -240,7 +240,7 @@ pub fn resolve_conversation_candidate_pubkeys(
 /// FFI wrapper for Invite.
 #[derive(uniffi::Object)]
 pub struct InviteHandle {
-    inner: Mutex<Invite>,
+    inner: Mutex<InviteActor>,
 }
 
 #[uniffi::export]
@@ -253,7 +253,7 @@ impl InviteHandle {
         max_uses: Option<u32>,
     ) -> Result<Arc<Self>, NdrError> {
         let inviter = nostr_double_ratchet::utils::pubkey_from_hex(&inviter_pubkey_hex)?;
-        let invite = Invite::create_new(inviter, device_id, max_uses.map(|n| n as usize))?;
+        let invite = InviteActor::create_new(inviter, device_id, max_uses.map(|n| n as usize))?;
         Ok(Arc::new(Self {
             inner: Mutex::new(invite),
         }))
@@ -262,7 +262,7 @@ impl InviteHandle {
     /// Parse an invite from a URL.
     #[uniffi::constructor]
     pub fn from_url(url: String) -> Result<Arc<Self>, NdrError> {
-        let invite = Invite::from_url(&url)?;
+        let invite = InviteActor::from_url(&url)?;
         Ok(Arc::new(Self {
             inner: Mutex::new(invite),
         }))
@@ -272,7 +272,7 @@ impl InviteHandle {
     #[uniffi::constructor]
     pub fn from_event_json(event_json: String) -> Result<Arc<Self>, NdrError> {
         let event: nostr::Event = serde_json::from_str(&event_json)?;
-        let invite = Invite::from_event(&event)?;
+        let invite = InviteActor::from_event(&event)?;
         Ok(Arc::new(Self {
             inner: Mutex::new(invite),
         }))
@@ -281,7 +281,7 @@ impl InviteHandle {
     /// Deserialize an invite from JSON.
     #[uniffi::constructor]
     pub fn deserialize(json: String) -> Result<Arc<Self>, NdrError> {
-        let invite = Invite::deserialize(&json)?;
+        let invite = InviteActor::deserialize(&json)?;
         Ok(Arc::new(Self {
             inner: Mutex::new(invite),
         }))
@@ -416,7 +416,7 @@ impl InviteHandle {
 /// FFI wrapper for Session.
 #[derive(uniffi::Object)]
 pub struct SessionHandle {
-    inner: Mutex<Session>,
+    inner: Mutex<SessionActor>,
 }
 
 #[uniffi::export]
@@ -435,7 +435,8 @@ impl SessionHandle {
         let our_privkey = parse_private_key(&our_ephemeral_privkey_hex)?;
         let shared_secret = parse_secret(&shared_secret_hex)?;
 
-        let session = Session::init(their_pubkey, our_privkey, is_initiator, shared_secret, name)?;
+        let session =
+            SessionActor::init(their_pubkey, our_privkey, is_initiator, shared_secret, name)?;
 
         Ok(Arc::new(Self {
             inner: Mutex::new(session),
@@ -447,7 +448,7 @@ impl SessionHandle {
     pub fn from_state_json(state_json: String) -> Result<Arc<Self>, NdrError> {
         let state: SessionState =
             nostr_double_ratchet::utils::deserialize_session_state(&state_json)?;
-        let session = Session::new(state, "restored".to_string());
+        let session = SessionActor::new(state, "restored".to_string());
 
         Ok(Arc::new(Self {
             inner: Mutex::new(session),

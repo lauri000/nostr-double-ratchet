@@ -1,5 +1,5 @@
 use nostr::{EventBuilder, JsonUtil, Keys, Kind, Tag, UnsignedEvent};
-use nostr_double_ratchet::{Result, Session};
+use nostr_double_ratchet::{Result, SessionActor as Session};
 
 #[test]
 fn test_alice_bob_conversation() -> Result<()> {

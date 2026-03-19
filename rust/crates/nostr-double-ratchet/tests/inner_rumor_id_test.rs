@@ -6,8 +6,8 @@ use crossbeam_channel::Receiver;
 use nostr::nips::nip44::{self, Version};
 use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp, UnsignedEvent};
 use nostr_double_ratchet::{
-    utils::kdf, Header, InMemoryStorage, Invite, Session, SessionManager, SessionManagerEvent,
-    MESSAGE_EVENT_KIND,
+    utils::kdf, Header, InMemoryStorage, Invite, InviteActor, SessionActor as Session,
+    SessionManager, SessionManagerEvent, MESSAGE_EVENT_KIND,
 };
 use sha2::{Digest, Sha256};
 
@@ -130,7 +130,7 @@ fn test_session_receive_recomputes_inner_rumor_id_and_stays_in_sync() {
     let invite = Invite::create_new(alice_keys.public_key(), None, None).unwrap();
 
     // Bob accepts: Bob becomes the initiator (can send first).
-    let (mut bob_session, response) = invite
+    let (mut bob_session, response) = InviteActor::new(invite.clone())
         .accept(
             bob_keys.public_key(),
             bob_keys.secret_key().to_secret_bytes(),
@@ -139,7 +139,7 @@ fn test_session_receive_recomputes_inner_rumor_id_and_stays_in_sync() {
         .unwrap();
 
     // Alice processes response: Alice must receive first.
-    let mut alice_session = invite
+    let mut alice_session = InviteActor::new(invite.clone())
         .process_invite_response(&response, alice_keys.secret_key().to_secret_bytes())
         .unwrap()
         .unwrap()
@@ -181,7 +181,7 @@ fn test_session_manager_delivers_messages_with_recomputed_inner_id() {
     let invite = Invite::create_new(alice_keys.public_key(), None, None).unwrap();
 
     // Bob initiator session
-    let (mut bob_session, response) = invite
+    let (mut bob_session, response) = InviteActor::new(invite.clone())
         .accept(
             bob_keys.public_key(),
             bob_keys.secret_key().to_secret_bytes(),
@@ -190,7 +190,7 @@ fn test_session_manager_delivers_messages_with_recomputed_inner_id() {
         .unwrap();
 
     // Alice responder session state (to import into manager)
-    let alice_session = invite
+    let alice_session = InviteActor::new(invite.clone())
         .process_invite_response(&response, alice_keys.secret_key().to_secret_bytes())
         .unwrap()
         .unwrap()

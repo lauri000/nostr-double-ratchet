@@ -1,4 +1,4 @@
-use crate::{Session, SessionState};
+use crate::{SessionActor, SessionState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -17,8 +17,8 @@ pub struct StoredDeviceRecord {
 pub struct DeviceRecord {
     pub device_id: String,
     pub public_key: String,
-    pub active_session: Option<Session>,
-    pub inactive_sessions: Vec<Session>,
+    pub active_session: Option<SessionActor>,
+    pub inactive_sessions: Vec<SessionActor>,
     pub created_at: u64,
     pub is_stale: bool,
     pub stale_timestamp: Option<u64>,
@@ -44,7 +44,7 @@ impl UserRecord {
         }
     }
 
-    pub fn upsert_session(&mut self, device_id: Option<&str>, session: Session) {
+    pub fn upsert_session(&mut self, device_id: Option<&str>, session: SessionActor) {
         let device_id = device_id.unwrap_or("unknown").to_string();
 
         let device = self
@@ -118,7 +118,7 @@ impl UserRecord {
         );
     }
 
-    fn session_priority(session: &Session) -> (u8, u32, u32) {
+    fn session_priority(session: &SessionActor) -> (u8, u32, u32) {
         let can_send = session.can_send();
         let can_receive = session.state.receiving_chain_key.is_some()
             || session.state.their_current_nostr_public_key.is_some()
@@ -177,12 +177,12 @@ impl UserRecord {
         device.inactive_sessions = inactive_sessions;
     }
 
-    pub fn get_all_sessions_mut(&mut self) -> Vec<&mut Session> {
+    pub fn get_all_sessions_mut(&mut self) -> Vec<&mut SessionActor> {
         if self.is_stale {
             return Vec::new();
         }
 
-        let mut sessions: Vec<&mut Session> = Vec::new();
+        let mut sessions: Vec<&mut SessionActor> = Vec::new();
         for device in self.device_records.values_mut().filter(|d| !d.is_stale) {
             if let Some(ref mut active) = device.active_session {
                 sessions.push(active);
@@ -194,12 +194,12 @@ impl UserRecord {
         sessions
     }
 
-    pub fn get_active_sessions_mut(&mut self) -> Vec<&mut Session> {
+    pub fn get_active_sessions_mut(&mut self) -> Vec<&mut SessionActor> {
         if self.is_stale {
             return Vec::new();
         }
 
-        let mut sessions: Vec<&mut Session> = self
+        let mut sessions: Vec<&mut SessionActor> = self
             .device_records
             .values_mut()
             .filter(|d| !d.is_stale)
@@ -267,13 +267,13 @@ mod tests {
         can_receive: bool,
         receiving_chain_message_number: u32,
         sending_chain_message_number: u32,
-    ) -> Session {
+    ) -> SessionActor {
         let our_current = Keys::generate();
         let our_next = Keys::generate();
         let their_current = Keys::generate();
         let their_next = Keys::generate();
 
-        Session::new(
+        SessionActor::new(
             SessionState {
                 root_key: [1u8; 32],
                 their_current_nostr_public_key: can_receive.then(|| their_current.public_key()),

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use nostr_double_ratchet::{Invite, Session};
+use nostr_double_ratchet::{InviteActor, SessionActor as Session};
 use std::path::Path;
 
 mod helpers {
@@ -115,7 +115,7 @@ fn create_session_pair(
     bob_pk: &nostr::PublicKey,
     bob_sk: &[u8; 32],
 ) -> (Session, Session, nostr::Event) {
-    let invite = Invite::create_new(*alice_pk, None, None).unwrap();
+    let invite = InviteActor::create_new(*alice_pk, None, None).unwrap();
     let (bob_session, response_event) = invite.accept(*bob_pk, *bob_sk, None).unwrap();
 
     let alice_session = invite

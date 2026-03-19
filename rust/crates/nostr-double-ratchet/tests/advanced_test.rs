@@ -1,7 +1,7 @@
 use nostr::Keys;
 use nostr_double_ratchet::{
     utils::{deserialize_session_state, serialize_session_state},
-    Result, Session,
+    Result, SessionActor as Session,
 };
 
 #[test]
