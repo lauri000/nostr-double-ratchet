@@ -151,12 +151,8 @@ pub fn custom_public_device_invite(
     device_id: Option<DeviceId>,
 ) -> Result<Invite> {
     let mut ctx = context(seed, now_secs);
-    let mut invite = Invite::create_new(
-        &mut ctx,
-        device.device_pubkey.as_owner(),
-        device_id,
-        None,
-    )?;
+    let mut invite =
+        Invite::create_new(&mut ctx, device.device_pubkey.as_owner(), device_id, None)?;
     invite.owner_public_key = Some(device.owner_pubkey);
     if invite.device_id.is_some() {
         public_invite_via_event(&invite, device.secret_key)

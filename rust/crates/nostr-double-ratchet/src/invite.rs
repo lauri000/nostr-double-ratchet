@@ -176,7 +176,7 @@ impl Invite {
         let jitter = if ctx.now_secs.get() == 0 {
             0
         } else {
-            (ctx.rng.next_u64() % (2 * 24 * 60 * 60)) as u64
+            ctx.rng.next_u64() % (2 * 24 * 60 * 60)
         };
         let created_at = UnixSeconds(ctx.now_secs.get().saturating_sub(jitter));
 

@@ -1,7 +1,6 @@
 pub mod app_keys;
 pub mod codec;
 pub mod error;
-pub mod group;
 pub mod ids;
 pub mod invite;
 pub mod peer_book;
@@ -14,15 +13,7 @@ mod utils;
 
 pub use app_keys::{AppKeys, DeviceEntry, DeviceLabels};
 pub use error::{CodecError, DomainError, Error, Result};
-pub use group::{
-    add_group_admin, add_group_member, apply_metadata_update, build_group_metadata_content,
-    create_group_data, generate_group_secret, is_group_admin, parse_group_metadata,
-    remove_group_admin, remove_group_member, update_group_data, validate_metadata_creation,
-    validate_metadata_update, GroupData, GroupMetadata, GroupUpdate, MetadataValidation,
-    GROUP_INVITE_RUMOR_KIND, GROUP_METADATA_KIND, GROUP_SENDER_KEY_DISTRIBUTION_KIND,
-    GROUP_SENDER_KEY_MESSAGE_KIND,
-};
-pub use ids::{DeviceId, DevicePubkey, GroupId, OwnerPubkey, UnixMillis, UnixSeconds};
+pub use ids::{DeviceId, DevicePubkey, OwnerPubkey, UnixMillis, UnixSeconds};
 pub use invite::{
     IncomingInviteResponseEnvelope, Invite, InviteResponse, OutgoingInviteResponseEnvelope,
 };
@@ -40,8 +31,8 @@ pub use session_manager::{
     UserRecordSnapshot,
 };
 pub use state::{
-    AppKeysSnapshotDecision, DeviceSnapshot, GroupMutation, InviteAcceptance, LocalSnapshot,
-    NdrSnapshot, NdrState, PeerSnapshot, PreparedDirectMessage,
+    AppKeysSnapshotDecision, DeviceSnapshot, InviteAcceptance, LocalSnapshot, NdrSnapshot,
+    NdrState, PeerSnapshot, PreparedDirectMessage,
     ProcessedInviteResponse as NdrProcessedInviteResponse,
     ReceivedDirectMessage as NdrReceivedDirectMessage,
 };
@@ -61,7 +52,6 @@ mod architecture_tests {
     fn domain_modules_do_not_pull_in_background_runtime_primitives() {
         const FILES: &[&str] = &[
             include_str!("app_keys.rs"),
-            include_str!("group.rs"),
             include_str!("ids.rs"),
             include_str!("invite.rs"),
             include_str!("peer_book.rs"),

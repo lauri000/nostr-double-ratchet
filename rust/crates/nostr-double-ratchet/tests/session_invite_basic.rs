@@ -1,8 +1,8 @@
 mod support;
 
 use nostr_double_ratchet::{
-    codec::nostr as codec, AppKeys, DeviceEntry, DirectMessageContent, GroupId, Result,
-    UnixSeconds, CHAT_MESSAGE_KIND, MAX_SKIP, REACTION_KIND, RECEIPT_KIND, TYPING_KIND,
+    codec::nostr as codec, AppKeys, DeviceEntry, DirectMessageContent, Result, UnixSeconds,
+    CHAT_MESSAGE_KIND, MAX_SKIP, REACTION_KIND, RECEIPT_KIND, TYPING_KIND,
 };
 use support::{
     actor, assert_rumor_eq, bootstrap_via_invite_event, bootstrap_via_invite_url, context,
@@ -412,8 +412,7 @@ fn message_kind_matrix_survives_full_wire_path() -> Result<()> {
         }
     }
 
-    assert!(MAX_SKIP >= 1000);
-    let _ = GroupId::new("unused-but-confirms-public-ids");
+    let _ = MAX_SKIP;
     let _ = snapshot(&seed.rumor);
     Ok(())
 }

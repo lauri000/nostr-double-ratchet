@@ -1,10 +1,8 @@
 use crate::{
-    apply_metadata_update, create_group_data, parse_group_metadata, validate_metadata_creation,
-    validate_metadata_update, AppKeys, DeviceId, DeviceLabels, DevicePubkey, DomainError,
-    GroupData, GroupMetadata, IncomingDirectMessageEnvelope, IncomingInviteResponseEnvelope,
-    Invite, InviteResponse, MetadataValidation, OutgoingDirectMessageEnvelope,
+    AppKeys, DeviceId, DeviceLabels, DevicePubkey, DomainError, IncomingDirectMessageEnvelope,
+    IncomingInviteResponseEnvelope, Invite, InviteResponse, OutgoingDirectMessageEnvelope,
     OutgoingInviteResponseEnvelope, OwnerPubkey, PeerBook, Result, Rumor, StoredPeerBook,
-    UnixMillis, UnixSeconds,
+    UnixSeconds,
 };
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -15,7 +13,6 @@ pub use crate::types::ProtocolContext;
 pub struct NdrState {
     local: LocalState,
     peers: BTreeMap<OwnerPubkey, PeerState>,
-    groups: BTreeMap<crate::GroupId, GroupData>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +43,6 @@ pub enum AppKeysSnapshotDecision {
 pub struct NdrSnapshot {
     pub local: LocalSnapshot,
     pub peers: Vec<PeerSnapshot>,
-    pub groups: Vec<GroupData>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,14 +100,6 @@ pub struct ProcessedInviteResponse {
     pub invitee_identity: DevicePubkey,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupMutation {
-    Created,
-    Updated,
-    Removed,
-    Rejected,
-}
-
 impl NdrState {
     pub fn new(
         owner_pubkey: OwnerPubkey,
@@ -127,7 +115,6 @@ impl NdrState {
                 app_keys_created_at: UnixSeconds(0),
             },
             peers: BTreeMap::new(),
-            groups: BTreeMap::new(),
         }
     }
 
@@ -153,7 +140,6 @@ impl NdrState {
                 authorized_devices: snapshot_devices(self.local.app_keys.as_ref()),
             },
             peers: self.peers.values().map(PeerState::snapshot).collect(),
-            groups: self.groups.values().cloned().collect(),
         }
     }
 
@@ -351,77 +337,6 @@ impl NdrState {
         }))
     }
 
-    pub fn create_group<R>(
-        &mut self,
-        ctx: &mut ProtocolContext<'_, R>,
-        name: &str,
-        member_pubkeys: &[OwnerPubkey],
-    ) -> GroupData
-    where
-        R: RngCore + CryptoRng,
-    {
-        let group = create_group_data(ctx, name, self.local.owner_pubkey, member_pubkeys);
-        self.groups.insert(group.id.clone(), group.clone());
-        group
-    }
-
-    pub fn insert_group(&mut self, group: GroupData) {
-        self.groups.insert(group.id.clone(), group);
-    }
-
-    pub fn apply_group_metadata_content(
-        &mut self,
-        content: &str,
-        sender_pubkey: OwnerPubkey,
-    ) -> Result<GroupMutation> {
-        let metadata = parse_group_metadata(content)?;
-        Ok(self.apply_group_metadata(&metadata, sender_pubkey))
-    }
-
-    pub fn apply_group_metadata(
-        &mut self,
-        metadata: &GroupMetadata,
-        sender_pubkey: OwnerPubkey,
-    ) -> GroupMutation {
-        match self.groups.get(&metadata.id) {
-            Some(existing) => match validate_metadata_update(
-                existing,
-                metadata,
-                sender_pubkey,
-                self.local.owner_pubkey,
-            ) {
-                MetadataValidation::Accept => {
-                    let updated = apply_metadata_update(existing, metadata);
-                    self.groups.insert(updated.id.clone(), updated);
-                    GroupMutation::Updated
-                }
-                MetadataValidation::Removed => {
-                    self.groups.remove(&metadata.id);
-                    GroupMutation::Removed
-                }
-                MetadataValidation::Reject => GroupMutation::Rejected,
-            },
-            None => {
-                if !validate_metadata_creation(metadata, sender_pubkey, self.local.owner_pubkey) {
-                    return GroupMutation::Rejected;
-                }
-                let group = GroupData {
-                    id: metadata.id.clone(),
-                    name: metadata.name.clone(),
-                    description: metadata.description.clone(),
-                    picture: metadata.picture.clone(),
-                    members: metadata.members.clone(),
-                    admins: metadata.admins.clone(),
-                    created_at: UnixMillis(0),
-                    secret: metadata.secret.clone(),
-                    accepted: Some(true),
-                };
-                self.groups.insert(group.id.clone(), group);
-                GroupMutation::Created
-            }
-        }
-    }
-
     fn peer_state_mut(&mut self, owner_pubkey: OwnerPubkey) -> &mut PeerState {
         self.peers.entry(owner_pubkey).or_insert_with(|| PeerState {
             owner_pubkey,
@@ -504,9 +419,8 @@ fn apply_app_keys_snapshot(
 mod tests {
     use super::*;
     use crate::{
-        add_group_member, build_group_metadata_content, device_pubkey_from_secret_bytes,
-        remove_group_member, update_group_data, AppKeysSnapshotDecision, DeviceEntry,
-        DirectMessageContent, GroupUpdate, IncomingDirectMessageEnvelope, ProtocolContext,
+        device_pubkey_from_secret_bytes, AppKeysSnapshotDecision, DeviceEntry,
+        DirectMessageContent, IncomingDirectMessageEnvelope, ProtocolContext, UnixMillis,
     };
     use rand::{rngs::StdRng, SeedableRng};
 
@@ -645,67 +559,6 @@ mod tests {
         let snapshot = state.snapshot();
         assert_eq!(snapshot.local.authorized_devices.len(), 2);
         assert_eq!(snapshot.peers.len(), 1);
-    }
-
-    #[test]
-    fn group_create_update_remove_flow() {
-        let alice_secret = [35u8; 32];
-        let bob_secret = [36u8; 32];
-        let alice_owner = device_pubkey_from_secret_bytes(&alice_secret)
-            .unwrap()
-            .as_owner();
-        let bob_owner = device_pubkey_from_secret_bytes(&bob_secret)
-            .unwrap()
-            .as_owner();
-
-        let mut alice = single_device_state(alice_secret, "alice-device");
-        let mut bob = single_device_state(bob_secret, "bob-device");
-
-        let mut create_ctx = context(7, 1_700_002_000, 1_700_002_000_000);
-        let group = alice.create_group(&mut create_ctx, "Test Group", &[bob_owner]);
-        let group_content = build_group_metadata_content(&group, false).unwrap();
-        assert_eq!(
-            bob.apply_group_metadata_content(&group_content, alice_owner)
-                .unwrap(),
-            GroupMutation::Created
-        );
-
-        let updated_group = update_group_data(
-            &group,
-            &GroupUpdate {
-                name: Some("Renamed Group".to_string()),
-                description: Some("desc".to_string()),
-                picture: None,
-            },
-            alice_owner,
-        )
-        .unwrap();
-        let update_content = build_group_metadata_content(&updated_group, false).unwrap();
-        assert_eq!(
-            bob.apply_group_metadata_content(&update_content, alice_owner)
-                .unwrap(),
-            GroupMutation::Updated
-        );
-
-        let removal_ctx = context(8, 1_700_002_100, 1_700_002_100_000);
-        let removed_group =
-            remove_group_member(&updated_group, bob_owner, alice_owner, removal_ctx.rng).unwrap();
-        let removal_content = build_group_metadata_content(&removed_group, false).unwrap();
-        assert_eq!(
-            bob.apply_group_metadata_content(&removal_content, alice_owner)
-                .unwrap(),
-            GroupMutation::Removed
-        );
-
-        let add_ctx = context(9, 1_700_002_200, 1_700_002_200_000);
-        let readded_group =
-            add_group_member(&removed_group, bob_owner, alice_owner, add_ctx.rng).unwrap();
-        let readd_content = build_group_metadata_content(&readded_group, false).unwrap();
-        assert_eq!(
-            bob.apply_group_metadata_content(&readd_content, alice_owner)
-                .unwrap(),
-            GroupMutation::Created
-        );
     }
 
     #[test]

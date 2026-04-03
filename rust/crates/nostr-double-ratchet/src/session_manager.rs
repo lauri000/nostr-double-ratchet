@@ -634,9 +634,9 @@ impl SessionManager {
             .public_invite
             .as_ref()
             .is_none_or(|existing| public_invite.created_at >= existing.created_at);
-        if should_replace_invite && public_invite.device_id.is_some() {
-            record.device_id = public_invite.device_id.clone();
-        } else if record.device_id.is_none() && public_invite.device_id.is_some() {
+        if public_invite.device_id.is_some()
+            && (should_replace_invite || record.device_id.is_none())
+        {
             record.device_id = public_invite.device_id.clone();
         }
         record.created_at = merge_created_at(record.created_at, public_invite.created_at);
@@ -918,9 +918,7 @@ impl DeviceRecord {
             let is_duplicate = active_state
                 .as_ref()
                 .is_some_and(|state| *state == session.state)
-                || unique_states
-                    .iter()
-                    .any(|state: &SessionState| *state == session.state);
+                || unique_states.contains(&session.state);
             if is_duplicate {
                 continue;
             }

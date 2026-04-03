@@ -516,10 +516,7 @@ fn skip_message_keys(state: &mut SessionState, until: u32, sender: DevicePubkey)
         return Err(DomainError::TooManySkippedMessages.into());
     }
 
-    let entry = state
-        .skipped_keys
-        .entry(sender)
-        .or_insert_with(SkippedKeysEntry::default);
+    let entry = state.skipped_keys.entry(sender).or_default();
 
     while state.receiving_chain_message_number < until {
         let receiving_chain_key = state

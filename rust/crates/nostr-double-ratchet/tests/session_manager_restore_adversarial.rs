@@ -26,7 +26,10 @@ fn incoming_response_from_public_invite(
     owner_pubkey: Option<OwnerPubkey>,
     seed: u64,
     now_secs: u64,
-) -> Result<(nostr_double_ratchet::Session, nostr_double_ratchet::IncomingInviteResponseEnvelope)> {
+) -> Result<(
+    nostr_double_ratchet::Session,
+    nostr_double_ratchet::IncomingInviteResponseEnvelope,
+)> {
     let mut accept_ctx = support::context(seed, now_secs);
     let (session, response) = public_invite.accept_with_owner(
         &mut accept_ctx,
@@ -161,7 +164,11 @@ fn older_or_incomplete_invite_does_not_erase_known_device_metadata() -> Result<(
 
     let complete = custom_public_device_invite(&bob, 331, 331, Some(bob.device_id.clone()))?;
     let incomplete = custom_public_device_invite(&bob, 332, 100, None)?;
-    observe_device_invites(&mut alice_manager, bob.owner_pubkey, &[complete.clone(), incomplete])?;
+    observe_device_invites(
+        &mut alice_manager,
+        bob.owner_pubkey,
+        &[complete.clone(), incomplete],
+    )?;
 
     let snapshot = alice_manager.snapshot();
     let bob_record = manager_device_snapshot(
@@ -181,7 +188,8 @@ fn older_or_incomplete_invite_does_not_erase_known_device_metadata() -> Result<(
 }
 
 #[test]
-fn delayed_invite_response_for_superseded_bootstrap_does_not_corrupt_active_session() -> Result<()> {
+fn delayed_invite_response_for_superseded_bootstrap_does_not_corrupt_active_session() -> Result<()>
+{
     let alice = manager_device(71, 178, "alice-1");
     let bob = manager_device(72, 179, "bob-1");
     let mut alice_manager = session_manager(&alice, 60 * 60);
@@ -204,7 +212,11 @@ fn delayed_invite_response_for_superseded_bootstrap_does_not_corrupt_active_sess
 
     let bob_invite = manager_public_device_invite(&mut bob_manager, &bob, 344, 344)?;
     alice_manager.observe_device_invite(bob.owner_pubkey, bob_invite)?;
-    let fresh = alice_manager.prepare_send_text(&mut support::context(345, 345), bob.owner_pubkey, "fresh".into())?;
+    let fresh = alice_manager.prepare_send_text(
+        &mut support::context(345, 345),
+        bob.owner_pubkey,
+        "fresh".into(),
+    )?;
     assert_eq!(fresh.invite_responses.len(), 1);
 
     let mut restored = restore_manager(&alice_manager.snapshot(), alice.secret_key, 60 * 60)?;
@@ -249,7 +261,11 @@ fn delayed_message_from_old_session_after_rebootstrap_does_not_take_over_newer_a
     let bob_invite = manager_public_device_invite(&mut bob_manager, &bob, 354, 354)?;
     alice_manager.observe_device_invite(bob.owner_pubkey, bob_invite)?;
 
-    let fresh = alice_manager.prepare_send_text(&mut support::context(355, 355), bob.owner_pubkey, "fresh".into())?;
+    let fresh = alice_manager.prepare_send_text(
+        &mut support::context(355, 355),
+        bob.owner_pubkey,
+        "fresh".into(),
+    )?;
     manager_observe_invite_response(
         &mut bob_manager,
         &mut support::context(356, 356),
@@ -262,7 +278,11 @@ fn delayed_message_from_old_session_after_rebootstrap_does_not_take_over_newer_a
         &fresh.deliveries[0],
     )?;
 
-    let new_reply = bob_manager.prepare_send_text(&mut support::context(358, 358), alice.owner_pubkey, "new-reply".into())?;
+    let new_reply = bob_manager.prepare_send_text(
+        &mut support::context(358, 358),
+        alice.owner_pubkey,
+        "new-reply".into(),
+    )?;
     manager_receive_delivery(
         &mut alice_manager,
         &mut support::context(359, 359),
@@ -298,12 +318,13 @@ fn delayed_message_from_old_session_after_rebootstrap_does_not_take_over_newer_a
         bob.device_pubkey,
     );
     assert_eq!(after_record.active_session, before_record);
-    assert!(after_record.inactive_sessions.len() >= 1);
+    assert!(!after_record.inactive_sessions.is_empty());
     Ok(())
 }
 
 #[test]
-fn partial_restore_with_cached_invite_but_no_appkeys_still_surfaces_missing_appkeys_gap() -> Result<()> {
+fn partial_restore_with_cached_invite_but_no_appkeys_still_surfaces_missing_appkeys_gap(
+) -> Result<()> {
     let alice = manager_device(75, 182, "alice-1");
     let bob = manager_device(76, 183, "bob-1");
     let mut alice_manager = session_manager(&alice, 60 * 60);
@@ -313,7 +334,11 @@ fn partial_restore_with_cached_invite_but_no_appkeys_still_surfaces_missing_appk
     alice_manager.observe_device_invite(bob.owner_pubkey, bob_invite)?;
 
     let mut restored = restore_manager(&alice_manager.snapshot(), alice.secret_key, 60 * 60)?;
-    let prepared = restored.prepare_send_text(&mut support::context(371, 371), bob.owner_pubkey, "gap".into())?;
+    let prepared = restored.prepare_send_text(
+        &mut support::context(371, 371),
+        bob.owner_pubkey,
+        "gap".into(),
+    )?;
     assert_eq!(
         prepared.relay_gaps,
         vec![RelayGap::MissingAppKeys {
@@ -340,7 +365,10 @@ fn pruned_stale_device_is_not_recreated_by_late_old_invite_observation_without_n
     alice_manager.observe_device_invite(bob.owner_pubkey, bob_invite.clone())?;
     alice_manager.observe_peer_app_keys(bob.owner_pubkey, app_keys_for(&[], 382), UnixSeconds(382));
     let prune = alice_manager.prune_stale_records(UnixSeconds(393));
-    assert_eq!(prune.removed_devices, vec![(bob.owner_pubkey, bob.device_pubkey)]);
+    assert_eq!(
+        prune.removed_devices,
+        vec![(bob.owner_pubkey, bob.device_pubkey)]
+    );
 
     let before = snapshot(&alice_manager.snapshot());
     alice_manager.observe_device_invite(bob.owner_pubkey, bob_invite)?;
