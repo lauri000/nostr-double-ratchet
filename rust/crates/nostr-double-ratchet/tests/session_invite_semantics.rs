@@ -1,8 +1,6 @@
 mod support;
 
-use nostr_double_ratchet::{
-    codec::nostr as codec, DomainError, Error, Invite, Result,
-};
+use nostr_double_ratchet::{codec::nostr as codec, DomainError, Error, Invite, Result};
 use support::{
     actor, context, corrupt_invite_response_layer, invite_response_fixture, receive_event,
     send_message, snapshot, InviteResponseCorruption, ROOT_URL,
@@ -42,11 +40,8 @@ fn response_is_bound_to_the_specific_invite_instance() -> Result<()> {
 
     let before_b = snapshot(&invite_b);
     let mut process_ctx = context(11_003, 1_700_400_003);
-    let wrong_invite = invite_b.process_invite_response(
-        &mut process_ctx,
-        &incoming_response,
-        alice.secret_key,
-    );
+    let wrong_invite =
+        invite_b.process_invite_response(&mut process_ctx, &incoming_response, alice.secret_key);
     assert!(wrong_invite.is_err());
     assert_eq!(snapshot(&invite_b), before_b);
 
@@ -83,7 +78,10 @@ fn invite_max_uses_is_enforced() -> Result<()> {
             fixture.alice.secret_key,
         )?
         .expect("expected first invite response");
-    assert_eq!(fixture.owned_invite.used_by, vec![fixture.bob.device_pubkey]);
+    assert_eq!(
+        fixture.owned_invite.used_by,
+        vec![fixture.bob.device_pubkey]
+    );
 
     let mut accept_ctx = context(11_101, 1_700_401_011);
     let second_accept = fixture.owned_invite.accept(
@@ -118,7 +116,10 @@ fn invite_max_uses_is_enforced() -> Result<()> {
         second_process,
         Err(Error::Domain(DomainError::InviteExhausted))
     ));
-    assert_eq!(fixture.owned_invite.used_by, vec![fixture.bob.device_pubkey]);
+    assert_eq!(
+        fixture.owned_invite.used_by,
+        vec![fixture.bob.device_pubkey]
+    );
     Ok(())
 }
 
@@ -181,8 +182,11 @@ fn unbounded_invite_can_bootstrap_multiple_independent_sessions() -> Result<()> 
         nostr_double_ratchet::DirectMessageContent::Text("from-bob".to_string()),
     )?;
     let mut alice_bob_recv_ctx = context(11_206, 1_700_402_006);
-    let bob_received =
-        receive_event(&mut alice_bob_session, &mut alice_bob_recv_ctx, &bob_sent.event)?;
+    let bob_received = receive_event(
+        &mut alice_bob_session,
+        &mut alice_bob_recv_ctx,
+        &bob_sent.event,
+    )?;
     assert_eq!(bob_received.content, "from-bob");
 
     let mut carol_send_ctx = context(11_207, 1_700_402_007);

@@ -6,6 +6,7 @@ pub mod ids;
 pub mod invite;
 pub mod peer_book;
 pub mod session;
+pub mod session_manager;
 pub mod state;
 pub mod types;
 
@@ -33,10 +34,16 @@ pub use session::{
     ReceiveOutcome, ReceivePlan, Rumor, SendOutcome, SendPlan, SerializableKeyPair, Session,
     SessionState, SkippedKeysEntry,
 };
+pub use session_manager::{
+    DeviceDelivery, DeviceRecordSnapshot, PreparedFanout, ProcessedInviteResponse, PruneReport,
+    ReceivedDirectMessage, RelayGap, SessionManager, SessionManagerPolicy, SessionManagerSnapshot,
+    UserRecordSnapshot,
+};
 pub use state::{
     AppKeysSnapshotDecision, DeviceSnapshot, GroupMutation, InviteAcceptance, LocalSnapshot,
-    NdrSnapshot, NdrState, PeerSnapshot, PreparedDirectMessage, ProcessedInviteResponse,
-    ReceivedDirectMessage,
+    NdrSnapshot, NdrState, PeerSnapshot, PreparedDirectMessage,
+    ProcessedInviteResponse as NdrProcessedInviteResponse,
+    ReceivedDirectMessage as NdrReceivedDirectMessage,
 };
 pub use types::{
     ProtocolContext, APP_KEYS_EVENT_KIND, CHAT_MESSAGE_KIND, CHAT_SETTINGS_KIND, EXPIRATION_TAG,
@@ -59,6 +66,7 @@ mod architecture_tests {
             include_str!("invite.rs"),
             include_str!("peer_book.rs"),
             include_str!("session.rs"),
+            include_str!("session_manager.rs"),
             include_str!("state.rs"),
             include_str!("types.rs"),
         ];

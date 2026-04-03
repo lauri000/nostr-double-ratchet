@@ -2,7 +2,7 @@ mod support;
 
 use nostr_double_ratchet::{
     codec::nostr as codec, AppKeys, DeviceEntry, DirectMessageContent, GroupId, Result,
-    CHAT_MESSAGE_KIND, REACTION_KIND, RECEIPT_KIND, TYPING_KIND, UnixSeconds, MAX_SKIP,
+    UnixSeconds, CHAT_MESSAGE_KIND, MAX_SKIP, REACTION_KIND, RECEIPT_KIND, TYPING_KIND,
 };
 use support::{
     actor, assert_rumor_eq, bootstrap_via_invite_event, bootstrap_via_invite_url, context,
@@ -48,11 +48,9 @@ fn post_bootstrap_bidirectional_ping_pong_over_many_turns() -> Result<()> {
     let mut boot = bootstrap_via_invite_url(1_700_100_200)?;
     let mut seen_ids = std::collections::BTreeSet::new();
 
-    for (index, text) in [
-        "m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9", "m10",
-    ]
-    .into_iter()
-    .enumerate()
+    for (index, text) in ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9", "m10"]
+        .into_iter()
+        .enumerate()
     {
         let from_bob = index % 2 == 0;
         let secs = 1_700_100_210 + index as u64 * 2;
@@ -102,7 +100,8 @@ fn post_bootstrap_bidirectional_ping_pong_over_many_turns() -> Result<()> {
 
 #[test]
 fn same_sender_burst_before_reply() -> Result<()> {
-    let (_alice, _bob, mut alice_session, mut bob_session) = direct_session_pair(1, 2, 1_700_100_300)?;
+    let (_alice, _bob, mut alice_session, mut bob_session) =
+        direct_session_pair(1, 2, 1_700_100_300)?;
 
     let mut sent_messages = Vec::new();
     for index in 0..5 {
@@ -135,7 +134,8 @@ fn same_sender_burst_before_reply() -> Result<()> {
 
 #[test]
 fn out_of_order_within_single_chain_recovers_skipped_messages() -> Result<()> {
-    let (_alice, _bob, mut alice_session, mut bob_session) = direct_session_pair(3, 4, 1_700_100_500)?;
+    let (_alice, _bob, mut alice_session, mut bob_session) =
+        direct_session_pair(3, 4, 1_700_100_500)?;
 
     let mut sent = Vec::new();
     for index in 0..4 {
@@ -148,7 +148,10 @@ fn out_of_order_within_single_chain_recovers_skipped_messages() -> Result<()> {
     }
 
     for (receive_index, sent_index) in [3usize, 1, 0, 2].into_iter().enumerate() {
-        let mut recv_ctx = context(600 + receive_index as u64, 1_700_100_520 + receive_index as u64);
+        let mut recv_ctx = context(
+            600 + receive_index as u64,
+            1_700_100_520 + receive_index as u64,
+        );
         let received = receive_event(&mut bob_session, &mut recv_ctx, &sent[sent_index].event)?;
         assert_rumor_eq(&received, &sent[sent_index].rumor);
     }
@@ -158,7 +161,8 @@ fn out_of_order_within_single_chain_recovers_skipped_messages() -> Result<()> {
 
 #[test]
 fn cross_chain_out_of_order_after_dh_ratchet_recovers_previous_chain_messages() -> Result<()> {
-    let (_alice, _bob, mut alice_session, mut bob_session) = direct_session_pair(5, 6, 1_700_100_600)?;
+    let (_alice, _bob, mut alice_session, mut bob_session) =
+        direct_session_pair(5, 6, 1_700_100_600)?;
 
     let mut send_ctx = context(700, 1_700_100_610);
     let old_1 = send_message(
@@ -184,7 +188,8 @@ fn cross_chain_out_of_order_after_dh_ratchet_recovers_previous_chain_messages() 
         DirectMessageContent::Text("reply-1".to_string()),
     )?;
     let mut alice_recv_ctx = context(704, 1_700_100_614);
-    let alice_received_reply = receive_event(&mut alice_session, &mut alice_recv_ctx, &bob_reply.event)?;
+    let alice_received_reply =
+        receive_event(&mut alice_session, &mut alice_recv_ctx, &bob_reply.event)?;
     assert_rumor_eq(&alice_received_reply, &bob_reply.rumor);
 
     let mut new_chain_ctx = context(705, 1_700_100_615);
@@ -216,14 +221,16 @@ fn cross_chain_out_of_order_after_dh_ratchet_recovers_previous_chain_messages() 
         DirectMessageContent::Text("reply-2".to_string()),
     )?;
     let mut recv_ctx = context(709, 1_700_100_619);
-    let received_final_reply = receive_event(&mut alice_session, &mut recv_ctx, &final_reply.event)?;
+    let received_final_reply =
+        receive_event(&mut alice_session, &mut recv_ctx, &final_reply.event)?;
     assert_rumor_eq(&received_final_reply, &final_reply.rumor);
     Ok(())
 }
 
 #[test]
 fn session_state_serde_roundtrip_mid_conversation() -> Result<()> {
-    let (_alice, _bob, mut alice_session, mut bob_session) = direct_session_pair(7, 8, 1_700_100_700)?;
+    let (_alice, _bob, mut alice_session, mut bob_session) =
+        direct_session_pair(7, 8, 1_700_100_700)?;
 
     for index in 0..3 {
         let mut send_ctx = context(800 + index, 1_700_100_710 + index);
@@ -310,7 +317,8 @@ fn invite_owner_claim_with_appkeys_proof_verifies() -> Result<()> {
         Some(alice.device_id.clone()),
         None,
     )?;
-    let public_invite = codec::parse_invite_url(&codec::invite_url(&owned_invite, support::ROOT_URL)?)?;
+    let public_invite =
+        codec::parse_invite_url(&codec::invite_url(&owned_invite, support::ROOT_URL)?)?;
 
     let mut bob_accept_ctx = context(1101, 1_700_100_901);
     let (_bob_session, response_envelope) = public_invite.accept_with_owner(
@@ -341,7 +349,8 @@ fn invite_owner_claim_with_appkeys_proof_verifies() -> Result<()> {
 
 #[test]
 fn message_kind_matrix_survives_full_wire_path() -> Result<()> {
-    let (_alice, _bob, mut alice_session, mut bob_session) = direct_session_pair(18, 19, 1_700_101_000)?;
+    let (_alice, _bob, mut alice_session, mut bob_session) =
+        direct_session_pair(18, 19, 1_700_101_000)?;
 
     let mut seed_ctx = context(1200, 1_700_101_001);
     let seed = send_message(
@@ -380,7 +389,11 @@ fn message_kind_matrix_survives_full_wire_path() -> Result<()> {
             RECEIPT_KIND,
             "seen".to_string(),
         ),
-        (DirectMessageContent::Typing, TYPING_KIND, "typing".to_string()),
+        (
+            DirectMessageContent::Typing,
+            TYPING_KIND,
+            "typing".to_string(),
+        ),
     ];
 
     for (index, (content, kind, body)) in cases.into_iter().enumerate() {
@@ -392,7 +405,10 @@ fn message_kind_matrix_survives_full_wire_path() -> Result<()> {
         assert_eq!(received.kind, kind);
         assert_eq!(received.content, body);
         if kind != TYPING_KIND {
-            assert!(received.tags.iter().any(|tag| tag.iter().any(|value| value == &seed_id)));
+            assert!(received
+                .tags
+                .iter()
+                .any(|tag| tag.iter().any(|value| value == &seed_id)));
         }
     }
 

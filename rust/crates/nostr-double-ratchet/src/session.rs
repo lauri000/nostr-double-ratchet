@@ -584,9 +584,7 @@ fn decrypt_header(
 
     if let Some(previous) = &state.our_previous_nostr_key {
         let previous_sk = secret_key_from_bytes(&previous.private_key)?;
-        if let Ok(decrypted) =
-            nip44::decrypt(&previous_sk, &sender.to_nostr()?, encrypted_header)
-        {
+        if let Ok(decrypted) = nip44::decrypt(&previous_sk, &sender.to_nostr()?, encrypted_header) {
             let header: Header = serde_json::from_str(&decrypted)?;
             return Ok((header, HeaderDecryptionTarget::Previous));
         }

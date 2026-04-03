@@ -1,17 +1,18 @@
 mod support;
 
 use nostr_double_ratchet::{
-    codec::nostr as codec, AppKeys, DeviceEntry, DirectMessageContent, DomainError, Error,
-    Invite, Result, UnixSeconds, MESSAGE_EVENT_KIND, MAX_SKIP,
+    codec::nostr as codec, AppKeys, DeviceEntry, DirectMessageContent, DomainError, Error, Invite,
+    Result, UnixSeconds, MAX_SKIP, MESSAGE_EVENT_KIND,
 };
 use support::{
-    actor, context, direct_session_pair, header_tag, mutate_text, receive_event,
-    receive_message, send_message, signed_event, snapshot, ROOT_URL,
+    actor, context, direct_session_pair, header_tag, mutate_text, receive_event, receive_message,
+    send_message, signed_event, snapshot, ROOT_URL,
 };
 
 #[test]
 fn replayed_message_is_rejected_and_state_unchanged() -> Result<()> {
-    let (_alice, _bob, mut alice_session, mut bob_session) = direct_session_pair(21, 22, 1_700_200_000)?;
+    let (_alice, _bob, mut alice_session, mut bob_session) =
+        direct_session_pair(21, 22, 1_700_200_000)?;
 
     let mut send_ctx = context(1, 1_700_200_010);
     let sent = send_message(
@@ -34,7 +35,8 @@ fn replayed_message_is_rejected_and_state_unchanged() -> Result<()> {
 
 #[test]
 fn tampered_ciphertext_is_rejected_and_state_unchanged() -> Result<()> {
-    let (_alice, _bob, mut alice_session, mut bob_session) = direct_session_pair(23, 24, 1_700_200_100)?;
+    let (_alice, _bob, mut alice_session, mut bob_session) =
+        direct_session_pair(23, 24, 1_700_200_100)?;
 
     let before = snapshot(&bob_session.state);
     let mut send_ctx = context(4, 1_700_200_110);
@@ -55,7 +57,8 @@ fn tampered_ciphertext_is_rejected_and_state_unchanged() -> Result<()> {
 
 #[test]
 fn tampered_encrypted_header_is_rejected_and_state_unchanged() -> Result<()> {
-    let (_alice, _bob, mut alice_session, mut bob_session) = direct_session_pair(25, 26, 1_700_200_200)?;
+    let (_alice, _bob, mut alice_session, mut bob_session) =
+        direct_session_pair(25, 26, 1_700_200_200)?;
 
     let before = snapshot(&bob_session.state);
     let mut send_ctx = context(6, 1_700_200_210);
@@ -76,7 +79,8 @@ fn tampered_encrypted_header_is_rejected_and_state_unchanged() -> Result<()> {
 
 #[test]
 fn wrong_sender_identity_is_rejected_before_decrypt() -> Result<()> {
-    let (_alice, _bob, mut alice_session, mut bob_session) = direct_session_pair(27, 28, 1_700_200_300)?;
+    let (_alice, _bob, mut alice_session, mut bob_session) =
+        direct_session_pair(27, 28, 1_700_200_300)?;
     let impostor = actor(29, "mallory-device");
 
     let before = snapshot(&bob_session.state);
@@ -91,7 +95,10 @@ fn wrong_sender_identity_is_rejected_before_decrypt() -> Result<()> {
 
     let mut recv_ctx = context(9, 1_700_200_311);
     let result = receive_message(&mut bob_session, &mut recv_ctx, &tampered);
-    assert!(matches!(result, Err(Error::Domain(DomainError::UnexpectedSender))));
+    assert!(matches!(
+        result,
+        Err(Error::Domain(DomainError::UnexpectedSender))
+    ));
     assert_eq!(snapshot(&bob_session.state), before);
     Ok(())
 }
@@ -131,7 +138,8 @@ fn dm_event_missing_or_wrong_header_tag_fails_parse() -> Result<()> {
 
 #[test]
 fn max_skip_exceeded_is_rejected_and_state_unchanged() -> Result<()> {
-    let (_alice, _bob, mut alice_session, mut bob_session) = direct_session_pair(31, 32, 1_700_200_500)?;
+    let (_alice, _bob, mut alice_session, mut bob_session) =
+        direct_session_pair(31, 32, 1_700_200_500)?;
     let before = snapshot(&bob_session.state);
 
     let mut last = None;
@@ -145,7 +153,11 @@ fn max_skip_exceeded_is_rejected_and_state_unchanged() -> Result<()> {
     }
 
     let mut recv_ctx = context(999, 1_700_200_999);
-    let result = receive_event(&mut bob_session, &mut recv_ctx, &last.expect("last event").event);
+    let result = receive_event(
+        &mut bob_session,
+        &mut recv_ctx,
+        &last.expect("last event").event,
+    );
     assert!(matches!(
         result,
         Err(Error::Domain(DomainError::TooManySkippedMessages))
@@ -270,8 +282,11 @@ fn public_only_invite_cannot_process_response() -> Result<()> {
     let incoming_response = codec::parse_invite_response_event(&response_event)?;
 
     let mut process_ctx = context(22, 1_700_200_802);
-    let url_result =
-        public_url_invite.process_invite_response(&mut process_ctx, &incoming_response, alice.secret_key);
+    let url_result = public_url_invite.process_invite_response(
+        &mut process_ctx,
+        &incoming_response,
+        alice.secret_key,
+    );
     assert!(url_result.is_err());
 
     let mut process_ctx = context(23, 1_700_200_803);

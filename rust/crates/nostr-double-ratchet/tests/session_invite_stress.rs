@@ -1,9 +1,9 @@
 mod support;
 
-use nostr_double_ratchet::{CodecError, Error, MAX_SKIP, Result};
+use nostr_double_ratchet::{CodecError, Error, Result, MAX_SKIP};
 use support::{
-    checkpoint_session, context, direct_session_pair, mutate_text, receive_message, restore_session,
-    snapshot, DeliveryScript, Side,
+    checkpoint_session, context, direct_session_pair, mutate_text, receive_message,
+    restore_session, snapshot, DeliveryScript, Side,
 };
 
 fn assert_receive_plan_pure(
@@ -192,8 +192,12 @@ fn previous_header_key_is_only_retained_one_ratchet_deep() -> Result<()> {
         script.send_text(Side::Bob, &mut alice_session, &mut bob_session, "reply-one")?;
     let _ = script.deliver(bob_reply_one, &mut alice_session, &mut bob_session)?;
 
-    let chain_one =
-        script.send_text(Side::Alice, &mut alice_session, &mut bob_session, "chain-one")?;
+    let chain_one = script.send_text(
+        Side::Alice,
+        &mut alice_session,
+        &mut bob_session,
+        "chain-one",
+    )?;
     let _ = script.deliver(chain_one, &mut alice_session, &mut bob_session)?;
 
     let previous_ok = script.deliver(delayed_one, &mut alice_session, &mut bob_session)?;
@@ -203,12 +207,19 @@ fn previous_header_key_is_only_retained_one_ratchet_deep() -> Result<()> {
         script.send_text(Side::Bob, &mut alice_session, &mut bob_session, "reply-two")?;
     let _ = script.deliver(bob_reply_two, &mut alice_session, &mut bob_session)?;
 
-    let chain_two =
-        script.send_text(Side::Alice, &mut alice_session, &mut bob_session, "chain-two")?;
+    let chain_two = script.send_text(
+        Side::Alice,
+        &mut alice_session,
+        &mut bob_session,
+        "chain-two",
+    )?;
     let _ = script.deliver(chain_two, &mut alice_session, &mut bob_session)?;
 
     let two_deep = script.deliver(delayed_two, &mut alice_session, &mut bob_session);
-    assert!(matches!(two_deep, Err(Error::Codec(CodecError::InvalidHeader))));
+    assert!(matches!(
+        two_deep,
+        Err(Error::Codec(CodecError::InvalidHeader))
+    ));
     Ok(())
 }
 
@@ -227,8 +238,7 @@ fn invalid_previous_chain_message_does_not_poison_future_messages() -> Result<()
     )?;
     let _ = script.deliver(first, &mut alice_session, &mut bob_session)?;
 
-    let bob_reply =
-        script.send_text(Side::Bob, &mut alice_session, &mut bob_session, "reply")?;
+    let bob_reply = script.send_text(Side::Bob, &mut alice_session, &mut bob_session, "reply")?;
     let _ = script.deliver(bob_reply, &mut alice_session, &mut bob_session)?;
 
     let current_chain = script.send_text(
@@ -276,8 +286,7 @@ fn plan_receive_is_pure_across_current_next_and_previous_header_paths() -> Resul
         1_700_305_100,
     )?;
 
-    let bob_reply =
-        script.send_text(Side::Bob, &mut alice_session, &mut bob_session, "reply")?;
+    let bob_reply = script.send_text(Side::Bob, &mut alice_session, &mut bob_session, "reply")?;
     let _ = script.deliver(bob_reply, &mut alice_session, &mut bob_session)?;
 
     let delayed_previous = script.send_text(
@@ -286,12 +295,8 @@ fn plan_receive_is_pure_across_current_next_and_previous_header_paths() -> Resul
         &mut bob_session,
         "previous",
     )?;
-    let ratchet_trigger = script.send_text(
-        Side::Alice,
-        &mut alice_session,
-        &mut bob_session,
-        "next",
-    )?;
+    let ratchet_trigger =
+        script.send_text(Side::Alice, &mut alice_session, &mut bob_session, "next")?;
 
     assert_receive_plan_pure(
         &bob_session,
