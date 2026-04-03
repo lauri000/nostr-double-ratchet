@@ -23,6 +23,12 @@ pub enum DomainError {
     #[error("Unexpected sender for session")]
     UnexpectedSender,
 
+    #[error("Invite exhausted")]
+    InviteExhausted,
+
+    #[error("Invite already used")]
+    InviteAlreadyUsed,
+
     #[error("Invalid state: {0}")]
     InvalidState(String),
 }

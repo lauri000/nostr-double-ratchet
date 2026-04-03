@@ -161,7 +161,7 @@ fn wrong_inviter_private_key_cannot_process_response() -> Result<()> {
     let wrong_alice = actor(35, "wrong-alice-device");
 
     let mut invite_ctx = context(11, 1_700_200_600);
-    let owned_invite = Invite::create_new(
+    let mut owned_invite = Invite::create_new(
         &mut invite_ctx,
         alice.owner_pubkey,
         Some(alice.device_id.clone()),
@@ -195,7 +195,7 @@ fn tampered_invite_response_is_rejected_and_invite_state_stays_usable() -> Resul
     let bob = actor(37, "bob-device");
 
     let mut invite_ctx = context(14, 1_700_200_700);
-    let owned_invite = Invite::create_new(
+    let mut owned_invite = Invite::create_new(
         &mut invite_ctx,
         alice.owner_pubkey,
         Some(alice.device_id.clone()),
@@ -254,9 +254,10 @@ fn public_only_invite_cannot_process_response() -> Result<()> {
         Some(alice.device_id.clone()),
         None,
     )?;
-    let public_url_invite = codec::parse_invite_url(&codec::invite_url(&owned_invite, ROOT_URL)?)?;
+    let mut public_url_invite =
+        codec::parse_invite_url(&codec::invite_url(&owned_invite, ROOT_URL)?)?;
     let invite_event = codec::invite_unsigned_event(&owned_invite)?.sign_with_keys(&alice.keys)?;
-    let public_event_invite = codec::parse_invite_event(&invite_event)?;
+    let mut public_event_invite = codec::parse_invite_event(&invite_event)?;
 
     let mut accept_ctx = context(21, 1_700_200_801);
     let (_bob_session, response_envelope) = public_url_invite.accept(
@@ -291,7 +292,7 @@ fn forged_owner_claim_without_appkeys_proof_stays_unverified() -> Result<()> {
     let unrelated_device = actor(43, "unrelated-device");
 
     let mut invite_ctx = context(24, 1_700_200_900);
-    let owned_invite = Invite::create_new(
+    let mut owned_invite = Invite::create_new(
         &mut invite_ctx,
         alice.owner_pubkey,
         Some(alice.device_id.clone()),

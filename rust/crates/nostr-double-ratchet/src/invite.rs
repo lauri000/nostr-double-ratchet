@@ -1,6 +1,6 @@
 use crate::{
-    random_secret_key_bytes, secret_key_from_bytes, DeviceId, DevicePubkey, OwnerPubkey,
-    ProtocolContext, Result, Session, UnixSeconds,
+    random_secret_key_bytes, secret_key_from_bytes, DeviceId, DevicePubkey, DomainError,
+    OwnerPubkey, ProtocolContext, Result, Session, UnixSeconds,
 };
 use base64::Engine;
 use nostr::nips::nip44::{self, Version};
@@ -127,6 +127,8 @@ impl Invite {
     where
         R: RngCore + CryptoRng,
     {
+        self.ensure_accept_allowed(invitee_public_key)?;
+
         let invitee_session_key = random_secret_key_bytes(ctx.rng)?;
         let invitee_session_public_key =
             crate::device_pubkey_from_secret_bytes(&invitee_session_key)?;
@@ -191,7 +193,7 @@ impl Invite {
     }
 
     pub fn process_invite_response<R>(
-        &self,
+        &mut self,
         ctx: &mut ProtocolContext<'_, R>,
         envelope: &IncomingInviteResponseEnvelope,
         inviter_private_key: [u8; 32],
@@ -230,6 +232,7 @@ impl Invite {
         )?;
 
         let payload: InviteResponsePayload = serde_json::from_str(&dh_decrypted)?;
+        self.ensure_accept_allowed(inner_event.pubkey)?;
         let session = Session::init(
             ctx,
             payload.session_key,
@@ -238,6 +241,7 @@ impl Invite {
             self.shared_secret,
             None,
         )?;
+        self.record_use(inner_event.pubkey);
 
         Ok(Some(InviteResponse {
             session,
@@ -245,6 +249,27 @@ impl Invite {
             device_id: payload.device_id,
             owner_public_key: payload.owner_public_key,
         }))
+    }
+
+    fn ensure_accept_allowed(&self, invitee_public_key: DevicePubkey) -> Result<()> {
+        if self.used_by.contains(&invitee_public_key) {
+            return Err(DomainError::InviteAlreadyUsed.into());
+        }
+        if self
+            .max_uses
+            .is_some_and(|max_uses| self.used_by.len() >= max_uses)
+        {
+            return Err(DomainError::InviteExhausted.into());
+        }
+        Ok(())
+    }
+
+    fn record_use(&mut self, invitee_public_key: DevicePubkey) {
+        if self.used_by.contains(&invitee_public_key) {
+            return;
+        }
+        self.used_by.push(invitee_public_key);
+        self.used_by.sort();
     }
 }
 

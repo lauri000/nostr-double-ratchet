@@ -72,6 +72,12 @@ pub fn invite_url(invite: &Invite, root: &str) -> Result<String> {
         "sharedSecret".to_string(),
         serde_json::Value::String(hex::encode(invite.shared_secret)),
     );
+    if let Some(device_id) = &invite.device_id {
+        data.insert(
+            "deviceId".to_string(),
+            serde_json::Value::String(device_id.as_str().to_string()),
+        );
+    }
     if let Some(purpose) = &invite.purpose {
         data.insert(
             "purpose".to_string(),
@@ -121,7 +127,7 @@ pub fn parse_invite_url(url: &str) -> Result<Invite> {
         shared_secret,
         inviter,
         inviter_ephemeral_private_key: None,
-        device_id: None,
+        device_id: data["deviceId"].as_str().map(DeviceId::new),
         max_uses: None,
         used_by: Vec::new(),
         created_at: UnixSeconds(0),
@@ -498,6 +504,7 @@ mod tests {
             parsed_from_url.inviter_ephemeral_public_key,
             invite.inviter_ephemeral_public_key
         );
+        assert_eq!(parsed_from_url.device_id, invite.device_id);
 
         let unsigned = invite_unsigned_event(&invite).unwrap();
         let signed = unsigned.sign_with_keys(&owner_keys).unwrap();

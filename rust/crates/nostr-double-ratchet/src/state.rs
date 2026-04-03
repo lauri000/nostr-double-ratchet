@@ -326,7 +326,7 @@ impl NdrState {
     pub fn process_invite_response<R>(
         &mut self,
         ctx: &mut ProtocolContext<'_, R>,
-        invite: &Invite,
+        invite: &mut Invite,
         envelope: &IncomingInviteResponseEnvelope,
         inviter_private_key: [u8; 32],
     ) -> Result<Option<ProcessedInviteResponse>>
@@ -536,7 +536,7 @@ mod tests {
         let mut bob = single_device_state(bob_secret, "bob-device");
 
         let mut invite_ctx = context(1, 1_700_001_000, 1_700_001_000_000);
-        let invite = alice.create_invite(&mut invite_ctx, None).unwrap();
+        let mut invite = alice.create_invite(&mut invite_ctx, None).unwrap();
 
         let mut accept_ctx = context(2, 1_700_001_005, 1_700_001_005_000);
         let acceptance = bob
@@ -547,7 +547,7 @@ mod tests {
         let processed = alice
             .process_invite_response(
                 &mut process_ctx,
-                &invite,
+                &mut invite,
                 &IncomingInviteResponseEnvelope {
                     sender: acceptance.response.sender,
                     created_at: acceptance.response.created_at,

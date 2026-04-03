@@ -263,7 +263,7 @@ fn owned_invite_serde_roundtrip_preserves_bootstrap_capability() -> Result<()> {
         Some(alice.device_id.clone()),
         None,
     )?;
-    let restored_owned_invite: nostr_double_ratchet::Invite =
+    let mut restored_owned_invite: nostr_double_ratchet::Invite =
         serde_json::from_str(&serde_json::to_string(&invite).unwrap()).unwrap();
 
     let url = codec::invite_url(&restored_owned_invite, support::ROOT_URL)?;
@@ -304,7 +304,7 @@ fn invite_owner_claim_with_appkeys_proof_verifies() -> Result<()> {
     let claimed_owner = actor(17, "owner-device");
 
     let mut invite_ctx = context(1100, 1_700_100_900);
-    let owned_invite = nostr_double_ratchet::Invite::create_new(
+    let mut owned_invite = nostr_double_ratchet::Invite::create_new(
         &mut invite_ctx,
         alice.owner_pubkey,
         Some(alice.device_id.clone()),
