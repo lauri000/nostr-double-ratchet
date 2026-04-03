@@ -1,50 +1,83 @@
 pub mod app_keys;
-pub mod app_keys_manager;
-pub mod delegate_manager;
+pub mod codec;
 pub mod error;
-pub mod file_storage;
 pub mod group;
-pub mod group_manager;
+pub mod ids;
 pub mod invite;
-pub mod message_origin;
-pub mod message_queue;
-pub mod multi_device;
-pub mod one_to_many;
-pub mod pubsub;
-pub mod runtime;
-pub mod sender_key;
+pub mod peer_book;
 pub mod session;
-pub mod session_manager;
-pub mod shared_channel;
-pub mod storage;
+pub mod state;
 pub mod types;
-pub mod user_record;
-pub mod utils;
 
-pub use app_keys::{is_app_keys_event, AppKeys, DeviceEntry, DeviceLabels};
-pub use app_keys_manager::AppKeysManager;
-pub use delegate_manager::{DelegateManager, DelegatePayload};
-pub use error::{Error, Result};
-pub use file_storage::{DebouncedFileStorage, FileStorageAdapter};
-pub use group::*;
-pub use group_manager::*;
-pub use invite::{Invite, InviteResponse};
-pub use message_origin::{classify_message_origin, MessageOrigin};
-pub use message_queue::{MessageQueue, QueueEntry};
-pub use multi_device::{
-    apply_app_keys_snapshot, evaluate_device_registration_state,
-    resolve_conversation_candidate_pubkeys, resolve_invite_owner_routing,
-    resolve_rumor_peer_pubkey, select_latest_app_keys_from_events,
-    should_require_relay_registration_confirmation, AppKeysSnapshot, AppKeysSnapshotDecision,
-    DeviceRegistrationState, InviteOwnerRoutingResolution,
+mod utils;
+
+pub use app_keys::{AppKeys, DeviceEntry, DeviceLabels};
+pub use error::{CodecError, DomainError, Error, Result};
+pub use group::{
+    add_group_admin, add_group_member, apply_metadata_update, build_group_metadata_content,
+    create_group_data, generate_group_secret, is_group_admin, parse_group_metadata,
+    remove_group_admin, remove_group_member, update_group_data, validate_metadata_creation,
+    validate_metadata_update, GroupData, GroupMetadata, GroupUpdate, MetadataValidation,
+    GROUP_INVITE_RUMOR_KIND, GROUP_METADATA_KIND, GROUP_SENDER_KEY_DISTRIBUTION_KIND,
+    GROUP_SENDER_KEY_MESSAGE_KIND,
 };
-pub use one_to_many::*;
-pub use pubsub::{ChannelPubSub, NostrPubSub, SessionEvent};
-pub use runtime::NdrRuntime;
-pub use sender_key::*;
-pub use session::Session;
-pub use session_manager::{AcceptInviteResult, SessionManager, SessionManagerEvent};
-pub use shared_channel::SharedChannel;
-pub use storage::{InMemoryStorage, StorageAdapter};
-pub use types::*;
-pub use user_record::{DeviceRecord, StoredDeviceRecord, StoredUserRecord, UserRecord};
+pub use ids::{DeviceId, DevicePubkey, GroupId, OwnerPubkey, UnixMillis, UnixSeconds};
+pub use invite::{
+    IncomingInviteResponseEnvelope, Invite, InviteResponse, OutgoingInviteResponseEnvelope,
+};
+pub use peer_book::{
+    PeerBook, PeerBookReceivePlan, PeerBookSendPlan, StoredPeerBook, StoredPeerDevice,
+};
+pub use session::{
+    DirectMessageContent, Header, IncomingDirectMessageEnvelope, OutgoingDirectMessageEnvelope,
+    ReceiveOutcome, ReceivePlan, Rumor, SendOutcome, SendPlan, SerializableKeyPair, Session,
+    SessionState, SkippedKeysEntry,
+};
+pub use state::{
+    AppKeysSnapshotDecision, DeviceSnapshot, GroupMutation, InviteAcceptance, LocalSnapshot,
+    NdrSnapshot, NdrState, PeerSnapshot, PreparedDirectMessage, ProcessedInviteResponse,
+    ReceivedDirectMessage,
+};
+pub use types::{
+    ProtocolContext, APP_KEYS_EVENT_KIND, CHAT_MESSAGE_KIND, CHAT_SETTINGS_KIND, EXPIRATION_TAG,
+    INVITE_EVENT_KIND, INVITE_RESPONSE_KIND, MAX_SKIP, MESSAGE_EVENT_KIND, REACTION_KIND,
+    RECEIPT_KIND, SHARED_CHANNEL_KIND, TYPING_KIND,
+};
+
+pub(crate) use utils::{
+    device_pubkey_from_secret_bytes, kdf, random_secret_key_bytes, secret_key_from_bytes,
+};
+
+#[cfg(test)]
+mod architecture_tests {
+    #[test]
+    fn domain_modules_do_not_pull_in_background_runtime_primitives() {
+        const FILES: &[&str] = &[
+            include_str!("app_keys.rs"),
+            include_str!("group.rs"),
+            include_str!("ids.rs"),
+            include_str!("invite.rs"),
+            include_str!("peer_book.rs"),
+            include_str!("session.rs"),
+            include_str!("state.rs"),
+            include_str!("types.rs"),
+        ];
+
+        for source in FILES {
+            for banned in [
+                "tokio",
+                "crossbeam",
+                "Arc",
+                "Mutex",
+                "mpsc",
+                "spawn",
+                "async ",
+            ] {
+                assert!(
+                    !source.contains(banned),
+                    "found banned runtime primitive `{banned}` in domain source"
+                );
+            }
+        }
+    }
+}

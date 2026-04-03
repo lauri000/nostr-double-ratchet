@@ -1,80 +1,251 @@
 use crate::{
-    pubsub::build_filter,
-    pubsub::NostrPubSub,
-    utils::{kdf, pubkey_from_hex},
-    Error, EventCallback, Header, Result, SerializableKeyPair, SessionState, SkippedKeysEntry,
-    Unsubscribe, CHAT_MESSAGE_KIND, MAX_SKIP, MESSAGE_EVENT_KIND, REACTION_KIND, RECEIPT_KIND,
-    TYPING_KIND,
+    device_pubkey_from_secret_bytes, kdf, random_secret_key_bytes, secret_key_from_bytes,
+    CodecError, DevicePubkey, DomainError, ProtocolContext, Result, UnixSeconds, CHAT_MESSAGE_KIND,
+    MAX_SKIP, REACTION_KIND, RECEIPT_KIND, TYPING_KIND,
 };
 use base64::Engine;
 use nostr::nips::nip44::{self, Version};
-use nostr::PublicKey;
-use nostr::{EventBuilder, Keys, Tag, Timestamp, UnsignedEvent};
+use rand::{CryptoRng, RngCore};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::BTreeMap;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Header {
+    pub number: u32,
+    pub previous_chain_length: u32,
+    pub next_public_key: DevicePubkey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SerializableKeyPair {
+    pub public_key: DevicePubkey,
+    #[serde(with = "serde_bytes_array")]
+    pub private_key: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SkippedKeysEntry {
+    #[serde(with = "serde_btreemap_u32_bytes")]
+    pub message_keys: BTreeMap<u32, [u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionState {
+    #[serde(with = "serde_bytes_array")]
+    pub root_key: [u8; 32],
+    pub their_current_nostr_public_key: Option<DevicePubkey>,
+    pub their_next_nostr_public_key: Option<DevicePubkey>,
+    pub our_current_nostr_key: Option<SerializableKeyPair>,
+    pub our_next_nostr_key: SerializableKeyPair,
+    #[serde(default, with = "serde_option_bytes_array")]
+    pub receiving_chain_key: Option<[u8; 32]>,
+    #[serde(default, with = "serde_option_bytes_array")]
+    pub sending_chain_key: Option<[u8; 32]>,
+    pub sending_chain_message_number: u32,
+    pub receiving_chain_message_number: u32,
+    pub previous_sending_chain_message_count: u32,
+    pub skipped_keys: BTreeMap<DevicePubkey, SkippedKeysEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Rumor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub pubkey: DevicePubkey,
+    pub created_at: UnixSeconds,
+    pub kind: u32,
+    pub tags: Vec<Vec<String>>,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectMessageContent {
+    Text(String),
+    Reaction {
+        message_id: String,
+        emoji: String,
+    },
+    Reply {
+        reply_to: String,
+        text: String,
+    },
+    Receipt {
+        receipt_type: String,
+        message_ids: Vec<String>,
+    },
+    Typing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutgoingDirectMessageEnvelope {
+    pub sender: DevicePubkey,
+    pub signer_secret_key: [u8; 32],
+    pub created_at: UnixSeconds,
+    pub encrypted_header: String,
+    pub ciphertext: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingDirectMessageEnvelope {
+    pub sender: DevicePubkey,
+    pub created_at: UnixSeconds,
+    pub encrypted_header: String,
+    pub ciphertext: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SendPlan {
+    pub next_state: SessionState,
+    pub envelope: OutgoingDirectMessageEnvelope,
+    pub rumor: Rumor,
+}
+
+#[derive(Debug, Clone)]
+pub struct SendOutcome {
+    pub envelope: OutgoingDirectMessageEnvelope,
+    pub rumor: Rumor,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceivePlan {
+    pub next_state: SessionState,
+    pub rumor: Rumor,
+    pub sender: DevicePubkey,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceiveOutcome {
+    pub rumor: Rumor,
+    pub sender: DevicePubkey,
+}
+
+#[derive(Debug, Clone)]
 pub struct Session {
     pub state: SessionState,
     pub name: String,
-    pub(crate) nostr_unsubscribe: Arc<Mutex<Option<Unsubscribe>>>,
-    pub(crate) nostr_next_unsubscribe: Arc<Mutex<Option<Unsubscribe>>>,
-    pub(crate) skipped_subscription: Arc<Mutex<Option<Unsubscribe>>>,
-    pub(crate) internal_subscriptions: Arc<Mutex<Vec<EventCallback>>>,
-    pub(crate) current_key_subid: Arc<Mutex<Option<String>>>,
-    pub(crate) next_key_subid: Arc<Mutex<Option<String>>>,
-    pub(crate) pubsub: Option<Arc<dyn NostrPubSub>>,
+}
+
+impl Rumor {
+    pub fn new(
+        pubkey: DevicePubkey,
+        created_at: UnixSeconds,
+        kind: u32,
+        tags: Vec<Vec<String>>,
+        content: String,
+    ) -> Result<Self> {
+        let mut rumor = Self {
+            id: None,
+            pubkey,
+            created_at,
+            kind,
+            tags,
+            content,
+        };
+        rumor.id = Some(rumor.compute_id()?);
+        Ok(rumor)
+    }
+
+    pub fn from_content<R>(
+        ctx: &mut ProtocolContext<'_, R>,
+        content: DirectMessageContent,
+    ) -> Result<Self>
+    where
+        R: RngCore + CryptoRng,
+    {
+        let random_secret = random_secret_key_bytes(ctx.rng)?;
+        let pubkey = device_pubkey_from_secret_bytes(&random_secret)?;
+        let ms_tag = vec!["ms".to_string(), ctx.now_millis.get().to_string()];
+        match content {
+            DirectMessageContent::Text(text) => {
+                Self::new(pubkey, ctx.now_secs, 1, vec![ms_tag], text)
+            }
+            DirectMessageContent::Reaction { message_id, emoji } => Self::new(
+                pubkey,
+                ctx.now_secs,
+                REACTION_KIND,
+                vec![vec!["e".to_string(), message_id], ms_tag],
+                emoji,
+            ),
+            DirectMessageContent::Reply { reply_to, text } => Self::new(
+                pubkey,
+                ctx.now_secs,
+                CHAT_MESSAGE_KIND,
+                vec![vec!["e".to_string(), reply_to], ms_tag],
+                text,
+            ),
+            DirectMessageContent::Receipt {
+                receipt_type,
+                message_ids,
+            } => {
+                let mut tags: Vec<Vec<String>> = message_ids
+                    .into_iter()
+                    .map(|id| vec!["e".to_string(), id])
+                    .collect();
+                tags.push(ms_tag);
+                Self::new(pubkey, ctx.now_secs, RECEIPT_KIND, tags, receipt_type)
+            }
+            DirectMessageContent::Typing => Self::new(
+                pubkey,
+                ctx.now_secs,
+                TYPING_KIND,
+                vec![ms_tag],
+                "typing".to_string(),
+            ),
+        }
+    }
+
+    pub fn from_json(json: &str) -> Result<Self> {
+        let mut rumor: Self = serde_json::from_str(json)?;
+        rumor.id = Some(rumor.compute_id()?);
+        Ok(rumor)
+    }
+
+    pub fn to_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    fn compute_id(&self) -> Result<String> {
+        let canonical = serde_json::json!([
+            0,
+            self.pubkey.to_string(),
+            self.created_at.get(),
+            self.kind,
+            self.tags,
+            self.content
+        ]);
+        let canonical_json = serde_json::to_string(&canonical)?;
+        Ok(hex::encode(Sha256::digest(canonical_json.as_bytes())))
+    }
 }
 
 impl Session {
     pub fn new(state: SessionState, name: String) -> Self {
-        Self {
-            state,
-            name,
-            nostr_unsubscribe: Arc::new(Mutex::new(None)),
-            nostr_next_unsubscribe: Arc::new(Mutex::new(None)),
-            skipped_subscription: Arc::new(Mutex::new(None)),
-            internal_subscriptions: Arc::new(Mutex::new(Vec::new())),
-            current_key_subid: Arc::new(Mutex::new(None)),
-            next_key_subid: Arc::new(Mutex::new(None)),
-            pubsub: None,
-        }
+        Self { state, name }
     }
 
-    pub fn set_event_tx(
-        &mut self,
-        event_tx: crossbeam_channel::Sender<crate::SessionManagerEvent>,
-    ) {
-        let pubsub: Arc<dyn NostrPubSub> = Arc::new(event_tx);
-        self.pubsub = Some(pubsub);
-    }
-
-    pub fn set_pubsub(&mut self, pubsub: Arc<dyn NostrPubSub>) {
-        self.pubsub = Some(pubsub);
-    }
-}
-
-impl Session {
-    pub fn init(
-        their_ephemeral_nostr_public_key: PublicKey,
+    pub fn init<R>(
+        ctx: &mut ProtocolContext<'_, R>,
+        their_ephemeral_nostr_public_key: DevicePubkey,
         our_ephemeral_nostr_private_key: [u8; 32],
         is_initiator: bool,
         shared_secret: [u8; 32],
         name: Option<String>,
-    ) -> Result<Self> {
-        let our_keys = Keys::new(nostr::SecretKey::from_slice(
-            &our_ephemeral_nostr_private_key,
-        )?);
-        let our_next_private_key = nostr::Keys::generate().secret_key().to_secret_bytes();
-        let our_next_keys = Keys::new(nostr::SecretKey::from_slice(&our_next_private_key)?);
+    ) -> Result<Self>
+    where
+        R: RngCore + CryptoRng,
+    {
+        let our_keys = nostr::Keys::new(secret_key_from_bytes(&our_ephemeral_nostr_private_key)?);
+        let our_next_private_key = random_secret_key_bytes(ctx.rng)?;
+        let our_next_keys = nostr::Keys::new(secret_key_from_bytes(&our_next_private_key)?);
 
         let (root_key, sending_chain_key, our_current_nostr_key, our_next_nostr_key);
 
         if is_initiator {
-            let our_current_pubkey = our_keys.public_key();
+            let our_current_pubkey = DevicePubkey::from_nostr(our_keys.public_key());
             let conversation_key = nip44::v2::ConversationKey::derive(
                 our_next_keys.secret_key(),
-                &their_ephemeral_nostr_public_key,
+                &their_ephemeral_nostr_public_key.to_nostr()?,
             );
             let kdf_outputs = kdf(&shared_secret, conversation_key.as_bytes(), 2);
             root_key = kdf_outputs[0];
@@ -84,7 +255,7 @@ impl Session {
                 private_key: our_ephemeral_nostr_private_key,
             });
             our_next_nostr_key = SerializableKeyPair {
-                public_key: our_next_keys.public_key(),
+                public_key: DevicePubkey::from_nostr(our_next_keys.public_key()),
                 private_key: our_next_private_key,
             };
         } else {
@@ -92,96 +263,27 @@ impl Session {
             sending_chain_key = None;
             our_current_nostr_key = None;
             our_next_nostr_key = SerializableKeyPair {
-                public_key: our_keys.public_key(),
+                public_key: DevicePubkey::from_nostr(our_keys.public_key()),
                 private_key: our_ephemeral_nostr_private_key,
             };
         }
 
-        // theirCurrentNostrPublicKey is NEVER set in init - it's populated dynamically when processing messages
-        // Both initiator and non-initiator only set theirNextNostrPublicKey initially
-        let their_current = None;
-        let their_next = Some(their_ephemeral_nostr_public_key);
-
-        let state = SessionState {
-            root_key,
-            their_current_nostr_public_key: their_current,
-            their_next_nostr_public_key: their_next,
-            our_current_nostr_key,
-            our_next_nostr_key,
-            receiving_chain_key: None,
-            sending_chain_key,
-            sending_chain_message_number: 0,
-            receiving_chain_message_number: 0,
-            previous_sending_chain_message_count: 0,
-            skipped_keys: HashMap::new(),
-        };
-
         Ok(Self {
-            state,
+            state: SessionState {
+                root_key,
+                their_current_nostr_public_key: None,
+                their_next_nostr_public_key: Some(their_ephemeral_nostr_public_key),
+                our_current_nostr_key,
+                our_next_nostr_key,
+                receiving_chain_key: None,
+                sending_chain_key,
+                sending_chain_message_number: 0,
+                receiving_chain_message_number: 0,
+                previous_sending_chain_message_count: 0,
+                skipped_keys: BTreeMap::new(),
+            },
             name: name.unwrap_or_else(|| "session".to_string()),
-            nostr_unsubscribe: Arc::new(Mutex::new(None)),
-            nostr_next_unsubscribe: Arc::new(Mutex::new(None)),
-            skipped_subscription: Arc::new(Mutex::new(None)),
-            internal_subscriptions: Arc::new(Mutex::new(Vec::new())),
-            current_key_subid: Arc::new(Mutex::new(None)),
-            next_key_subid: Arc::new(Mutex::new(None)),
-            pubsub: None,
         })
-    }
-
-    /// Subscribe to kind 1060 messages for this session's ratchet keys
-    pub fn subscribe_to_messages(&mut self) -> Result<()> {
-        if let Some(ref pubsub) = self.pubsub {
-            if let Some(current_pk) = self.state.their_current_nostr_public_key {
-                let mut current_key_subid = self.current_key_subid.lock().unwrap();
-                if current_key_subid.is_none() {
-                    let filter = build_filter()
-                        .kinds(vec![crate::MESSAGE_EVENT_KIND as u64])
-                        .authors(vec![current_pk])
-                        .build();
-
-                    let filter_json = serde_json::to_string(&filter)?;
-                    let subid = format!("session-current-{}", uuid::Uuid::new_v4());
-
-                    pubsub.subscribe(subid.clone(), filter_json)?;
-                    *current_key_subid = Some(subid);
-                }
-            }
-
-            if let Some(next_pk) = self.state.their_next_nostr_public_key {
-                let mut next_key_subid = self.next_key_subid.lock().unwrap();
-                if next_key_subid.is_none() {
-                    let filter = build_filter()
-                        .kinds(vec![crate::MESSAGE_EVENT_KIND as u64])
-                        .authors(vec![next_pk])
-                        .build();
-
-                    let filter_json = serde_json::to_string(&filter)?;
-                    let subid = format!("session-next-{}", uuid::Uuid::new_v4());
-
-                    pubsub.subscribe(subid.clone(), filter_json)?;
-                    *next_key_subid = Some(subid);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Update subscriptions after ratchet step (keys changed)
-    pub fn update_subscriptions(&mut self) -> Result<()> {
-        // Unsubscribe from old keys
-        if let Some(pubsub) = &self.pubsub {
-            if let Some(old_subid) = self.current_key_subid.lock().unwrap().take() {
-                let _ = pubsub.unsubscribe(old_subid);
-            }
-            if let Some(old_subid) = self.next_key_subid.lock().unwrap().take() {
-                let _ = pubsub.unsubscribe(old_subid);
-            }
-        }
-
-        // Subscribe to new keys
-        self.subscribe_to_messages()
     }
 
     pub fn can_send(&self) -> bool {
@@ -189,622 +291,579 @@ impl Session {
             && self.state.our_current_nostr_key.is_some()
     }
 
-    pub fn send(&mut self, text: String) -> Result<nostr::Event> {
-        let dummy_keys = Keys::generate();
-        self.send_event(EventBuilder::text_note(text).build(dummy_keys.public_key()))
+    pub fn matches_sender(&self, sender: DevicePubkey) -> bool {
+        self.state.their_current_nostr_public_key == Some(sender)
+            || self.state.their_next_nostr_public_key == Some(sender)
     }
 
-    /// Send a reaction to a message through the encrypted session.
-    ///
-    /// # Arguments
-    /// * `message_id` - The ID of the message being reacted to
-    /// * `emoji` - The emoji or reaction content (e.g., "👍", "❤️", "+1")
-    ///
-    /// # Returns
-    /// A signed Nostr event containing the encrypted reaction.
-    pub fn send_reaction(&mut self, message_id: &str, emoji: &str) -> Result<nostr::Event> {
-        let dummy_keys = Keys::generate();
-
-        let event = EventBuilder::new(nostr::Kind::from(REACTION_KIND as u16), emoji)
-            .tag(
-                Tag::parse(&["e".to_string(), message_id.to_string()])
-                    .map_err(|e| Error::InvalidEvent(e.to_string()))?,
-            )
-            .build(dummy_keys.public_key());
-
-        self.send_event(event)
-    }
-
-    /// Send a reply to a specific message through the encrypted session.
-    ///
-    /// # Arguments
-    /// * `text` - The reply text content
-    /// * `reply_to` - The ID of the message being replied to
-    ///
-    /// # Returns
-    /// A signed Nostr event containing the encrypted reply.
-    pub fn send_reply(&mut self, text: String, reply_to: &str) -> Result<nostr::Event> {
-        let dummy_keys = Keys::generate();
-
-        let event = EventBuilder::new(nostr::Kind::from(CHAT_MESSAGE_KIND as u16), &text)
-            .tag(
-                Tag::parse(&["e".to_string(), reply_to.to_string()])
-                    .map_err(|e| Error::InvalidEvent(e.to_string()))?,
-            )
-            .build(dummy_keys.public_key());
-
-        self.send_event(event)
-    }
-
-    /// Send a delivery/read receipt for messages through the encrypted session.
-    ///
-    /// # Arguments
-    /// * `receipt_type` - Either "delivered" or "seen"
-    /// * `message_ids` - The IDs of the messages being acknowledged
-    ///
-    /// # Returns
-    /// A signed Nostr event containing the encrypted receipt.
-    pub fn send_receipt(
-        &mut self,
-        receipt_type: &str,
-        message_ids: &[&str],
-    ) -> Result<nostr::Event> {
-        let dummy_keys = Keys::generate();
-
-        let mut builder = EventBuilder::new(nostr::Kind::from(RECEIPT_KIND as u16), receipt_type);
-        for id in message_ids {
-            builder = builder.tag(
-                Tag::parse(&["e".to_string(), id.to_string()])
-                    .map_err(|e| Error::InvalidEvent(e.to_string()))?,
-            );
-        }
-
-        self.send_event(builder.build(dummy_keys.public_key()))
-    }
-
-    /// Send a typing indicator through the encrypted session.
-    ///
-    /// # Returns
-    /// A signed Nostr event containing the encrypted typing indicator.
-    pub fn send_typing(&mut self) -> Result<nostr::Event> {
-        let dummy_keys = Keys::generate();
-
-        let event = EventBuilder::new(nostr::Kind::from(TYPING_KIND as u16), "typing")
-            .build(dummy_keys.public_key());
-
-        self.send_event(event)
-    }
-
-    pub fn send_event(&mut self, mut event: UnsignedEvent) -> Result<nostr::Event> {
+    pub fn plan_send(&self, rumor: &Rumor, now: UnixSeconds) -> Result<SendPlan> {
         if !self.can_send() {
-            return Err(Error::NotInitiator);
+            return Err(DomainError::NotInitiator.into());
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap();
-        let now_s = now.as_secs();
-        let now_ms = now.as_millis();
-
-        let ms_tag = Tag::parse(&["ms".to_string(), now_ms.to_string()])
-            .map_err(|e| Error::InvalidEvent(e.to_string()))?;
-        let has_ms_tag = event.tags.iter().any(|t| {
-            let v = t.clone().to_vec();
-            v.first().map(|s| s.as_str()) == Some("ms")
-        });
-
-        if !has_ms_tag {
-            let mut builder = EventBuilder::new(event.kind, &event.content);
-            for tag in event.tags.iter() {
-                builder = builder.tag(tag.clone());
-            }
-            builder = builder.tag(ms_tag);
-            event = builder
-                .custom_created_at(event.created_at)
-                .build(event.pubkey);
-        }
-
-        // Event fields were mutated; ensure id matches the final content.
-        event.id = None;
-        event.ensure_id();
-
-        let rumor_json = serde_json::to_string(&event)?;
-        let (header, encrypted_data) = self.ratchet_encrypt(&rumor_json)?;
-
-        let our_current = self.state.our_current_nostr_key.as_ref().unwrap();
-        let their_next = &self.state.their_next_nostr_public_key;
-
-        let our_sk = nostr::SecretKey::from_slice(&our_current.private_key)?;
-        let their_pk = their_next.unwrap();
-
+        let mut next_state = self.state.clone();
+        let rumor_json = rumor.to_json()?;
+        let (header, ciphertext) = ratchet_encrypt(&mut next_state, &rumor_json)?;
+        let our_current = self
+            .state
+            .our_current_nostr_key
+            .as_ref()
+            .ok_or(DomainError::SessionNotReady)?;
+        let our_secret = secret_key_from_bytes(&our_current.private_key)?;
+        let their_next = self
+            .state
+            .their_next_nostr_public_key
+            .ok_or(DomainError::SessionNotReady)?;
         let encrypted_header = nip44::encrypt(
-            &our_sk,
-            &their_pk,
+            &our_secret,
+            &their_next.to_nostr()?,
             &serde_json::to_string(&header)?,
             Version::V2,
         )?;
 
-        let tags = vec![Tag::parse(&["header".to_string(), encrypted_header])
-            .map_err(|e| Error::InvalidEvent(e.to_string()))?];
-
-        let author_pubkey = our_current.public_key;
-
-        // Build the event
-        let unsigned_event =
-            nostr::EventBuilder::new(nostr::Kind::from(MESSAGE_EVENT_KIND as u16), encrypted_data)
-                .tags(tags)
-                .custom_created_at(Timestamp::from(now_s))
-                .build(author_pubkey);
-
-        // Sign with the ephemeral private key before returning
-        let author_secret_key = nostr::SecretKey::from_slice(&our_current.private_key)?;
-        let author_keys = nostr::Keys::new(author_secret_key);
-        let signed_event = unsigned_event
-            .sign_with_keys(&author_keys)
-            .map_err(|e| Error::InvalidEvent(e.to_string()))?;
-
-        Ok(signed_event)
+        Ok(SendPlan {
+            next_state,
+            envelope: OutgoingDirectMessageEnvelope {
+                sender: our_current.public_key,
+                signer_secret_key: our_current.private_key,
+                created_at: now,
+                encrypted_header,
+                ciphertext,
+            },
+            rumor: rumor.clone(),
+        })
     }
 
-    fn ratchet_encrypt(&mut self, plaintext: &str) -> Result<(Header, String)> {
-        let sending_chain_key = self.state.sending_chain_key.ok_or(Error::SessionNotReady)?;
-
-        let kdf_outputs = kdf(&sending_chain_key, &[1u8], 2);
-        self.state.sending_chain_key = Some(kdf_outputs[0]);
-        let message_key = kdf_outputs[1];
-
-        let header = Header {
-            number: self.state.sending_chain_message_number,
-            next_public_key: hex::encode(self.state.our_next_nostr_key.public_key.to_bytes()),
-            previous_chain_length: self.state.previous_sending_chain_message_count,
-        };
-
-        self.state.sending_chain_message_number += 1;
-
-        let conversation_key = nip44::v2::ConversationKey::new(message_key);
-        let encrypted_bytes = nip44::v2::encrypt_to_bytes(&conversation_key, plaintext)?;
-        let ciphertext = base64::engine::general_purpose::STANDARD.encode(encrypted_bytes);
-        Ok((header, ciphertext))
+    pub fn apply_send(&mut self, plan: SendPlan) -> SendOutcome {
+        self.state = plan.next_state;
+        SendOutcome {
+            envelope: plan.envelope,
+            rumor: plan.rumor,
+        }
     }
 
-    fn ratchet_decrypt(
-        &mut self,
-        header: &Header,
-        ciphertext: &str,
-        nostr_sender: &PublicKey,
-    ) -> Result<String> {
-        if let Some(plaintext) = self.try_skipped_message_keys(header, ciphertext, nostr_sender)? {
-            return Ok(plaintext);
+    pub fn plan_receive<R>(
+        &self,
+        ctx: &mut ProtocolContext<'_, R>,
+        envelope: &IncomingDirectMessageEnvelope,
+    ) -> Result<ReceivePlan>
+    where
+        R: RngCore + CryptoRng,
+    {
+        if !self.matches_sender(envelope.sender) {
+            return Err(DomainError::UnexpectedSender.into());
         }
 
-        if self.state.receiving_chain_key.is_none() {
-            return Err(Error::SessionNotReady);
+        let mut next_state = self.state.clone();
+        let (header, should_ratchet) =
+            decrypt_header(&next_state, &envelope.encrypted_header, envelope.sender)?;
+
+        let expected_next = next_state.their_next_nostr_public_key;
+        if expected_next != Some(header.next_public_key) {
+            next_state.their_current_nostr_public_key = next_state.their_next_nostr_public_key;
+            next_state.their_next_nostr_public_key = Some(header.next_public_key);
         }
 
-        self.skip_message_keys(header.number, nostr_sender)?;
+        if should_ratchet {
+            if next_state.receiving_chain_key.is_some() {
+                skip_message_keys(
+                    &mut next_state,
+                    header.previous_chain_length,
+                    envelope.sender,
+                )?;
+            }
+            ratchet_step(&mut next_state, ctx.rng)?;
+        }
 
-        let receiving_chain_key = self.state.receiving_chain_key.unwrap();
+        let plaintext = ratchet_decrypt(
+            &mut next_state,
+            &header,
+            &envelope.ciphertext,
+            envelope.sender,
+        )?;
+        let rumor = Rumor::from_json(&plaintext)?;
 
+        Ok(ReceivePlan {
+            next_state,
+            rumor,
+            sender: envelope.sender,
+        })
+    }
+
+    pub fn apply_receive(&mut self, plan: ReceivePlan) -> ReceiveOutcome {
+        self.state = plan.next_state;
+        ReceiveOutcome {
+            rumor: plan.rumor,
+            sender: plan.sender,
+        }
+    }
+}
+
+fn ratchet_encrypt(state: &mut SessionState, plaintext: &str) -> Result<(Header, String)> {
+    let sending_chain_key = state
+        .sending_chain_key
+        .ok_or(DomainError::SessionNotReady)?;
+
+    let kdf_outputs = kdf(&sending_chain_key, &[1u8], 2);
+    state.sending_chain_key = Some(kdf_outputs[0]);
+    let message_key = kdf_outputs[1];
+
+    let header = Header {
+        number: state.sending_chain_message_number,
+        next_public_key: state.our_next_nostr_key.public_key,
+        previous_chain_length: state.previous_sending_chain_message_count,
+    };
+
+    state.sending_chain_message_number += 1;
+
+    let conversation_key = nip44::v2::ConversationKey::new(message_key);
+    let encrypted_bytes = nip44::v2::encrypt_to_bytes(&conversation_key, plaintext)?;
+    let ciphertext = base64::engine::general_purpose::STANDARD.encode(encrypted_bytes);
+    Ok((header, ciphertext))
+}
+
+fn ratchet_decrypt(
+    state: &mut SessionState,
+    header: &Header,
+    ciphertext: &str,
+    sender: DevicePubkey,
+) -> Result<String> {
+    if let Some(plaintext) = try_skipped_message_keys(state, header, ciphertext, sender)? {
+        return Ok(plaintext);
+    }
+
+    if state.receiving_chain_key.is_none() {
+        return Err(DomainError::SessionNotReady.into());
+    }
+
+    skip_message_keys(state, header.number, sender)?;
+
+    let receiving_chain_key = state
+        .receiving_chain_key
+        .ok_or(DomainError::SessionNotReady)?;
+
+    let kdf_outputs = kdf(&receiving_chain_key, &[1u8], 2);
+    state.receiving_chain_key = Some(kdf_outputs[0]);
+    let message_key = kdf_outputs[1];
+    state.receiving_chain_message_number += 1;
+
+    let conversation_key = nip44::v2::ConversationKey::new(message_key);
+    let ciphertext_bytes = base64::engine::general_purpose::STANDARD
+        .decode(ciphertext)
+        .map_err(|e| crate::Error::Decryption(e.to_string()))?;
+
+    let plaintext_bytes = nip44::v2::decrypt_to_bytes(&conversation_key, &ciphertext_bytes)?;
+    String::from_utf8(plaintext_bytes).map_err(|e| crate::Error::Decryption(e.to_string()))
+}
+
+fn ratchet_step<R>(state: &mut SessionState, rng: &mut R) -> Result<()>
+where
+    R: RngCore + CryptoRng,
+{
+    state.previous_sending_chain_message_count = state.sending_chain_message_number;
+    state.sending_chain_message_number = 0;
+    state.receiving_chain_message_number = 0;
+
+    let our_next_sk = secret_key_from_bytes(&state.our_next_nostr_key.private_key)?;
+    let their_next_pk = state
+        .their_next_nostr_public_key
+        .ok_or(DomainError::SessionNotReady)?;
+
+    let conversation_key1 =
+        nip44::v2::ConversationKey::derive(&our_next_sk, &their_next_pk.to_nostr()?);
+    let kdf_outputs = kdf(&state.root_key, conversation_key1.as_bytes(), 2);
+    state.receiving_chain_key = Some(kdf_outputs[1]);
+    state.our_current_nostr_key = Some(state.our_next_nostr_key.clone());
+
+    let our_next_private_key = random_secret_key_bytes(rng)?;
+    state.our_next_nostr_key = SerializableKeyPair {
+        public_key: device_pubkey_from_secret_bytes(&our_next_private_key)?,
+        private_key: our_next_private_key,
+    };
+
+    let our_next_sk2 = secret_key_from_bytes(&our_next_private_key)?;
+    let conversation_key2 =
+        nip44::v2::ConversationKey::derive(&our_next_sk2, &their_next_pk.to_nostr()?);
+    let kdf_outputs2 = kdf(&kdf_outputs[0], conversation_key2.as_bytes(), 2);
+    state.root_key = kdf_outputs2[0];
+    state.sending_chain_key = Some(kdf_outputs2[1]);
+    Ok(())
+}
+
+fn skip_message_keys(state: &mut SessionState, until: u32, sender: DevicePubkey) -> Result<()> {
+    if until <= state.receiving_chain_message_number {
+        return Ok(());
+    }
+
+    if (until - state.receiving_chain_message_number) as usize > MAX_SKIP {
+        return Err(DomainError::TooManySkippedMessages.into());
+    }
+
+    let entry = state
+        .skipped_keys
+        .entry(sender)
+        .or_insert_with(SkippedKeysEntry::default);
+
+    while state.receiving_chain_message_number < until {
+        let receiving_chain_key = state
+            .receiving_chain_key
+            .ok_or(DomainError::SessionNotReady)?;
         let kdf_outputs = kdf(&receiving_chain_key, &[1u8], 2);
-        self.state.receiving_chain_key = Some(kdf_outputs[0]);
-        let message_key = kdf_outputs[1];
-
-        self.state.receiving_chain_message_number += 1;
-
-        let conversation_key = nip44::v2::ConversationKey::new(message_key);
-        let ciphertext_bytes = base64::engine::general_purpose::STANDARD
-            .decode(ciphertext)
-            .map_err(|e| Error::Decryption(e.to_string()))?;
-
-        let plaintext_bytes = nip44::v2::decrypt_to_bytes(&conversation_key, &ciphertext_bytes)?;
-        String::from_utf8(plaintext_bytes).map_err(|e| Error::Decryption(e.to_string()))
+        state.receiving_chain_key = Some(kdf_outputs[0]);
+        entry
+            .message_keys
+            .insert(state.receiving_chain_message_number, kdf_outputs[1]);
+        state.receiving_chain_message_number += 1;
     }
 
-    fn ratchet_step(&mut self) -> Result<()> {
-        self.state.previous_sending_chain_message_count = self.state.sending_chain_message_number;
-        self.state.sending_chain_message_number = 0;
-        self.state.receiving_chain_message_number = 0;
+    prune_skipped_message_keys(&mut entry.message_keys);
+    Ok(())
+}
 
-        let our_next_sk = nostr::SecretKey::from_slice(&self.state.our_next_nostr_key.private_key)?;
-        let their_next_pk = self
-            .state
-            .their_next_nostr_public_key
-            .ok_or(Error::SessionNotReady)?;
+fn try_skipped_message_keys(
+    state: &mut SessionState,
+    header: &Header,
+    ciphertext: &str,
+    sender: DevicePubkey,
+) -> Result<Option<String>> {
+    if let Some(entry) = state.skipped_keys.get_mut(&sender) {
+        if let Some(message_key) = entry.message_keys.remove(&header.number) {
+            let conversation_key = nip44::v2::ConversationKey::new(message_key);
+            let ciphertext_bytes = base64::engine::general_purpose::STANDARD
+                .decode(ciphertext)
+                .map_err(|e| crate::Error::Decryption(e.to_string()))?;
+            let plaintext_bytes =
+                nip44::v2::decrypt_to_bytes(&conversation_key, &ciphertext_bytes)?;
+            let plaintext = String::from_utf8(plaintext_bytes)
+                .map_err(|e| crate::Error::Decryption(e.to_string()))?;
+            if entry.message_keys.is_empty() {
+                state.skipped_keys.remove(&sender);
+            }
+            return Ok(Some(plaintext));
+        }
+    }
 
-        let conversation_key1 = nip44::v2::ConversationKey::derive(&our_next_sk, &their_next_pk);
-        let kdf_outputs = kdf(&self.state.root_key, conversation_key1.as_bytes(), 2);
+    Ok(None)
+}
 
-        self.state.receiving_chain_key = Some(kdf_outputs[1]);
+fn decrypt_header(
+    state: &SessionState,
+    encrypted_header: &str,
+    sender: DevicePubkey,
+) -> Result<(Header, bool)> {
+    if let Some(current) = &state.our_current_nostr_key {
+        let current_sk = secret_key_from_bytes(&current.private_key)?;
+        if let Ok(decrypted) = nip44::decrypt(&current_sk, &sender.to_nostr()?, encrypted_header) {
+            let header: Header = serde_json::from_str(&decrypted)?;
+            return Ok((header, false));
+        }
+    }
 
-        self.state.our_current_nostr_key = Some(self.state.our_next_nostr_key.clone());
+    let next_sk = secret_key_from_bytes(&state.our_next_nostr_key.private_key)?;
+    let decrypted = nip44::decrypt(&next_sk, &sender.to_nostr()?, encrypted_header)
+        .map_err(|_| CodecError::InvalidHeader)?;
+    let header: Header = serde_json::from_str(&decrypted)?;
+    Ok((header, true))
+}
 
-        let our_next_keys = nostr::Keys::generate();
-        let our_next_private_key = our_next_keys.secret_key().to_secret_bytes();
-        self.state.our_next_nostr_key = SerializableKeyPair {
-            public_key: our_next_keys.public_key(),
-            private_key: our_next_private_key,
+fn prune_skipped_message_keys(map: &mut BTreeMap<u32, [u8; 32]>) {
+    while map.len() > MAX_SKIP {
+        let Some(first) = map.keys().next().copied() else {
+            break;
         };
+        map.remove(&first);
+    }
+}
 
-        let our_next_sk2 = nostr::SecretKey::from_slice(&our_next_private_key)?;
-        let conversation_key2 = nip44::v2::ConversationKey::derive(&our_next_sk2, &their_next_pk);
-        let kdf_outputs2 = kdf(&kdf_outputs[0], conversation_key2.as_bytes(), 2);
+mod serde_bytes_array {
+    use serde::{Deserialize, Deserializer, Serializer};
 
-        self.state.root_key = kdf_outputs2[0];
-        self.state.sending_chain_key = Some(kdf_outputs2[1]);
-
-        Ok(())
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
     }
 
-    fn skip_message_keys(&mut self, until: u32, nostr_sender: &PublicKey) -> Result<()> {
-        if until <= self.state.receiving_chain_message_number {
-            return Ok(());
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        super::decode_hex_32(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+mod serde_option_bytes_array {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &Option<[u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match bytes {
+            Some(b) => serializer.serialize_str(&hex::encode(b)),
+            None => serializer.serialize_none(),
         }
-
-        if (until - self.state.receiving_chain_message_number) as usize > MAX_SKIP {
-            return Err(Error::TooManySkippedMessages);
-        }
-
-        let entry = self
-            .state
-            .skipped_keys
-            .entry(*nostr_sender)
-            .or_insert_with(|| SkippedKeysEntry {
-                header_keys: Vec::new(),
-                message_keys: HashMap::new(),
-            });
-
-        while self.state.receiving_chain_message_number < until {
-            let receiving_chain_key = self
-                .state
-                .receiving_chain_key
-                .ok_or(Error::SessionNotReady)?;
-
-            let kdf_outputs = kdf(&receiving_chain_key, &[1u8], 2);
-            self.state.receiving_chain_key = Some(kdf_outputs[0]);
-
-            entry
-                .message_keys
-                .insert(self.state.receiving_chain_message_number, kdf_outputs[1]);
-            self.state.receiving_chain_message_number += 1;
-        }
-
-        // Bound stored skipped keys to avoid unbounded memory growth when many messages are missed.
-        prune_skipped_message_keys(&mut entry.message_keys);
-        Ok(())
     }
 
-    fn try_skipped_message_keys(
-        &mut self,
-        header: &Header,
-        ciphertext: &str,
-        nostr_sender: &PublicKey,
-    ) -> Result<Option<String>> {
-        if let Some(entry) = self.state.skipped_keys.get_mut(nostr_sender) {
-            if let Some(message_key) = entry.message_keys.remove(&header.number) {
-                let conversation_key = nip44::v2::ConversationKey::new(message_key);
-                let ciphertext_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(ciphertext)
-                    .map_err(|e| Error::Decryption(e.to_string()))?;
-
-                let plaintext_bytes =
-                    nip44::v2::decrypt_to_bytes(&conversation_key, &ciphertext_bytes)?;
-                let plaintext = String::from_utf8(plaintext_bytes)
-                    .map_err(|e| Error::Decryption(e.to_string()))?;
-
-                if entry.message_keys.is_empty() {
-                    self.state.skipped_keys.remove(nostr_sender);
-                }
-
-                return Ok(Some(plaintext));
-            }
-        }
-        Ok(None)
-    }
-
-    pub fn receive(&mut self, event: &nostr::Event) -> Result<Option<String>> {
-        // Snapshot state so we can roll back on decryption failures (e.g. duplicates/replays).
-        let snapshot = crate::utils::deep_copy_state(&self.state);
-
-        let result = (|| {
-            let header_tag = event
-                .tags
-                .iter()
-                .find(|t| t.as_slice().first().map(|s| s.as_str()) == Some("header"))
-                .cloned();
-
-            let encrypted_header = match header_tag {
-                Some(tag) => {
-                    let v = tag.to_vec();
-                    v.get(1).ok_or(Error::InvalidHeader)?.clone()
-                }
-                None => return Err(Error::InvalidHeader),
-            };
-
-            let sender_pubkey = event.pubkey;
-            let (header, should_ratchet) =
-                self.decrypt_header(&encrypted_header, &sender_pubkey)?;
-
-            let sender_bytes = sender_pubkey.to_bytes();
-            let their_next_matches = self
-                .state
-                .their_next_nostr_public_key
-                .as_ref()
-                .map(|pk| pk.to_bytes() == sender_bytes)
-                .unwrap_or(false);
-            let their_current_matches = self
-                .state
-                .their_current_nostr_public_key
-                .as_ref()
-                .map(|pk| pk.to_bytes() == sender_bytes)
-                .unwrap_or(false);
-
-            if !their_next_matches && !their_current_matches {
-                return Err(Error::InvalidEvent("Unexpected sender".to_string()));
-            }
-
-            let their_next_pk_hex = self
-                .state
-                .their_next_nostr_public_key
-                .map(|pk| hex::encode(pk.to_bytes()))
-                .unwrap_or_default();
-
-            if header.next_public_key != their_next_pk_hex {
-                self.state.their_current_nostr_public_key = self.state.their_next_nostr_public_key;
-                self.state.their_next_nostr_public_key =
-                    Some(pubkey_from_hex(&header.next_public_key)?);
-            }
-
-            let mut needs_subscription_update = false;
-            if should_ratchet {
-                if self.state.receiving_chain_key.is_some() {
-                    self.skip_message_keys(header.previous_chain_length, &sender_pubkey)?;
-                }
-                self.ratchet_step()?;
-                needs_subscription_update = true;
-            }
-
-            let plaintext = self.ratchet_decrypt(&header, &event.content, &sender_pubkey)?;
-
-            if needs_subscription_update {
-                // Update subscriptions after ratchet (keys changed). We do this only once we know the
-                // ciphertext decrypted successfully, so duplicates/replays don't thrash subscriptions.
-                let _ = self.update_subscriptions();
-            }
-
-            Ok(Some(normalize_inner_rumor_id(&plaintext)))
-        })();
-
-        if result.is_err() {
-            self.state = snapshot;
-        }
-
-        result
-    }
-
-    fn decrypt_header(&self, encrypted_header: &str, sender: &PublicKey) -> Result<(Header, bool)> {
-        if let Some(current) = &self.state.our_current_nostr_key {
-            let current_sk = nostr::SecretKey::from_slice(&current.private_key)?;
-
-            if let Ok(decrypted) =
-                nostr::nips::nip44::decrypt(&current_sk, sender, encrypted_header)
-            {
-                let header: Header = serde_json::from_str(&decrypted)
-                    .map_err(|e| Error::Serialization(e.to_string()))?;
-                return Ok((header, false));
-            }
-        }
-
-        let next_sk = nostr::SecretKey::from_slice(&self.state.our_next_nostr_key.private_key)?;
-
-        let decrypted = nostr::nips::nip44::decrypt(&next_sk, sender, encrypted_header)?;
-        let header: Header =
-            serde_json::from_str(&decrypted).map_err(|e| Error::Serialization(e.to_string()))?;
-        Ok((header, true))
-    }
-
-    pub fn close(&self) {
-        if let Some(unsub) = self.nostr_unsubscribe.lock().unwrap().take() {
-            unsub();
-        }
-        if let Some(unsub) = self.nostr_next_unsubscribe.lock().unwrap().take() {
-            unsub();
-        }
-        if let Some(unsub) = self.skipped_subscription.lock().unwrap().take() {
-            unsub();
-        }
-        self.internal_subscriptions.lock().unwrap().clear();
-
-        // Unsubscribe from session-managed subscriptions
-        if let Some(pubsub) = &self.pubsub {
-            if let Some(subid) = self.current_key_subid.lock().unwrap().take() {
-                let _ = pubsub.unsubscribe(subid);
-            }
-            if let Some(subid) = self.next_key_subid.lock().unwrap().take() {
-                let _ = pubsub.unsubscribe(subid);
-            }
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<[u8; 32]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        match opt {
+            Some(s) => super::decode_hex_32(&s)
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
         }
     }
 }
 
-fn normalize_inner_rumor_id(plaintext: &str) -> String {
-    let mut v: serde_json::Value = match serde_json::from_str(plaintext) {
-        Ok(v) => v,
-        Err(_) => return plaintext.to_string(),
-    };
+mod serde_btreemap_u32_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
 
-    let obj = match v.as_object_mut() {
-        Some(obj) => obj,
-        None => return plaintext.to_string(),
-    };
-
-    let pubkey = match obj.get("pubkey").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return plaintext.to_string(),
-    };
-
-    let created_at = match obj.get("created_at").and_then(|v| v.as_u64()) {
-        Some(n) => n,
-        None => return plaintext.to_string(),
-    };
-
-    let kind = match obj.get("kind").and_then(|v| v.as_u64()) {
-        Some(n) => n,
-        None => return plaintext.to_string(),
-    };
-
-    let content = match obj.get("content").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return plaintext.to_string(),
-    };
-
-    let tags_value = match obj.get("tags").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return plaintext.to_string(),
-    };
-
-    // NIP-01 expects tags to be an array of string arrays. If it's not, keep the plaintext as-is.
-    let mut tags: Vec<Vec<String>> = Vec::with_capacity(tags_value.len());
-    for tag in tags_value {
-        let arr = match tag.as_array() {
-            Some(arr) => arr,
-            None => return plaintext.to_string(),
-        };
-        let mut out: Vec<String> = Vec::with_capacity(arr.len());
-        for v in arr {
-            let s = match v.as_str() {
-                Some(s) => s,
-                None => return plaintext.to_string(),
-            };
-            out.push(s.to_string());
-        }
-        tags.push(out);
+    pub fn serialize<S>(map: &BTreeMap<u32, [u8; 32]>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let string_map: BTreeMap<String, String> = map
+            .iter()
+            .map(|(k, v)| (k.to_string(), hex::encode(v)))
+            .collect();
+        string_map.serialize(serializer)
     }
 
-    // NIP-01 event id hash is sha256(JSON.stringify([0,pubkey,created_at,kind,tags,content])).
-    let canonical = serde_json::json!([0, pubkey, created_at, kind, tags, content]);
-    let canonical_json = match serde_json::to_string(&canonical) {
-        Ok(s) => s,
-        Err(_) => return plaintext.to_string(),
-    };
-
-    let computed = hex::encode(Sha256::digest(canonical_json.as_bytes()));
-    obj.insert("id".to_string(), serde_json::Value::String(computed));
-
-    serde_json::to_string(&v).unwrap_or_else(|_| plaintext.to_string())
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<u32, [u8; 32]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let string_map: BTreeMap<String, String> = BTreeMap::deserialize(deserializer)?;
+        let mut out = BTreeMap::new();
+        for (k, v) in string_map {
+            let idx: u32 = k.parse().map_err(serde::de::Error::custom)?;
+            out.insert(
+                idx,
+                super::decode_hex_32(&v).map_err(serde::de::Error::custom)?,
+            );
+        }
+        Ok(out)
+    }
 }
 
-fn prune_skipped_message_keys(map: &mut HashMap<u32, [u8; 32]>) {
-    if map.len() <= MAX_SKIP {
-        return;
-    }
-
-    // Drop the oldest skipped keys first (smallest message numbers).
-    // This sacrifices decrypting very old out-of-order messages in exchange for bounded memory.
-    let mut keys: Vec<u32> = map.keys().copied().collect();
-    keys.sort_unstable();
-    let to_remove = map.len().saturating_sub(MAX_SKIP);
-    for k in keys.into_iter().take(to_remove) {
-        map.remove(&k);
-    }
+fn decode_hex_32(value: &str) -> std::result::Result<[u8; 32], String> {
+    let bytes = hex::decode(value).map_err(|e| e.to_string())?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| "invalid 32-byte hex".to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SessionManagerEvent;
+    use crate::UnixMillis;
+    use rand::{rngs::StdRng, SeedableRng};
 
-    #[test]
-    fn skip_message_keys_prunes_to_max_skip() {
-        let our_keys = Keys::generate();
-        let our_next = SerializableKeyPair {
-            public_key: our_keys.public_key(),
-            private_key: our_keys.secret_key().to_secret_bytes(),
-        };
-
-        let mut session = Session::new(
-            SessionState {
-                root_key: [0u8; 32],
-                their_current_nostr_public_key: None,
-                their_next_nostr_public_key: None,
-                our_current_nostr_key: None,
-                our_next_nostr_key: our_next,
-                receiving_chain_key: Some([7u8; 32]),
-                sending_chain_key: None,
-                sending_chain_message_number: 0,
-                receiving_chain_message_number: 0,
-                previous_sending_chain_message_count: 0,
-                skipped_keys: HashMap::new(),
-            },
-            "test".to_string(),
-        );
-
-        let sender = Keys::generate().public_key();
-
-        session.skip_message_keys(MAX_SKIP as u32, &sender).unwrap();
-        session
-            .skip_message_keys((MAX_SKIP * 2) as u32, &sender)
-            .unwrap();
-
-        let entry = session.state.skipped_keys.get(&sender).unwrap();
-        assert!(
-            entry.message_keys.len() <= MAX_SKIP,
-            "expected skipped keys to be pruned to MAX_SKIP"
-        );
-        // Oldest key should be gone; newest should remain.
-        assert!(!entry.message_keys.contains_key(&0));
-        assert!(entry
-            .message_keys
-            .contains_key(&((MAX_SKIP * 2 - 1) as u32)));
+    fn context(seed: u64) -> ProtocolContext<'static, StdRng> {
+        let rng = Box::new(StdRng::seed_from_u64(seed));
+        let rng = Box::leak(rng);
+        ProtocolContext::new(
+            UnixSeconds(1_700_000_000),
+            UnixMillis(1_700_000_000_123),
+            rng,
+        )
     }
 
     #[test]
-    fn subscribe_to_messages_is_idempotent_until_close() {
-        let their_current = Keys::generate().public_key();
-        let their_next = Keys::generate().public_key();
-        let our_current = Keys::generate();
-        let our_next = Keys::generate();
+    fn plan_send_and_apply_receive_roundtrip() {
+        let alice_secret = [1u8; 32];
+        let bob_secret = [2u8; 32];
+        let alice_pub = device_pubkey_from_secret_bytes(&alice_secret).unwrap();
+        let bob_pub = device_pubkey_from_secret_bytes(&bob_secret).unwrap();
+        let shared_secret = [7u8; 32];
 
-        let mut session = Session::new(
-            SessionState {
-                root_key: [0u8; 32],
-                their_current_nostr_public_key: Some(their_current),
-                their_next_nostr_public_key: Some(their_next),
-                our_current_nostr_key: Some(SerializableKeyPair {
-                    public_key: our_current.public_key(),
-                    private_key: our_current.secret_key().to_secret_bytes(),
-                }),
-                our_next_nostr_key: SerializableKeyPair {
-                    public_key: our_next.public_key(),
-                    private_key: our_next.secret_key().to_secret_bytes(),
+        let mut init_ctx_alice = context(1);
+        let alice = Session::init(
+            &mut init_ctx_alice,
+            bob_pub,
+            alice_secret,
+            true,
+            shared_secret,
+            None,
+        )
+        .unwrap();
+        let mut init_ctx_bob = context(2);
+        let mut bob = Session::init(
+            &mut init_ctx_bob,
+            alice_pub,
+            bob_secret,
+            false,
+            shared_secret,
+            None,
+        )
+        .unwrap();
+
+        let mut ctx = context(9);
+        let rumor =
+            Rumor::from_content(&mut ctx, DirectMessageContent::Text("hello".to_string())).unwrap();
+        let send_plan = alice.plan_send(&rumor, ctx.now_secs).unwrap();
+        let send_outcome = alice.clone().apply_send(send_plan.clone());
+
+        let mut recv_ctx = context(10);
+        let receive_plan = bob
+            .plan_receive(
+                &mut recv_ctx,
+                &IncomingDirectMessageEnvelope {
+                    sender: send_outcome.envelope.sender,
+                    created_at: send_outcome.envelope.created_at,
+                    encrypted_header: send_outcome.envelope.encrypted_header.clone(),
+                    ciphertext: send_outcome.envelope.ciphertext.clone(),
                 },
-                receiving_chain_key: Some([1u8; 32]),
-                sending_chain_key: Some([2u8; 32]),
-                sending_chain_message_number: 0,
-                receiving_chain_message_number: 0,
-                previous_sending_chain_message_count: 0,
-                skipped_keys: HashMap::new(),
-            },
-            "test".to_string(),
-        );
+            )
+            .unwrap();
+        let outcome = bob.apply_receive(receive_plan);
+        assert_eq!(outcome.rumor.content, "hello");
+    }
 
-        let (tx, rx) = crossbeam_channel::unbounded();
-        session.set_event_tx(tx);
+    #[test]
+    fn plan_receive_does_not_mutate_original_session() {
+        let alice_secret = [3u8; 32];
+        let bob_secret = [4u8; 32];
+        let alice_pub = device_pubkey_from_secret_bytes(&alice_secret).unwrap();
+        let bob_pub = device_pubkey_from_secret_bytes(&bob_secret).unwrap();
+        let shared_secret = [8u8; 32];
 
-        session.subscribe_to_messages().unwrap();
-        session.subscribe_to_messages().unwrap();
+        let mut init_ctx_alice = context(3);
+        let alice = Session::init(
+            &mut init_ctx_alice,
+            bob_pub,
+            alice_secret,
+            true,
+            shared_secret,
+            None,
+        )
+        .unwrap();
+        let mut init_ctx_bob = context(4);
+        let bob = Session::init(
+            &mut init_ctx_bob,
+            alice_pub,
+            bob_secret,
+            false,
+            shared_secret,
+            None,
+        )
+        .unwrap();
+        let bob_before = bob.state.clone();
 
-        let subscribe_count = rx
-            .try_iter()
-            .filter(|event| matches!(event, SessionManagerEvent::Subscribe { .. }))
-            .count();
-        assert_eq!(subscribe_count, 2);
+        let mut ctx = context(12);
+        let rumor = Rumor::from_content(&mut ctx, DirectMessageContent::Typing).unwrap();
+        let send_plan = alice.plan_send(&rumor, ctx.now_secs).unwrap();
 
-        session.close();
+        let mut recv_ctx = context(13);
+        let _ = bob
+            .plan_receive(
+                &mut recv_ctx,
+                &IncomingDirectMessageEnvelope {
+                    sender: send_plan.envelope.sender,
+                    created_at: send_plan.envelope.created_at,
+                    encrypted_header: send_plan.envelope.encrypted_header.clone(),
+                    ciphertext: send_plan.envelope.ciphertext.clone(),
+                },
+            )
+            .unwrap();
 
-        let unsubscribe_count = rx
-            .try_iter()
-            .filter(|event| matches!(event, SessionManagerEvent::Unsubscribe(_)))
-            .count();
-        assert_eq!(unsubscribe_count, 2);
+        assert_eq!(bob.state, bob_before);
+    }
+
+    #[test]
+    fn duplicate_receive_fails_without_corrupting_state() {
+        let alice_secret = [5u8; 32];
+        let bob_secret = [6u8; 32];
+        let alice_pub = device_pubkey_from_secret_bytes(&alice_secret).unwrap();
+        let bob_pub = device_pubkey_from_secret_bytes(&bob_secret).unwrap();
+        let shared_secret = [9u8; 32];
+
+        let mut init_ctx_alice = context(5);
+        let alice = Session::init(
+            &mut init_ctx_alice,
+            bob_pub,
+            alice_secret,
+            true,
+            shared_secret,
+            None,
+        )
+        .unwrap();
+        let mut init_ctx_bob = context(6);
+        let mut bob = Session::init(
+            &mut init_ctx_bob,
+            alice_pub,
+            bob_secret,
+            false,
+            shared_secret,
+            None,
+        )
+        .unwrap();
+
+        let mut send_ctx = context(14);
+        let rumor = Rumor::from_content(
+            &mut send_ctx,
+            DirectMessageContent::Text("hello".to_string()),
+        )
+        .unwrap();
+        let send_plan = alice.plan_send(&rumor, send_ctx.now_secs).unwrap();
+        let envelope = alice.clone().apply_send(send_plan).envelope;
+        let incoming = IncomingDirectMessageEnvelope {
+            sender: envelope.sender,
+            created_at: envelope.created_at,
+            encrypted_header: envelope.encrypted_header.clone(),
+            ciphertext: envelope.ciphertext.clone(),
+        };
+
+        let mut recv_ctx = context(15);
+        let first_plan = bob.plan_receive(&mut recv_ctx, &incoming).unwrap();
+        let _ = bob.apply_receive(first_plan);
+        let after_first = bob.state.clone();
+
+        let mut replay_ctx = context(16);
+        let replay = bob.plan_receive(&mut replay_ctx, &incoming);
+        assert!(replay.is_err());
+        assert_eq!(bob.state, after_first);
+    }
+
+    #[test]
+    fn invalid_sender_is_rejected() {
+        let alice_secret = [7u8; 32];
+        let bob_secret = [8u8; 32];
+        let alice_pub = device_pubkey_from_secret_bytes(&alice_secret).unwrap();
+        let bob_pub = device_pubkey_from_secret_bytes(&bob_secret).unwrap();
+        let shared_secret = [10u8; 32];
+
+        let mut init_ctx_bob = context(7);
+        let bob = Session::init(
+            &mut init_ctx_bob,
+            alice_pub,
+            bob_secret,
+            false,
+            shared_secret,
+            None,
+        )
+        .unwrap();
+
+        let mut recv_ctx = context(17);
+        let err = bob
+            .plan_receive(
+                &mut recv_ctx,
+                &IncomingDirectMessageEnvelope {
+                    sender: bob_pub,
+                    created_at: UnixSeconds(1),
+                    encrypted_header: "bad".to_string(),
+                    ciphertext: "bad".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Domain(DomainError::UnexpectedSender)
+        ));
     }
 }

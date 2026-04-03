@@ -1,108 +1,127 @@
 # nostr-double-ratchet
 
-Rust library implementing Double Ratchet messaging for Nostr, including multi-device session management and sender-key group messaging.
+Rust domain library for Double Ratchet messaging on Nostr.
 
-## Features
+The Rust side is intentionally synchronous and ownership-driven:
 
-- 1:1 Double Ratchet sessions over Nostr events
-- Invite/bootstrap flows for secure session establishment
-- `SessionManager` for multi-device owner/device routing
-- AppKeys-based device authorization and owner-claim validation
-- Sender-key + one-to-many group messaging primitives
-- Persistent storage adapters and message/discovery queues
-- TypeScript/Rust interop test coverage
+- no CLI crate
+- no FFI crate
+- no pubsub/runtime layer
+- no storage adapters or background orchestration in the core
 
-## Security Properties
+State lives in one place, under your control, and every transition happens through normal
+function calls and return values.
 
-### Confidentiality
+## Architecture
 
-- 1:1 payloads are encrypted with Double Ratchet and NIP-44.
-- Group payloads are encrypted with sender-key chains and published as one-to-many outer events.
+There are two layers:
 
-### Forward Secrecy And Post-Compromise Recovery
+1. Domain core:
+   - `ids`
+   - `Session`
+   - `PeerBook`
+   - `Invite`
+   - `AppKeys`
+   - group metadata helpers
 
-- 1:1 chains ratchet continuously, providing forward secrecy.
-- Future secrecy recovers after fresh ratchet steps if transient compromise ends.
+2. Explicit orchestration and adapters:
+   - `NdrState`
+   - `codec::nostr`
 
-### Author/Device Verification
+`NdrState` owns:
 
-- Outer Nostr events are signature-verified.
-- Identity attribution is based on authenticated session context and owner/device mapping.
-- For multi-device owner claims, AppKeys are used to verify device authorization.
-- The latest AppKeys set is authoritative for device authorization; removing a device from AppKeys revokes it for future routing and owner-claim validation.
-- Applications must not publish a reduced AppKeys set implicitly during startup/reopen. Publishing fewer devices should only happen for explicit device revocation or first-device bootstrap.
-- Inner rumor `pubkey` is not treated as a trusted sender identity source.
+- local owner/device identity metadata
+- local AppKeys timeline
+- peer session books
+- peer AppKeys timelines
+- group state
 
-### Plausible Deniability
+It exposes synchronous methods such as:
 
-- Inner rumors are unsigned payloads transported inside encrypted channels.
-- This preserves deniability for inner content at the cost of strong non-repudiation.
+- `upsert_peer_session(...)`
+- `send_text(...)`
+- `receive_direct_message(...)`
+- `apply_local_app_keys(...)`
+- `apply_peer_app_keys(...)`
+- `create_group(...)`
+- `apply_group_metadata(...)`
+- `snapshot()`
 
-## Group Messaging Architecture
+No hidden subscriptions, callbacks, queues, or async tasks are involved.
 
-Groups are handled with a hybrid model:
-
-1. Membership is tracked by owner pubkeys.
-2. Group metadata and sender-key distributions are sent over authenticated 1:1 sessions.
-3. Each sender device uses a per-group sender-event keypair and sender-key state.
-4. Group messages are published once (one-to-many), then decrypted by members with sender-key state.
-5. Shared-channel events are used by higher-level integrations for signed bootstrap invites when pairwise sessions are missing.
-
-## Basic 1:1 Usage
+## Basic Usage
 
 ```rust
-use nostr::Keys;
-use nostr_double_ratchet::Session;
+use rand::{rngs::StdRng, SeedableRng};
+use nostr_double_ratchet::{
+    codec::nostr,
+    DeviceId, DevicePubkey, IncomingDirectMessageEnvelope, IncomingInviteResponseEnvelope,
+    NdrState, ProtocolContext, UnixMillis, UnixSeconds,
+};
 
-let alice_keys = Keys::generate();
-let bob_keys = Keys::generate();
+let alice_secret = [1u8; 32];
+let bob_secret = [2u8; 32];
 
-// Shared secret must come from a secure invite/bootstrap flow.
-let shared_secret = [7u8; 32];
+let mut rng = StdRng::seed_from_u64(7);
+let mut ctx = ProtocolContext::new(
+    UnixSeconds(1_700_000_000),
+    UnixMillis(1_700_000_000_000),
+    &mut rng,
+);
 
-let mut alice = Session::init(
-    bob_keys.public_key(),
-    alice_keys.secret_key().to_secret_bytes(),
-    true,
-    shared_secret,
-    Some("alice-chat".to_string()),
-)?;
+let mut alice = NdrState::single_device(
+    DevicePubkey::from_bytes(nostr::Keys::new(
+        nostr::SecretKey::from_slice(&alice_secret)?
+    ).public_key().to_bytes()),
+    Some(DeviceId::new("alice-device")),
+);
+let mut bob = NdrState::single_device(
+    DevicePubkey::from_bytes(nostr::Keys::new(
+        nostr::SecretKey::from_slice(&bob_secret)?
+    ).public_key().to_bytes()),
+    Some(DeviceId::new("bob-device")),
+);
 
-let mut bob = Session::init(
-    alice_keys.public_key(),
-    bob_keys.secret_key().to_secret_bytes(),
-    false,
-    shared_secret,
-    Some("bob-chat".to_string()),
-)?;
+let invite = alice.create_invite(&mut ctx, None)?;
+let acceptance = bob.accept_invite(&mut ctx, &invite, bob_secret)?;
+let response_event = nostr::invite_response_event(&acceptance.response)?;
+let response = nostr::parse_invite_response_event(&response_event)?;
+alice.process_invite_response(&mut ctx, &invite, &response, alice_secret)?;
 
-let outer = alice.send("hello bob".to_string())?;
-let plaintext = bob.receive(&outer)?;
-assert!(plaintext.is_some());
+let outbound = bob.send_text(&mut ctx, alice.owner_pubkey(), "hello".to_string())?;
+let dm_event = nostr::direct_message_event(&outbound.envelope)?;
+let incoming = nostr::parse_direct_message_event(&dm_event)?;
+let received = alice
+    .receive_direct_message(&mut ctx, bob.owner_pubkey(), None, &incoming)?
+    .expect("message");
+
+assert_eq!(received.rumor.content, "hello");
 # Ok::<(), nostr_double_ratchet::Error>(())
 ```
 
-## Disappearing Messages
+## Snapshot-Driven Inspection
 
-Use NIP-40-style `["expiration", "<unix seconds>"]` tags in inner rumors.  
-`SessionManager` helpers support global, per-peer, and per-group defaults through `SendOptions`.
+Use `snapshot()` when you want a stable, serializable view of the full Rust-side state:
 
-## 1:1 Chat Settings Signaling
+- local owner/device keys
+- authorized devices from AppKeys
+- peer session books
+- peer AppKeys views
+- groups
 
-- Kind: `CHAT_SETTINGS_KIND = 10448`
-- Content: `{ "type": "chat-settings", "v": 1, "messageTtlSeconds": <seconds|null> }`
-- Settings events themselves should not expire
+This is the preferred way to inspect state instead of inferring it from emitted events.
 
-Receivers can auto-adopt or reject incoming settings policy.
+## Security Properties
+
+- 1:1 payloads are encrypted with Double Ratchet and NIP-44.
+- Outer Nostr events are signature-verified.
+- AppKeys snapshots are ordered by `created_at`, stale snapshots are ignored, and same-second
+  snapshots are merged monotonically.
+- Inner rumor `pubkey` is not treated as a trusted sender identity source.
+- Inner rumors remain unsigned, preserving plausible deniability.
 
 ## Testing
 
 ```bash
 cargo test -p nostr-double-ratchet --manifest-path rust/Cargo.toml
-```
-
-For CLI/e2e coverage (including cross-language tests), run:
-
-```bash
-cargo test -p ndr --manifest-path rust/Cargo.toml
 ```
