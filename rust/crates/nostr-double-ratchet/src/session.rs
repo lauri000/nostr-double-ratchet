@@ -36,6 +36,8 @@ pub struct SessionState {
     pub root_key: [u8; 32],
     pub their_current_nostr_public_key: Option<DevicePubkey>,
     pub their_next_nostr_public_key: Option<DevicePubkey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub our_previous_nostr_key: Option<SerializableKeyPair>,
     pub our_current_nostr_key: Option<SerializableKeyPair>,
     pub our_next_nostr_key: SerializableKeyPair,
     #[serde(default, with = "serde_option_bytes_array")]
@@ -124,6 +126,13 @@ pub struct ReceiveOutcome {
 pub struct Session {
     pub state: SessionState,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderDecryptionTarget {
+    Current,
+    Next,
+    Previous,
 }
 
 impl Rumor {
@@ -273,6 +282,7 @@ impl Session {
                 root_key,
                 their_current_nostr_public_key: None,
                 their_next_nostr_public_key: Some(their_ephemeral_nostr_public_key),
+                our_previous_nostr_key: None,
                 our_current_nostr_key,
                 our_next_nostr_key,
                 receiving_chain_key: None,
@@ -294,6 +304,7 @@ impl Session {
     pub fn matches_sender(&self, sender: DevicePubkey) -> bool {
         self.state.their_current_nostr_public_key == Some(sender)
             || self.state.their_next_nostr_public_key == Some(sender)
+            || self.state.skipped_keys.contains_key(&sender)
     }
 
     pub fn plan_send(&self, rumor: &Rumor, now: UnixSeconds) -> Result<SendPlan> {
@@ -355,21 +366,26 @@ impl Session {
         }
 
         let mut next_state = self.state.clone();
-        let (header, should_ratchet) =
+        let previous_chain_sender = next_state
+            .their_current_nostr_public_key
+            .or(next_state.their_next_nostr_public_key);
+        let (header, decryption_target) =
             decrypt_header(&next_state, &envelope.encrypted_header, envelope.sender)?;
+        let should_ratchet = decryption_target == HeaderDecryptionTarget::Next;
 
         let expected_next = next_state.their_next_nostr_public_key;
-        if expected_next != Some(header.next_public_key) {
+        if should_ratchet && expected_next != Some(header.next_public_key) {
             next_state.their_current_nostr_public_key = next_state.their_next_nostr_public_key;
             next_state.their_next_nostr_public_key = Some(header.next_public_key);
         }
 
         if should_ratchet {
             if next_state.receiving_chain_key.is_some() {
+                let skipped_sender = previous_chain_sender.ok_or(DomainError::SessionNotReady)?;
                 skip_message_keys(
                     &mut next_state,
                     header.previous_chain_length,
-                    envelope.sender,
+                    skipped_sender,
                 )?;
             }
             ratchet_step(&mut next_state, ctx.rng)?;
@@ -473,6 +489,7 @@ where
         nip44::v2::ConversationKey::derive(&our_next_sk, &their_next_pk.to_nostr()?);
     let kdf_outputs = kdf(&state.root_key, conversation_key1.as_bytes(), 2);
     state.receiving_chain_key = Some(kdf_outputs[1]);
+    state.our_previous_nostr_key = state.our_current_nostr_key.clone();
     state.our_current_nostr_key = Some(state.our_next_nostr_key.clone());
 
     let our_next_private_key = random_secret_key_bytes(rng)?;
@@ -550,20 +567,32 @@ fn decrypt_header(
     state: &SessionState,
     encrypted_header: &str,
     sender: DevicePubkey,
-) -> Result<(Header, bool)> {
+) -> Result<(Header, HeaderDecryptionTarget)> {
     if let Some(current) = &state.our_current_nostr_key {
         let current_sk = secret_key_from_bytes(&current.private_key)?;
         if let Ok(decrypted) = nip44::decrypt(&current_sk, &sender.to_nostr()?, encrypted_header) {
             let header: Header = serde_json::from_str(&decrypted)?;
-            return Ok((header, false));
+            return Ok((header, HeaderDecryptionTarget::Current));
         }
     }
 
     let next_sk = secret_key_from_bytes(&state.our_next_nostr_key.private_key)?;
-    let decrypted = nip44::decrypt(&next_sk, &sender.to_nostr()?, encrypted_header)
-        .map_err(|_| CodecError::InvalidHeader)?;
-    let header: Header = serde_json::from_str(&decrypted)?;
-    Ok((header, true))
+    if let Ok(decrypted) = nip44::decrypt(&next_sk, &sender.to_nostr()?, encrypted_header) {
+        let header: Header = serde_json::from_str(&decrypted)?;
+        return Ok((header, HeaderDecryptionTarget::Next));
+    }
+
+    if let Some(previous) = &state.our_previous_nostr_key {
+        let previous_sk = secret_key_from_bytes(&previous.private_key)?;
+        if let Ok(decrypted) =
+            nip44::decrypt(&previous_sk, &sender.to_nostr()?, encrypted_header)
+        {
+            let header: Header = serde_json::from_str(&decrypted)?;
+            return Ok((header, HeaderDecryptionTarget::Previous));
+        }
+    }
+
+    Err(CodecError::InvalidHeader.into())
 }
 
 fn prune_skipped_message_keys(map: &mut BTreeMap<u32, [u8; 32]>) {

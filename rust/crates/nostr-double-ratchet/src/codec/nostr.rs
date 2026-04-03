@@ -46,6 +46,9 @@ pub fn parse_direct_message_event(event: &Event) -> Result<IncomingDirectMessage
     verify_event_kind(event, MESSAGE_EVENT_KIND)?;
     event.verify()?;
     let encrypted_header = required_tag_value(event, "header")?;
+    if encrypted_header.is_empty() {
+        return Err(CodecError::InvalidEvent("empty `header` tag".to_string()).into());
+    }
 
     Ok(IncomingDirectMessageEnvelope {
         sender: DevicePubkey::from_nostr(event.pubkey),

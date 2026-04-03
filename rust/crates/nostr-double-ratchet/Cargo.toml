@@ -6,7 +6,6 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-autotests = false
 
 [dependencies]
 nostr.workspace = true
