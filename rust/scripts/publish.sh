@@ -1,9 +1,9 @@
 #!/bin/bash
-# Publish nostr-double-ratchet crates to crates.io in dependency order
+# Publish supported nostr-double-ratchet crates to crates.io in dependency order
 #
 # Usage:
-#   ./scripts/publish.sh        # Publish all crates
-#   ./scripts/publish.sh --dry-run  # Test without publishing
+#   ./scripts/publish.sh
+#   ./scripts/publish.sh --dry-run
 
 set -e
 
@@ -39,7 +39,7 @@ publish_crate() {
     fi
 }
 
-echo "Publishing nostr-double-ratchet crates to crates.io"
+echo "Publishing supported nostr-double-ratchet crates to crates.io"
 echo ""
 
 # Check if logged in
@@ -51,11 +51,11 @@ if [[ -z "$DRY_RUN" ]]; then
     fi
 fi
 
-# Tier 1: Library (no internal dependencies)
+# Tier 1: Domain core
 publish_crate "nostr-double-ratchet"
 
-# Tier 2: CLI (depends on library)
-publish_crate "ndr"
+# Tier 2: Nostr adapter
+publish_crate "nostr-double-ratchet-nostr"
 
 echo ""
 echo "=========================================="
