@@ -4,13 +4,12 @@ use base64::Engine;
 use nostr::nips::nip44::{self, Version};
 use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, SecretKey, Tag, Timestamp};
 use nostr_double_ratchet::{
-    codec::nostr as codec, DeviceDelivery, DeviceId, DevicePubkey, DeviceRecordSnapshot,
-    DirectMessageContent, IncomingDirectMessageEnvelope, IncomingInviteResponseEnvelope, Invite,
-    InviteResponse, OutgoingInviteResponseEnvelope, OwnerPubkey, PreparedFanout,
-    ProcessedInviteResponse, ProtocolContext, ReceivedDirectMessage, Result, Rumor, Session,
-    SessionManager, SessionManagerPolicy, SessionManagerSnapshot, SessionState, UnixMillis,
-    UnixSeconds, UserRecordSnapshot,
+    AuthorizedDevice, Delivery, DeviceId, DevicePubkey, DeviceRecordSnapshot, DeviceRoster, Invite,
+    InviteResponse, InviteResponseEnvelope, MessageEnvelope, OwnerPubkey, PreparedSend,
+    ProcessedInviteResponse, ProtocolContext, ReceivedMessage, Result, RosterSnapshotDecision,
+    Session, SessionManager, SessionManagerSnapshot, SessionState, UnixSeconds, UserRecordSnapshot,
 };
+use nostr_double_ratchet_nostr::nostr as codec;
 use rand::{rngs::StdRng, CryptoRng, RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
 
@@ -24,17 +23,9 @@ pub struct Actor {
     pub device_id: DeviceId,
 }
 
-pub struct InviteBootstrap {
-    pub alice: Actor,
-    pub bob: Actor,
-    pub owned_invite: Invite,
-    pub invite_response: InviteResponse,
-    pub incoming_response: IncomingInviteResponseEnvelope,
-    pub alice_session: Session,
-    pub bob_session: Session,
-}
-
 pub struct ManagerDevice {
+    pub owner_secret_key: [u8; 32],
+    pub owner_keys: Keys,
     pub owner_pubkey: OwnerPubkey,
     pub secret_key: [u8; 32],
     pub keys: Keys,
@@ -42,20 +33,23 @@ pub struct ManagerDevice {
     pub device_id: DeviceId,
 }
 
+pub struct InviteBootstrap {
+    pub alice: Actor,
+    pub bob: Actor,
+    pub owned_invite: Invite,
+    pub invite_response: InviteResponse,
+    pub response_envelope: InviteResponseEnvelope,
+    pub alice_session: Session,
+    pub bob_session: Session,
+}
+
 pub struct InviteResponseFixture {
     pub alice: Actor,
     pub bob: Actor,
     pub owned_invite: Invite,
     pub public_invite: Invite,
-    pub response_envelope: OutgoingInviteResponseEnvelope,
-    pub incoming_response: IncomingInviteResponseEnvelope,
+    pub response_envelope: InviteResponseEnvelope,
     pub bob_session: Session,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Alice,
-    Bob,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,32 +61,60 @@ pub enum InviteResponseCorruption {
     InvalidSessionKey,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentMessage {
-    pub rumor: Rumor,
+    pub payload: Vec<u8>,
     pub event: Event,
-    pub incoming: IncomingDirectMessageEnvelope,
+    pub incoming: MessageEnvelope,
 }
 
-pub struct HeldMessage {
-    pub from: Side,
-    pub sent: SentMessage,
+pub fn context(seed: u64, now_secs: u64) -> ProtocolContext<'static, StdRng> {
+    let mixed_seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17)
+        ^ now_secs.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let rng = Box::new(StdRng::seed_from_u64(mixed_seed));
+    let rng = Box::leak(rng);
+    ProtocolContext::new(UnixSeconds(now_secs), rng)
 }
 
-pub struct DeliveryScript {
-    next_seed: u64,
-    next_secs: u64,
-    held: Vec<HeldMessage>,
+pub fn snapshot<T>(value: &T) -> String
+where
+    T: Serialize,
+{
+    serde_json::to_string(value).unwrap()
+}
+
+pub fn payload_text(payload: &[u8]) -> String {
+    String::from_utf8(payload.to_vec()).expect("payload must be valid utf-8 in this test")
+}
+
+pub fn assert_payload_eq(actual: &[u8], expected: &[u8]) {
+    assert_eq!(actual, expected);
+}
+
+pub fn actor(secret_fill: u8, device_id: &str) -> Actor {
+    let secret_key = [secret_fill; 32];
+    let keys = Keys::new(SecretKey::from_slice(&secret_key).unwrap());
+    let device_pubkey = DevicePubkey::from_bytes(keys.public_key().to_bytes());
+    Actor {
+        secret_key,
+        keys,
+        device_pubkey,
+        owner_pubkey: device_pubkey.as_owner(),
+        device_id: DeviceId::new(device_id),
+    }
 }
 
 pub fn manager_device(owner_fill: u8, device_fill: u8, device_id: &str) -> ManagerDevice {
-    let owner_secret = [owner_fill; 32];
-    let owner_keys = Keys::new(SecretKey::from_slice(&owner_secret).unwrap());
+    let owner_secret_key = [owner_fill; 32];
+    let owner_keys = Keys::new(SecretKey::from_slice(&owner_secret_key).unwrap());
+    let owner_pubkey = OwnerPubkey::from_bytes(owner_keys.public_key().to_bytes());
     let secret_key = [device_fill; 32];
     let keys = Keys::new(SecretKey::from_slice(&secret_key).unwrap());
     let device_pubkey = DevicePubkey::from_bytes(keys.public_key().to_bytes());
     ManagerDevice {
-        owner_pubkey: OwnerPubkey::from_bytes(owner_keys.public_key().to_bytes()),
+        owner_secret_key,
+        owner_keys,
+        owner_pubkey,
         secret_key,
         keys,
         device_pubkey,
@@ -100,37 +122,34 @@ pub fn manager_device(owner_fill: u8, device_fill: u8, device_id: &str) -> Manag
     }
 }
 
-pub fn session_manager(device: &ManagerDevice, max_relay_latency_secs: u64) -> SessionManager {
+pub fn session_manager(device: &ManagerDevice) -> SessionManager {
     SessionManager::new(
         device.owner_pubkey,
         device.secret_key,
         Some(device.device_id.clone()),
-        SessionManagerPolicy {
-            max_relay_latency: UnixSeconds(max_relay_latency_secs),
-        },
     )
 }
 
-pub fn app_keys_for(devices: &[&ManagerDevice], created_at: u64) -> nostr_double_ratchet::AppKeys {
-    nostr_double_ratchet::AppKeys::new(
+pub fn roster_for(devices: &[&ManagerDevice], created_at: u64) -> DeviceRoster {
+    DeviceRoster::new(
+        UnixSeconds(created_at),
         devices
             .iter()
-            .map(|device| nostr_double_ratchet::DeviceEntry {
-                identity_pubkey: device.device_pubkey,
-                created_at: UnixSeconds(created_at),
-            })
+            .map(|device| AuthorizedDevice::new(device.device_pubkey, UnixSeconds(created_at)))
             .collect(),
     )
 }
 
 pub fn public_invite_via_url(invite: &Invite) -> Result<Invite> {
-    codec::parse_invite_url(&codec::invite_url(invite, ROOT_URL)?)
+    codec::parse_invite_url(&codec::invite_url(invite, ROOT_URL)?).map_err(Into::into)
 }
 
 pub fn public_invite_via_event(invite: &Invite, signer_secret: [u8; 32]) -> Result<Invite> {
     let keys = Keys::new(SecretKey::from_slice(&signer_secret).unwrap());
-    let event = codec::invite_unsigned_event(invite)?.sign_with_keys(&keys)?;
-    codec::parse_invite_event(&event)
+    let event = codec::invite_unsigned_event(invite)?
+        .sign_with_keys(&keys)
+        .map_err(codec_error)?;
+    codec::parse_invite_event(&event).map_err(Into::into)
 }
 
 pub fn manager_public_device_invite(
@@ -140,8 +159,9 @@ pub fn manager_public_device_invite(
     now_secs: u64,
 ) -> Result<Invite> {
     let mut ctx = context(seed, now_secs);
-    let invite = manager.ensure_local_device_invite(&mut ctx)?.clone();
-    public_invite_via_event(&invite, device.secret_key)
+    let invite = manager.ensure_local_invite(&mut ctx)?.clone();
+    let _ = device;
+    public_invite_via_url(&invite)
 }
 
 pub fn custom_public_device_invite(
@@ -154,60 +174,35 @@ pub fn custom_public_device_invite(
     let mut invite =
         Invite::create_new(&mut ctx, device.device_pubkey.as_owner(), device_id, None)?;
     invite.owner_public_key = Some(device.owner_pubkey);
-    if invite.device_id.is_some() {
-        public_invite_via_event(&invite, device.secret_key)
-    } else {
-        public_invite_via_url(&invite)
-    }
-}
-
-pub fn incoming_invite_response(
-    envelope: &OutgoingInviteResponseEnvelope,
-) -> Result<IncomingInviteResponseEnvelope> {
-    let event = codec::invite_response_event(envelope)?;
-    codec::parse_invite_response_event(&event)
+    let _ = device;
+    public_invite_via_url(&invite)
 }
 
 pub fn manager_receive_delivery<R>(
     manager: &mut SessionManager,
     ctx: &mut ProtocolContext<'_, R>,
     sender_owner: OwnerPubkey,
-    envelope: &nostr_double_ratchet::DeviceDelivery,
-) -> Result<Option<ReceivedDirectMessage>>
+    delivery: &Delivery,
+) -> Result<Option<ReceivedMessage>>
 where
     R: RngCore + CryptoRng,
 {
-    let event = codec::direct_message_event(&envelope.envelope)?;
-    let incoming = codec::parse_direct_message_event(&event)?;
-    manager.receive_direct_message(ctx, sender_owner, &incoming)
+    let event = codec::message_event(&delivery.envelope)?;
+    let incoming = codec::parse_message_event(&event)?;
+    manager.receive(ctx, sender_owner, &incoming)
 }
 
 pub fn manager_observe_invite_response<R>(
     manager: &mut SessionManager,
     ctx: &mut ProtocolContext<'_, R>,
-    envelope: &OutgoingInviteResponseEnvelope,
+    envelope: &InviteResponseEnvelope,
 ) -> Result<Option<ProcessedInviteResponse>>
 where
     R: RngCore + CryptoRng,
 {
-    let incoming = incoming_invite_response(envelope)?;
+    let event = codec::invite_response_event(envelope)?;
+    let incoming = codec::parse_invite_response_event(&event)?;
     manager.observe_invite_response(ctx, &incoming)
-}
-
-pub fn restore_manager(
-    snapshot: &SessionManagerSnapshot,
-    local_device_secret_key: [u8; 32],
-    max_relay_latency_secs: u64,
-) -> Result<SessionManager> {
-    let restored: SessionManagerSnapshot =
-        serde_json::from_str(&serde_json::to_string(snapshot).unwrap()).unwrap();
-    SessionManager::from_snapshot(
-        restored,
-        local_device_secret_key,
-        SessionManagerPolicy {
-            max_relay_latency: UnixSeconds(max_relay_latency_secs),
-        },
-    )
 }
 
 pub fn observe_device_invites(
@@ -221,27 +216,13 @@ pub fn observe_device_invites(
     Ok(())
 }
 
-pub fn prepared_targets(prepared: &PreparedFanout) -> Vec<(OwnerPubkey, DevicePubkey)> {
-    prepared
-        .deliveries
-        .iter()
-        .map(|delivery| (delivery.owner_pubkey, delivery.device_pubkey))
-        .collect()
-}
-
-pub fn delivery_by_target(
-    prepared: &PreparedFanout,
-    owner_pubkey: OwnerPubkey,
-    device_pubkey: DevicePubkey,
-) -> DeviceDelivery {
-    prepared
-        .deliveries
-        .iter()
-        .find(|delivery| {
-            delivery.owner_pubkey == owner_pubkey && delivery.device_pubkey == device_pubkey
-        })
-        .cloned()
-        .expect("target delivery must exist")
+pub fn restore_manager(
+    snapshot: &SessionManagerSnapshot,
+    local_device_secret_key: [u8; 32],
+) -> Result<SessionManager> {
+    let restored: SessionManagerSnapshot =
+        serde_json::from_str(&serde_json::to_string(snapshot).unwrap()).unwrap();
+    SessionManager::from_snapshot(restored, local_device_secret_key)
 }
 
 pub fn manager_user_snapshot(
@@ -265,99 +246,34 @@ pub fn manager_device_snapshot(
         .expect("device snapshot must exist")
 }
 
-pub fn received_contents(received: &[ReceivedDirectMessage]) -> Vec<String> {
-    received
+pub fn prepared_targets(prepared: &PreparedSend) -> Vec<(OwnerPubkey, DevicePubkey)> {
+    prepared
+        .deliveries
         .iter()
-        .map(|message| message.rumor.content.clone())
+        .map(|delivery| (delivery.owner_pubkey, delivery.device_pubkey))
         .collect()
 }
 
-pub fn actor(secret_fill: u8, device_id: &str) -> Actor {
-    let secret_key = [secret_fill; 32];
-    let keys = Keys::new(SecretKey::from_slice(&secret_key).unwrap());
-    let device_pubkey = DevicePubkey::from_bytes(keys.public_key().to_bytes());
-    Actor {
-        secret_key,
-        keys,
-        device_pubkey,
-        owner_pubkey: device_pubkey.as_owner(),
-        device_id: DeviceId::new(device_id),
-    }
+pub fn delivery_by_target(
+    prepared: &PreparedSend,
+    owner_pubkey: OwnerPubkey,
+    device_pubkey: DevicePubkey,
+) -> Delivery {
+    prepared
+        .deliveries
+        .iter()
+        .find(|delivery| {
+            delivery.owner_pubkey == owner_pubkey && delivery.device_pubkey == device_pubkey
+        })
+        .cloned()
+        .expect("target delivery must exist")
 }
 
-pub fn context(seed: u64, now_secs: u64) -> ProtocolContext<'static, StdRng> {
-    let mixed_seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17)
-        ^ now_secs.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    let rng = Box::new(StdRng::seed_from_u64(mixed_seed));
-    let rng = Box::leak(rng);
-    ProtocolContext::new(
-        UnixSeconds(now_secs),
-        UnixMillis(now_secs.saturating_mul(1000).saturating_add(seed % 997)),
-        rng,
-    )
-}
-
-impl Side {
-    pub fn opposite(self) -> Self {
-        match self {
-            Self::Alice => Self::Bob,
-            Self::Bob => Self::Alice,
-        }
-    }
-}
-
-impl DeliveryScript {
-    pub fn new(start_seed: u64, start_secs: u64) -> Self {
-        Self {
-            next_seed: start_seed,
-            next_secs: start_secs,
-            held: Vec::new(),
-        }
-    }
-
-    fn next_context(&mut self) -> ProtocolContext<'static, StdRng> {
-        let ctx = context(self.next_seed, self.next_secs);
-        self.next_seed = self.next_seed.saturating_add(1);
-        self.next_secs = self.next_secs.saturating_add(1);
-        ctx
-    }
-
-    pub fn send_text(
-        &mut self,
-        from: Side,
-        alice: &mut Session,
-        bob: &mut Session,
-        text: impl Into<String>,
-    ) -> Result<usize> {
-        let mut ctx = self.next_context();
-        let sent = match from {
-            Side::Alice => send_message(alice, &mut ctx, DirectMessageContent::Text(text.into()))?,
-            Side::Bob => send_message(bob, &mut ctx, DirectMessageContent::Text(text.into()))?,
-        };
-        let id = self.held.len();
-        self.held.push(HeldMessage { from, sent });
-        Ok(id)
-    }
-
-    pub fn deliver(&mut self, id: usize, alice: &mut Session, bob: &mut Session) -> Result<Rumor> {
-        let mut ctx = self.next_context();
-        let held = self
-            .held
-            .get(id)
-            .expect("delivery script message id must exist");
-        match held.from {
-            Side::Alice => receive_event(bob, &mut ctx, &held.sent.event),
-            Side::Bob => receive_event(alice, &mut ctx, &held.sent.event),
-        }
-    }
-
-    pub fn replay(&mut self, id: usize, alice: &mut Session, bob: &mut Session) -> Result<Rumor> {
-        self.deliver(id, alice, bob)
-    }
-
-    pub fn sent(&self, id: usize) -> &SentMessage {
-        &self.held[id].sent
-    }
+pub fn received_payloads(received: &[ReceivedMessage]) -> Vec<String> {
+    received
+        .iter()
+        .map(|message| payload_text(&message.payload))
+        .collect()
 }
 
 pub fn direct_session_pair(
@@ -370,63 +286,22 @@ pub fn direct_session_pair(
     let shared_secret = [77u8; 32];
 
     let mut alice_init = context(10 + alice_fill as u64, base_secs);
-    let alice_session = Session::init(
+    let alice_session = Session::new_initiator(
         &mut alice_init,
         bob.device_pubkey,
         alice.secret_key,
-        true,
         shared_secret,
-        Some("alice".to_string()),
     )?;
 
     let mut bob_init = context(20 + bob_fill as u64, base_secs);
-    let bob_session = Session::init(
+    let bob_session = Session::new_responder(
         &mut bob_init,
         alice.device_pubkey,
         bob.secret_key,
-        false,
         shared_secret,
-        Some("bob".to_string()),
     )?;
 
     Ok((alice, bob, alice_session, bob_session))
-}
-
-pub fn invite_response_fixture(
-    base_secs: u64,
-    max_uses: Option<usize>,
-) -> Result<InviteResponseFixture> {
-    let alice = actor(51, "alice-device");
-    let bob = actor(52, "bob-device");
-
-    let mut invite_ctx = context(300, base_secs);
-    let owned_invite = Invite::create_new(
-        &mut invite_ctx,
-        alice.owner_pubkey,
-        Some(alice.device_id.clone()),
-        max_uses,
-    )?;
-    let public_invite = codec::parse_invite_url(&codec::invite_url(&owned_invite, ROOT_URL)?)?;
-
-    let mut accept_ctx = context(301, base_secs + 1);
-    let (bob_session, response_envelope) = public_invite.accept(
-        &mut accept_ctx,
-        bob.device_pubkey,
-        bob.secret_key,
-        Some(bob.device_id.clone()),
-    )?;
-    let response_event = codec::invite_response_event(&response_envelope)?;
-    let incoming_response = codec::parse_invite_response_event(&response_event)?;
-
-    Ok(InviteResponseFixture {
-        alice,
-        bob,
-        owned_invite,
-        public_invite,
-        response_envelope,
-        incoming_response,
-        bob_session,
-    })
 }
 
 pub fn bootstrap_via_invite_url(base_secs: u64) -> Result<InviteBootstrap> {
@@ -450,29 +325,25 @@ fn bootstrap_via_invite(base_secs: u64, via_url: bool) -> Result<InviteBootstrap
     )?;
 
     let public_invite = if via_url {
-        let url = codec::invite_url(&owned_invite, ROOT_URL)?;
-        codec::parse_invite_url(&url)?
+        public_invite_via_url(&owned_invite)?
     } else {
-        let signed_event =
-            codec::invite_unsigned_event(&owned_invite)?.sign_with_keys(&alice.keys)?;
-        codec::parse_invite_event(&signed_event)?
+        public_invite_via_event(&owned_invite, alice.secret_key)?
     };
 
-    let mut bob_accept_ctx = context(101, base_secs + 1);
+    let mut accept_ctx = context(101, base_secs + 1);
     let (bob_session, response_envelope) = public_invite.accept(
-        &mut bob_accept_ctx,
+        &mut accept_ctx,
         bob.device_pubkey,
         bob.secret_key,
         Some(bob.device_id.clone()),
     )?;
 
-    let response_event = codec::invite_response_event(&response_envelope)?;
-    let incoming_response = codec::parse_invite_response_event(&response_event)?;
+    let event = codec::invite_response_event(&response_envelope)?;
+    let incoming = codec::parse_invite_response_event(&event)?;
 
-    let mut alice_process_ctx = context(102, base_secs + 2);
-    let invite_response = owned_invite
-        .process_invite_response(&mut alice_process_ctx, &incoming_response, alice.secret_key)?
-        .expect("expected invite response");
+    let mut process_ctx = context(102, base_secs + 2);
+    let invite_response =
+        owned_invite.process_response(&mut process_ctx, &incoming, alice.secret_key)?;
     let alice_session = invite_response.session.clone();
 
     Ok(InviteBootstrap {
@@ -480,112 +351,108 @@ fn bootstrap_via_invite(base_secs: u64, via_url: bool) -> Result<InviteBootstrap
         bob,
         owned_invite,
         invite_response,
-        incoming_response,
+        response_envelope,
         alice_session,
         bob_session,
     })
 }
 
-pub fn send_message<R>(
+pub fn invite_response_fixture(
+    base_secs: u64,
+    max_uses: Option<usize>,
+) -> Result<InviteResponseFixture> {
+    let alice = actor(51, "alice-device");
+    let bob = actor(52, "bob-device");
+
+    let mut invite_ctx = context(300, base_secs);
+    let owned_invite = Invite::create_new(
+        &mut invite_ctx,
+        alice.owner_pubkey,
+        Some(alice.device_id.clone()),
+        max_uses,
+    )?;
+    let public_invite = public_invite_via_url(&owned_invite)?;
+
+    let mut accept_ctx = context(301, base_secs + 1);
+    let (bob_session, response_envelope) = public_invite.accept(
+        &mut accept_ctx,
+        bob.device_pubkey,
+        bob.secret_key,
+        Some(bob.device_id.clone()),
+    )?;
+
+    Ok(InviteResponseFixture {
+        alice,
+        bob,
+        owned_invite,
+        public_invite,
+        response_envelope,
+        bob_session,
+    })
+}
+
+pub fn send_bytes<R>(
     session: &mut Session,
     ctx: &mut ProtocolContext<'_, R>,
-    content: DirectMessageContent,
+    payload: Vec<u8>,
 ) -> Result<SentMessage>
 where
     R: RngCore + CryptoRng,
 {
-    let rumor = Rumor::from_content(ctx, content)?;
-    send_rumor(session, ctx.now_secs, rumor)
-}
-
-pub fn send_rumor(session: &mut Session, now: UnixSeconds, rumor: Rumor) -> Result<SentMessage> {
-    let send_plan = session.plan_send(&rumor, now)?;
+    let send_plan = session.plan_send(&payload, ctx.now)?;
     let sent = session.apply_send(send_plan);
-    let event = codec::direct_message_event(&sent.envelope)?;
-    let incoming = codec::parse_direct_message_event(&event)?;
+    let event = codec::message_event(&sent.envelope)?;
+    let incoming = codec::parse_message_event(&event)?;
     Ok(SentMessage {
-        rumor: sent.rumor,
+        payload: sent.payload,
         event,
         incoming,
     })
 }
 
+pub fn send_text<R>(
+    session: &mut Session,
+    ctx: &mut ProtocolContext<'_, R>,
+    text: impl AsRef<str>,
+) -> Result<SentMessage>
+where
+    R: RngCore + CryptoRng,
+{
+    send_bytes(session, ctx, text.as_ref().as_bytes().to_vec())
+}
+
 pub fn receive_message<R>(
     session: &mut Session,
     ctx: &mut ProtocolContext<'_, R>,
-    incoming: &IncomingDirectMessageEnvelope,
-) -> Result<Rumor>
+    incoming: &MessageEnvelope,
+) -> Result<Vec<u8>>
 where
     R: RngCore + CryptoRng,
 {
     let plan = session.plan_receive(ctx, incoming)?;
-    Ok(session.apply_receive(plan).rumor)
+    Ok(session.apply_receive(plan).payload)
 }
 
 pub fn receive_event<R>(
     session: &mut Session,
     ctx: &mut ProtocolContext<'_, R>,
     event: &Event,
-) -> Result<Rumor>
+) -> Result<Vec<u8>>
 where
     R: RngCore + CryptoRng,
 {
-    let incoming = codec::parse_direct_message_event(event)?;
+    let incoming = codec::parse_message_event(event)?;
     receive_message(session, ctx, &incoming)
 }
 
-pub fn restore_session(state: &SessionState, name: &str) -> Session {
+pub fn restore_session(state: &SessionState) -> Session {
     let restored: SessionState =
         serde_json::from_str(&serde_json::to_string(state).unwrap()).unwrap();
-    Session::new(restored, name.to_string())
+    Session::new(restored)
 }
 
 pub fn checkpoint_session(session: &Session) -> SessionState {
     session.state.clone()
-}
-
-pub fn corrupt_invite_response_layer(
-    invite: &Invite,
-    response: &OutgoingInviteResponseEnvelope,
-    invitee: &Actor,
-    corruption: InviteResponseCorruption,
-) -> Result<IncomingInviteResponseEnvelope> {
-    match corruption {
-        InviteResponseCorruption::OuterEnvelope => Ok(IncomingInviteResponseEnvelope {
-            sender: response.sender,
-            created_at: response.created_at,
-            content: mutate_text(&response.content),
-        }),
-        InviteResponseCorruption::InnerJson => {
-            reencrypt_outer_response(response, "\"not-json\"".to_string())
-        }
-        InviteResponseCorruption::InnerBase64 => {
-            let mut inner = decrypt_outer_response(invite, response)?;
-            inner.content = "***not-base64***".to_string();
-            reencrypt_outer_response(response, serde_json::to_string(&inner)?)
-        }
-        InviteResponseCorruption::PayloadJson => {
-            let mut inner = decrypt_outer_response(invite, response)?;
-            inner.content = build_invite_payload_ciphertext(invite, invitee, "{")?;
-            reencrypt_outer_response(response, serde_json::to_string(&inner)?)
-        }
-        InviteResponseCorruption::InvalidSessionKey => {
-            let mut inner = decrypt_outer_response(invite, response)?;
-            inner.content = build_invite_payload_ciphertext(
-                invite,
-                invitee,
-                r#"{"sessionKey":"deadbeef","deviceId":"broken-device"}"#,
-            )?;
-            reencrypt_outer_response(response, serde_json::to_string(&inner)?)
-        }
-    }
-}
-
-pub fn snapshot<T>(value: &T) -> String
-where
-    T: Serialize,
-{
-    serde_json::to_string(value).unwrap()
 }
 
 pub fn mutate_text(value: &str) -> String {
@@ -625,13 +492,41 @@ pub fn header_tag(header: &str) -> Tag {
     Tag::parse(["header".to_string(), header.to_string()]).unwrap()
 }
 
-pub fn assert_rumor_eq(actual: &Rumor, expected: &Rumor) {
-    assert_eq!(actual.id, expected.id);
-    assert_eq!(actual.pubkey, expected.pubkey);
-    assert_eq!(actual.created_at, expected.created_at);
-    assert_eq!(actual.kind, expected.kind);
-    assert_eq!(actual.tags, expected.tags);
-    assert_eq!(actual.content, expected.content);
+pub fn corrupt_invite_response_layer(
+    invite: &Invite,
+    response: &InviteResponseEnvelope,
+    invitee: &Actor,
+    corruption: InviteResponseCorruption,
+) -> Result<InviteResponseEnvelope> {
+    match corruption {
+        InviteResponseCorruption::OuterEnvelope => {
+            let mut tampered = response.clone();
+            tampered.content = mutate_text(&tampered.content);
+            Ok(tampered)
+        }
+        InviteResponseCorruption::InnerJson => {
+            reencrypt_outer_response(response, "\"not-json\"".to_string())
+        }
+        InviteResponseCorruption::InnerBase64 => {
+            let mut inner = decrypt_outer_response(invite, response)?;
+            inner.content = "***not-base64***".to_string();
+            reencrypt_outer_response(response, serde_json::to_string(&inner)?)
+        }
+        InviteResponseCorruption::PayloadJson => {
+            let mut inner = decrypt_outer_response(invite, response)?;
+            inner.content = build_invite_payload_ciphertext(invite, invitee, "{")?;
+            reencrypt_outer_response(response, serde_json::to_string(&inner)?)
+        }
+        InviteResponseCorruption::InvalidSessionKey => {
+            let mut inner = decrypt_outer_response(invite, response)?;
+            inner.content = build_invite_payload_ciphertext(
+                invite,
+                invitee,
+                r#"{"sessionKey":"deadbeef","deviceId":"broken-device"}"#,
+            )?;
+            reencrypt_outer_response(response, serde_json::to_string(&inner)?)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -643,7 +538,7 @@ struct TestInviteResponseInnerEvent {
 
 fn decrypt_outer_response(
     invite: &Invite,
-    response: &OutgoingInviteResponseEnvelope,
+    response: &InviteResponseEnvelope,
 ) -> Result<TestInviteResponseInnerEvent> {
     let inviter_ephemeral_private_key = invite
         .inviter_ephemeral_private_key
@@ -657,17 +552,19 @@ fn decrypt_outer_response(
 }
 
 fn reencrypt_outer_response(
-    response: &OutgoingInviteResponseEnvelope,
+    response: &InviteResponseEnvelope,
     plaintext: String,
-) -> Result<IncomingInviteResponseEnvelope> {
+) -> Result<InviteResponseEnvelope> {
     let content = nip44::encrypt(
         &SecretKey::from_slice(&response.signer_secret_key).unwrap(),
         &nostr_pubkey(response.recipient),
         plaintext,
         Version::V2,
     )?;
-    Ok(IncomingInviteResponseEnvelope {
+    Ok(InviteResponseEnvelope {
         sender: response.sender,
+        signer_secret_key: response.signer_secret_key,
+        recipient: response.recipient,
         created_at: response.created_at,
         content,
     })
@@ -691,4 +588,90 @@ fn build_invite_payload_ciphertext(
 
 fn nostr_pubkey(pubkey: DevicePubkey) -> PublicKey {
     PublicKey::from_slice(&pubkey.to_bytes()).unwrap()
+}
+
+fn codec_error(error: nostr::event::unsigned::Error) -> nostr_double_ratchet::Error {
+    nostr_double_ratchet::Error::Parse(error.to_string())
+}
+
+pub trait SessionManagerCompatExt {
+    fn apply_local_app_keys(
+        &mut self,
+        roster: DeviceRoster,
+        observed_at: UnixSeconds,
+    ) -> RosterSnapshotDecision;
+
+    fn observe_peer_app_keys(
+        &mut self,
+        owner_pubkey: OwnerPubkey,
+        roster: DeviceRoster,
+        observed_at: UnixSeconds,
+    ) -> RosterSnapshotDecision;
+
+    fn prepare_send_text<R>(
+        &mut self,
+        ctx: &mut ProtocolContext<'_, R>,
+        recipient_owner: OwnerPubkey,
+        text: String,
+    ) -> Result<PreparedSend>
+    where
+        R: RngCore + CryptoRng;
+
+    fn receive_direct_message<R>(
+        &mut self,
+        ctx: &mut ProtocolContext<'_, R>,
+        sender_owner: OwnerPubkey,
+        envelope: &MessageEnvelope,
+    ) -> Result<Option<ReceivedMessage>>
+    where
+        R: RngCore + CryptoRng;
+
+    fn prune_stale_records(&mut self, now: UnixSeconds) -> nostr_double_ratchet::PruneReport;
+}
+
+impl SessionManagerCompatExt for SessionManager {
+    fn apply_local_app_keys(
+        &mut self,
+        roster: DeviceRoster,
+        _observed_at: UnixSeconds,
+    ) -> RosterSnapshotDecision {
+        self.apply_local_roster(roster)
+    }
+
+    fn observe_peer_app_keys(
+        &mut self,
+        owner_pubkey: OwnerPubkey,
+        roster: DeviceRoster,
+        _observed_at: UnixSeconds,
+    ) -> RosterSnapshotDecision {
+        self.observe_peer_roster(owner_pubkey, roster)
+    }
+
+    fn prepare_send_text<R>(
+        &mut self,
+        ctx: &mut ProtocolContext<'_, R>,
+        recipient_owner: OwnerPubkey,
+        text: String,
+    ) -> Result<PreparedSend>
+    where
+        R: RngCore + CryptoRng,
+    {
+        self.prepare_send(ctx, recipient_owner, text.into_bytes())
+    }
+
+    fn receive_direct_message<R>(
+        &mut self,
+        ctx: &mut ProtocolContext<'_, R>,
+        sender_owner: OwnerPubkey,
+        envelope: &MessageEnvelope,
+    ) -> Result<Option<ReceivedMessage>>
+    where
+        R: RngCore + CryptoRng,
+    {
+        self.receive(ctx, sender_owner, envelope)
+    }
+
+    fn prune_stale_records(&mut self, now: UnixSeconds) -> nostr_double_ratchet::PruneReport {
+        self.prune_stale(now)
+    }
 }

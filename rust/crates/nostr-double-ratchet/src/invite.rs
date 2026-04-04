@@ -1,6 +1,6 @@
 use crate::{
-    random_secret_key_bytes, secret_key_from_bytes, DeviceId, DevicePubkey, DomainError,
-    OwnerPubkey, ProtocolContext, Result, Session, UnixSeconds,
+    random_secret_key_bytes, secret_key_from_bytes, DeviceId, DevicePubkey, DeviceRoster,
+    DomainError, OwnerPubkey, ProtocolContext, Result, Session, UnixSeconds,
 };
 use base64::Engine;
 use nostr::nips::nip44::{self, Version};
@@ -23,7 +23,6 @@ pub struct Invite {
     pub max_uses: Option<usize>,
     pub used_by: Vec<DevicePubkey>,
     pub created_at: UnixSeconds,
-    pub purpose: Option<String>,
     pub owner_public_key: Option<OwnerPubkey>,
 }
 
@@ -36,17 +35,10 @@ pub struct InviteResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutgoingInviteResponseEnvelope {
+pub struct InviteResponseEnvelope {
     pub sender: DevicePubkey,
     pub signer_secret_key: [u8; 32],
     pub recipient: DevicePubkey,
-    pub created_at: UnixSeconds,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IncomingInviteResponseEnvelope {
-    pub sender: DevicePubkey,
     pub created_at: UnixSeconds,
     pub content: String,
 }
@@ -57,13 +49,14 @@ impl InviteResponse {
             .unwrap_or_else(|| self.invitee_identity.as_owner())
     }
 
-    pub fn has_verified_owner_claim(&self, app_keys: Option<&crate::AppKeys>) -> bool {
+    pub fn has_verified_owner_claim(&self, roster: Option<&DeviceRoster>) -> bool {
         let owner = self.resolved_owner_pubkey();
         if owner == self.invitee_identity.as_owner() {
             return true;
         }
-        app_keys
-            .and_then(|keys| keys.get_device(&self.invitee_identity))
+
+        roster
+            .and_then(|roster| roster.get_device(&self.invitee_identity))
             .is_some()
     }
 }
@@ -91,8 +84,7 @@ impl Invite {
             device_id,
             max_uses,
             used_by: Vec::new(),
-            created_at: ctx.now_secs,
-            purpose: None,
+            created_at: ctx.now,
             owner_public_key: None,
         })
     }
@@ -103,7 +95,7 @@ impl Invite {
         invitee_public_key: DevicePubkey,
         invitee_private_key: [u8; 32],
         device_id: Option<DeviceId>,
-    ) -> Result<(Session, OutgoingInviteResponseEnvelope)>
+    ) -> Result<(Session, InviteResponseEnvelope)>
     where
         R: RngCore + CryptoRng,
     {
@@ -123,7 +115,7 @@ impl Invite {
         invitee_private_key: [u8; 32],
         device_id: Option<DeviceId>,
         owner_public_key: Option<OwnerPubkey>,
-    ) -> Result<(Session, OutgoingInviteResponseEnvelope)>
+    ) -> Result<(Session, InviteResponseEnvelope)>
     where
         R: RngCore + CryptoRng,
     {
@@ -133,13 +125,11 @@ impl Invite {
         let invitee_session_public_key =
             crate::device_pubkey_from_secret_bytes(&invitee_session_key)?;
 
-        let session = Session::init(
+        let session = Session::new_initiator(
             ctx,
             self.inviter_ephemeral_public_key,
             invitee_session_key,
-            true,
             self.shared_secret,
-            None,
         )?;
 
         let payload = InviteResponsePayload {
@@ -161,7 +151,7 @@ impl Invite {
         let inner_event = InviteResponseInnerEvent {
             pubkey: invitee_public_key,
             content: base64::engine::general_purpose::STANDARD.encode(encrypted_bytes),
-            created_at: ctx.now_secs,
+            created_at: ctx.now,
         };
 
         let random_sender_secret = random_secret_key_bytes(ctx.rng)?;
@@ -173,16 +163,16 @@ impl Invite {
             Version::V2,
         )?;
 
-        let jitter = if ctx.now_secs.get() == 0 {
+        let jitter = if ctx.now.get() == 0 {
             0
         } else {
             ctx.rng.next_u64() % (2 * 24 * 60 * 60)
         };
-        let created_at = UnixSeconds(ctx.now_secs.get().saturating_sub(jitter));
+        let created_at = UnixSeconds(ctx.now.get().saturating_sub(jitter));
 
         Ok((
             session,
-            OutgoingInviteResponseEnvelope {
+            InviteResponseEnvelope {
                 sender: random_sender_pubkey,
                 signer_secret_key: random_sender_secret,
                 recipient: self.inviter_ephemeral_public_key,
@@ -192,19 +182,18 @@ impl Invite {
         ))
     }
 
-    pub fn process_invite_response<R>(
+    pub fn process_response<R>(
         &mut self,
         ctx: &mut ProtocolContext<'_, R>,
-        envelope: &IncomingInviteResponseEnvelope,
+        envelope: &InviteResponseEnvelope,
         inviter_private_key: [u8; 32],
-    ) -> Result<Option<InviteResponse>>
+    ) -> Result<InviteResponse>
     where
         R: RngCore + CryptoRng,
     {
-        let inviter_ephemeral_private_key =
-            self.inviter_ephemeral_private_key.ok_or_else(|| {
-                crate::error::CodecError::Invite("ephemeral key not available".to_string())
-            })?;
+        let inviter_ephemeral_private_key = self
+            .inviter_ephemeral_private_key
+            .ok_or_else(|| crate::Error::Parse("ephemeral key not available".to_string()))?;
 
         let inviter_ephemeral_sk = secret_key_from_bytes(&inviter_ephemeral_private_key)?;
         let decrypted = nip44::decrypt(
@@ -233,22 +222,20 @@ impl Invite {
 
         let payload: InviteResponsePayload = serde_json::from_str(&dh_decrypted)?;
         self.ensure_accept_allowed(inner_event.pubkey)?;
-        let session = Session::init(
+        let session = Session::new_responder(
             ctx,
             payload.session_key,
             inviter_ephemeral_private_key,
-            false,
             self.shared_secret,
-            None,
         )?;
         self.record_use(inner_event.pubkey);
 
-        Ok(Some(InviteResponse {
+        Ok(InviteResponse {
             session,
             invitee_identity: inner_event.pubkey,
             device_id: payload.device_id,
             owner_public_key: payload.owner_public_key,
-        }))
+        })
     }
 
     fn ensure_accept_allowed(&self, invitee_public_key: DevicePubkey) -> Result<()> {

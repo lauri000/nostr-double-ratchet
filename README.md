@@ -1,74 +1,55 @@
 # nostr-double-ratchet
 
-End-to-end encrypted messaging primitives for Nostr, implemented in TypeScript and Rust.
+Hard-forked Double Ratchet primitives for new applications.
 
-## Current Rust Direction
+The Rust side is now split into:
 
-The Rust side is now a single-threaded protocol core with an explicit Nostr codec boundary.
+- `nostr-double-ratchet`: minimal synchronous domain core
+- `nostr-double-ratchet-nostr`: Nostr event and invite adapter
 
-It is centered on:
+## Rust Shape
 
-- explicit ownership
-- synchronous function call/return flow
-- inspectable state snapshots
-- no runtime/pubsub/event-driven core
-- no hidden clock or randomness in state transitions
+The core crate keeps only:
 
-The main Rust entry point is `NdrState`, which owns peer session books, AppKeys timelines, and
-group metadata state. Raw `nostr::Event` and invite URL handling live under
-`codec::nostr`.
+- `Session`: low-level device-to-device ratchet
+- `Invite`: low-level bootstrap primitive
+- `SessionManager`: the only high-level multi-device API
+- typed ids, rosters, snapshots, explicit errors, and `ProtocolContext`
 
-## Rust Architecture
+The core does not expose:
 
-The Rust core has two layers:
+- `NdrState`
+- `PeerBook`
+- `AppKeys`
+- `Rumor`
+- `DirectMessageContent`
+- group state
+- Nostr event or invite URL codecs
 
-1. Domain modules:
-   - `ids`
-   - `Session`
-   - `peer_book`
-   - `Invite`
-   - `AppKeys`
-   - group metadata helpers
-
-2. High-level owned state:
-   - `NdrState`
-
-3. Thin adapters:
-   - `codec::nostr`
-
-`NdrState` keeps the full Rust-side model in memory and exposes direct methods like:
-
-- `upsert_peer_session(...)`
-- `send_text(...)`
-- `receive_direct_message(...)`
-- `apply_local_app_keys(...)`
-- `apply_peer_app_keys(...)`
-- `create_group(...)`
-- `apply_group_metadata(...)`
-- `snapshot()`
+`SessionManager` is the supported application API. `Session` and `Invite` stay public for direct
+device-to-device integrations.
 
 ## Repository Layout
 
+- `rust/crates/nostr-double-ratchet/`: domain core
+- `rust/crates/nostr-double-ratchet-nostr/`: Nostr adapter
 - `ts/`: TypeScript implementation
-- `rust/crates/nostr-double-ratchet/`: Rust core library
-- `formal/`: TLA+ models for protocol rules and invariants
+- `formal/`: protocol models
 
 ## Development
 
 ```bash
-# Rust
 cargo test --manifest-path rust/Cargo.toml
-
-# TypeScript
+cargo clippy --manifest-path rust/Cargo.toml --workspace --tests -- -D warnings
 pnpm -C ts test:once
 ```
 
-## Security Notes
+## Notes
 
-- 1:1 payloads use Double Ratchet over NIP-44.
-- Outer Nostr events are signed and verified.
-- AppKeys snapshots are treated as an authorization timeline, not a plain set.
-- Inner rumor `pubkey` is not trusted for sender attribution.
-- Inner rumors are unsigned, preserving plausible deniability.
+- Core payloads are opaque `Vec<u8>`.
+- Device authorization in the core is modeled as `DeviceRoster`.
+- Nostr event kinds, URL formats, and roster-event translation live only in the adapter crate.
+- State transitions are synchronous and explicit. No runtime, pubsub, storage layer, or background
+  workers are built into the core.
 
-For Rust-specific usage, see [rust/crates/nostr-double-ratchet/README.md](./rust/crates/nostr-double-ratchet/README.md).
+See [rust/README.md](./rust/README.md) for the Rust workspace overview.

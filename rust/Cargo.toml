@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/nostr-double-ratchet",
+    "crates/nostr-double-ratchet-nostr",
 ]
 
 [workspace.package]
@@ -13,6 +14,7 @@ repository = "https://github.com/Innode/nostr-double-ratchet"
 
 [workspace.dependencies]
 nostr-double-ratchet = { version = "0.0.88", path = "crates/nostr-double-ratchet" }
+nostr-double-ratchet-nostr = { version = "0.0.88", path = "crates/nostr-double-ratchet-nostr" }
 nostr = { version = "0.37", default-features = false, features = ["std", "nip44"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

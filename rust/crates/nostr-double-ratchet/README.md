@@ -1,124 +1,85 @@
 # nostr-double-ratchet
 
-Rust domain library for Double Ratchet messaging on Nostr.
+Minimal synchronous Double Ratchet core.
 
-The Rust side is intentionally synchronous and ownership-driven:
+This crate is the domain layer only. It does not expose Nostr events, invite URLs, relay code,
+storage, or background orchestration.
 
-- no CLI crate
-- no FFI crate
-- no pubsub/runtime layer
-- no storage adapters or background orchestration in the core
+## Public API
 
-State lives in one place, under your control, and every transition happens through normal
-function calls and return values.
+High-level API:
 
-## Architecture
+- `SessionManager`
 
-There are two layers:
+Lower-level primitives:
 
-1. Domain core:
-   - `ids`
-   - `Session`
-   - `PeerBook`
-   - `Invite`
-   - `AppKeys`
-   - group metadata helpers
+- `Session`
+- `Invite`
 
-2. Explicit orchestration and adapters:
-   - `NdrState`
-   - `codec::nostr`
+Core data types:
 
-`NdrState` owns:
+- `MessageEnvelope`
+- `InviteResponseEnvelope`
+- `DeviceRoster`
+- `AuthorizedDevice`
+- `ProtocolContext`
+- `SessionManagerSnapshot`
+- `SessionState`
+- `DeviceId`
+- `DevicePubkey`
+- `OwnerPubkey`
+- `UnixSeconds`
 
-- local owner/device identity metadata
-- local AppKeys timeline
-- peer session books
-- peer AppKeys timelines
-- group state
+## Design
 
-It exposes synchronous methods such as:
+- Payloads are opaque `Vec<u8>`.
+- State transitions are explicit call/return operations.
+- `ProtocolContext` carries time and randomness per call.
+- Device authorization is represented by `DeviceRoster`.
+- `SessionManager` owns multi-device Sesame-style state for decentralized relay input, but stays
+  pure domain logic.
 
-- `upsert_peer_session(...)`
-- `send_text(...)`
-- `receive_direct_message(...)`
-- `apply_local_app_keys(...)`
-- `apply_peer_app_keys(...)`
-- `create_group(...)`
-- `apply_group_metadata(...)`
-- `snapshot()`
+No compatibility layer is kept for the removed APIs.
 
-No hidden subscriptions, callbacks, queues, or async tasks are involved.
+## Basic `SessionManager` Flow
 
-## Basic Usage
+1. Construct a manager for the local device.
+2. Publish the local public invite with `ensure_local_invite(...)`.
+3. Apply the local roster and observe peer rosters.
+4. Observe peer device invites.
+5. Call `prepare_send(...)` to produce:
+   - `deliveries`
+   - `invite_responses`
+   - `relay_gaps`
+6. Feed invite responses and incoming messages back with:
+   - `observe_invite_response(...)`
+   - `receive(...)`
+7. Persist and restore with `snapshot()` / `SessionManager::from_snapshot(...)`.
 
-```rust
-use rand::{rngs::StdRng, SeedableRng};
-use nostr_double_ratchet::{
-    codec::nostr,
-    DeviceId, DevicePubkey, IncomingDirectMessageEnvelope, IncomingInviteResponseEnvelope,
-    NdrState, ProtocolContext, UnixMillis, UnixSeconds,
-};
+## Lower-Level Device-to-Device Usage
 
-let alice_secret = [1u8; 32];
-let bob_secret = [2u8; 32];
+If you do not want the multi-device manager, use:
 
-let mut rng = StdRng::seed_from_u64(7);
-let mut ctx = ProtocolContext::new(
-    UnixSeconds(1_700_000_000),
-    UnixMillis(1_700_000_000_000),
-    &mut rng,
-);
+- `Invite` to bootstrap a pairwise session
+- `Session::new_initiator(...)`
+- `Session::new_responder(...)`
+- `Session::plan_send(...)` / `apply_send(...)`
+- `Session::plan_receive(...)` / `apply_receive(...)`
 
-let mut alice = NdrState::single_device(
-    DevicePubkey::from_bytes(nostr::Keys::new(
-        nostr::SecretKey::from_slice(&alice_secret)?
-    ).public_key().to_bytes()),
-    Some(DeviceId::new("alice-device")),
-);
-let mut bob = NdrState::single_device(
-    DevicePubkey::from_bytes(nostr::Keys::new(
-        nostr::SecretKey::from_slice(&bob_secret)?
-    ).public_key().to_bytes()),
-    Some(DeviceId::new("bob-device")),
-);
+Those APIs operate only on opaque byte payloads and `MessageEnvelope`.
 
-let invite = alice.create_invite(&mut ctx, None)?;
-let acceptance = bob.accept_invite(&mut ctx, &invite, bob_secret)?;
-let response_event = nostr::invite_response_event(&acceptance.response)?;
-let response = nostr::parse_invite_response_event(&response_event)?;
-alice.process_invite_response(&mut ctx, &invite, &response, alice_secret)?;
+## Nostr Integration
 
-let outbound = bob.send_text(&mut ctx, alice.owner_pubkey(), "hello".to_string())?;
-let dm_event = nostr::direct_message_event(&outbound.envelope)?;
-let incoming = nostr::parse_direct_message_event(&dm_event)?;
-let received = alice
-    .receive_direct_message(&mut ctx, bob.owner_pubkey(), None, &incoming)?
-    .expect("message");
+Use the sibling adapter crate for Nostr conversions:
 
-assert_eq!(received.rumor.content, "hello");
-# Ok::<(), nostr_double_ratchet::Error>(())
-```
+- [nostr-double-ratchet-nostr](../nostr-double-ratchet-nostr)
 
-## Snapshot-Driven Inspection
+That crate translates:
 
-Use `snapshot()` when you want a stable, serializable view of the full Rust-side state:
-
-- local owner/device keys
-- authorized devices from AppKeys
-- peer session books
-- peer AppKeys views
-- groups
-
-This is the preferred way to inspect state instead of inferring it from emitted events.
-
-## Security Properties
-
-- 1:1 payloads are encrypted with Double Ratchet and NIP-44.
-- Outer Nostr events are signature-verified.
-- AppKeys snapshots are ordered by `created_at`, stale snapshots are ignored, and same-second
-  snapshots are merged monotonically.
-- Inner rumor `pubkey` is not treated as a trusted sender identity source.
-- Inner rumors remain unsigned, preserving plausible deniability.
+- Nostr DM events <-> `MessageEnvelope`
+- invite URLs/events <-> `Invite`
+- invite response events <-> `InviteResponseEnvelope`
+- roster events <-> `DeviceRoster`
 
 ## Testing
 

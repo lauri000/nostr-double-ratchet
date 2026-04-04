@@ -1,13 +1,11 @@
 use crate::{
     device_pubkey_from_secret_bytes, kdf, random_secret_key_bytes, secret_key_from_bytes,
-    CodecError, DevicePubkey, DomainError, ProtocolContext, Result, UnixSeconds, CHAT_MESSAGE_KIND,
-    MAX_SKIP, REACTION_KIND, RECEIPT_KIND, TYPING_KIND,
+    DevicePubkey, DomainError, ProtocolContext, Result, UnixSeconds, MAX_SKIP,
 };
 use base64::Engine;
 use nostr::nips::nip44::{self, Version};
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,47 +48,10 @@ pub struct SessionState {
     pub skipped_keys: BTreeMap<DevicePubkey, SkippedKeysEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Rumor {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    pub pubkey: DevicePubkey,
-    pub created_at: UnixSeconds,
-    pub kind: u32,
-    pub tags: Vec<Vec<String>>,
-    pub content: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DirectMessageContent {
-    Text(String),
-    Reaction {
-        message_id: String,
-        emoji: String,
-    },
-    Reply {
-        reply_to: String,
-        text: String,
-    },
-    Receipt {
-        receipt_type: String,
-        message_ids: Vec<String>,
-    },
-    Typing,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutgoingDirectMessageEnvelope {
+pub struct MessageEnvelope {
     pub sender: DevicePubkey,
     pub signer_secret_key: [u8; 32],
-    pub created_at: UnixSeconds,
-    pub encrypted_header: String,
-    pub ciphertext: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IncomingDirectMessageEnvelope {
-    pub sender: DevicePubkey,
     pub created_at: UnixSeconds,
     pub encrypted_header: String,
     pub ciphertext: String,
@@ -99,33 +60,32 @@ pub struct IncomingDirectMessageEnvelope {
 #[derive(Debug, Clone)]
 pub struct SendPlan {
     pub next_state: SessionState,
-    pub envelope: OutgoingDirectMessageEnvelope,
-    pub rumor: Rumor,
+    pub envelope: MessageEnvelope,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SendOutcome {
-    pub envelope: OutgoingDirectMessageEnvelope,
-    pub rumor: Rumor,
+    pub envelope: MessageEnvelope,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ReceivePlan {
     pub next_state: SessionState,
-    pub rumor: Rumor,
+    pub payload: Vec<u8>,
     pub sender: DevicePubkey,
 }
 
 #[derive(Debug, Clone)]
 pub struct ReceiveOutcome {
-    pub rumor: Rumor,
+    pub payload: Vec<u8>,
     pub sender: DevicePubkey,
 }
 
 #[derive(Debug, Clone)]
 pub struct Session {
     pub state: SessionState,
-    pub name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,153 +95,98 @@ enum HeaderDecryptionTarget {
     Previous,
 }
 
-impl Rumor {
-    pub fn new(
-        pubkey: DevicePubkey,
-        created_at: UnixSeconds,
-        kind: u32,
-        tags: Vec<Vec<String>>,
-        content: String,
-    ) -> Result<Self> {
-        let mut rumor = Self {
-            id: None,
-            pubkey,
-            created_at,
-            kind,
-            tags,
-            content,
-        };
-        rumor.id = Some(rumor.compute_id()?);
-        Ok(rumor)
+impl Session {
+    pub fn new(state: SessionState) -> Self {
+        Self { state }
     }
 
-    pub fn from_content<R>(
+    pub fn new_initiator<R>(
         ctx: &mut ProtocolContext<'_, R>,
-        content: DirectMessageContent,
+        their_ephemeral_public_key: DevicePubkey,
+        our_ephemeral_private_key: [u8; 32],
+        shared_secret: [u8; 32],
     ) -> Result<Self>
     where
         R: RngCore + CryptoRng,
     {
-        let random_secret = random_secret_key_bytes(ctx.rng)?;
-        let pubkey = device_pubkey_from_secret_bytes(&random_secret)?;
-        let ms_tag = vec!["ms".to_string(), ctx.now_millis.get().to_string()];
-        match content {
-            DirectMessageContent::Text(text) => {
-                Self::new(pubkey, ctx.now_secs, 1, vec![ms_tag], text)
-            }
-            DirectMessageContent::Reaction { message_id, emoji } => Self::new(
-                pubkey,
-                ctx.now_secs,
-                REACTION_KIND,
-                vec![vec!["e".to_string(), message_id], ms_tag],
-                emoji,
-            ),
-            DirectMessageContent::Reply { reply_to, text } => Self::new(
-                pubkey,
-                ctx.now_secs,
-                CHAT_MESSAGE_KIND,
-                vec![vec!["e".to_string(), reply_to], ms_tag],
-                text,
-            ),
-            DirectMessageContent::Receipt {
-                receipt_type,
-                message_ids,
-            } => {
-                let mut tags: Vec<Vec<String>> = message_ids
-                    .into_iter()
-                    .map(|id| vec!["e".to_string(), id])
-                    .collect();
-                tags.push(ms_tag);
-                Self::new(pubkey, ctx.now_secs, RECEIPT_KIND, tags, receipt_type)
-            }
-            DirectMessageContent::Typing => Self::new(
-                pubkey,
-                ctx.now_secs,
-                TYPING_KIND,
-                vec![ms_tag],
-                "typing".to_string(),
-            ),
-        }
+        Self::init(
+            ctx,
+            their_ephemeral_public_key,
+            our_ephemeral_private_key,
+            true,
+            shared_secret,
+        )
     }
 
-    pub fn from_json(json: &str) -> Result<Self> {
-        let mut rumor: Self = serde_json::from_str(json)?;
-        rumor.id = Some(rumor.compute_id()?);
-        Ok(rumor)
-    }
-
-    pub fn to_json(&self) -> Result<String> {
-        Ok(serde_json::to_string(self)?)
-    }
-
-    fn compute_id(&self) -> Result<String> {
-        let canonical = serde_json::json!([
-            0,
-            self.pubkey.to_string(),
-            self.created_at.get(),
-            self.kind,
-            self.tags,
-            self.content
-        ]);
-        let canonical_json = serde_json::to_string(&canonical)?;
-        Ok(hex::encode(Sha256::digest(canonical_json.as_bytes())))
-    }
-}
-
-impl Session {
-    pub fn new(state: SessionState, name: String) -> Self {
-        Self { state, name }
-    }
-
-    pub fn init<R>(
+    pub fn new_responder<R>(
         ctx: &mut ProtocolContext<'_, R>,
-        their_ephemeral_nostr_public_key: DevicePubkey,
-        our_ephemeral_nostr_private_key: [u8; 32],
+        their_ephemeral_public_key: DevicePubkey,
+        our_ephemeral_private_key: [u8; 32],
+        shared_secret: [u8; 32],
+    ) -> Result<Self>
+    where
+        R: RngCore + CryptoRng,
+    {
+        Self::init(
+            ctx,
+            their_ephemeral_public_key,
+            our_ephemeral_private_key,
+            false,
+            shared_secret,
+        )
+    }
+
+    fn init<R>(
+        ctx: &mut ProtocolContext<'_, R>,
+        their_ephemeral_public_key: DevicePubkey,
+        our_ephemeral_private_key: [u8; 32],
         is_initiator: bool,
         shared_secret: [u8; 32],
-        name: Option<String>,
     ) -> Result<Self>
     where
         R: RngCore + CryptoRng,
     {
-        let our_keys = nostr::Keys::new(secret_key_from_bytes(&our_ephemeral_nostr_private_key)?);
+        let our_keys = nostr::Keys::new(secret_key_from_bytes(&our_ephemeral_private_key)?);
         let our_next_private_key = random_secret_key_bytes(ctx.rng)?;
         let our_next_keys = nostr::Keys::new(secret_key_from_bytes(&our_next_private_key)?);
 
-        let (root_key, sending_chain_key, our_current_nostr_key, our_next_nostr_key);
-
-        if is_initiator {
-            let our_current_pubkey = DevicePubkey::from_nostr(our_keys.public_key());
-            let conversation_key = nip44::v2::ConversationKey::derive(
-                our_next_keys.secret_key(),
-                &their_ephemeral_nostr_public_key.to_nostr()?,
-            );
-            let kdf_outputs = kdf(&shared_secret, conversation_key.as_bytes(), 2);
-            root_key = kdf_outputs[0];
-            sending_chain_key = Some(kdf_outputs[1]);
-            our_current_nostr_key = Some(SerializableKeyPair {
-                public_key: our_current_pubkey,
-                private_key: our_ephemeral_nostr_private_key,
-            });
-            our_next_nostr_key = SerializableKeyPair {
-                public_key: DevicePubkey::from_nostr(our_next_keys.public_key()),
-                private_key: our_next_private_key,
+        let (root_key, sending_chain_key, our_current_nostr_key, our_next_nostr_key) =
+            if is_initiator {
+                let our_current_pubkey = DevicePubkey::from_nostr(our_keys.public_key());
+                let conversation_key = nip44::v2::ConversationKey::derive(
+                    our_next_keys.secret_key(),
+                    &their_ephemeral_public_key.to_nostr()?,
+                );
+                let kdf_outputs = kdf(&shared_secret, conversation_key.as_bytes(), 2);
+                (
+                    kdf_outputs[0],
+                    Some(kdf_outputs[1]),
+                    Some(SerializableKeyPair {
+                        public_key: our_current_pubkey,
+                        private_key: our_ephemeral_private_key,
+                    }),
+                    SerializableKeyPair {
+                        public_key: DevicePubkey::from_nostr(our_next_keys.public_key()),
+                        private_key: our_next_private_key,
+                    },
+                )
+            } else {
+                (
+                    shared_secret,
+                    None,
+                    None,
+                    SerializableKeyPair {
+                        public_key: DevicePubkey::from_nostr(our_keys.public_key()),
+                        private_key: our_ephemeral_private_key,
+                    },
+                )
             };
-        } else {
-            root_key = shared_secret;
-            sending_chain_key = None;
-            our_current_nostr_key = None;
-            our_next_nostr_key = SerializableKeyPair {
-                public_key: DevicePubkey::from_nostr(our_keys.public_key()),
-                private_key: our_ephemeral_nostr_private_key,
-            };
-        }
 
         Ok(Self {
             state: SessionState {
                 root_key,
                 their_current_nostr_public_key: None,
-                their_next_nostr_public_key: Some(their_ephemeral_nostr_public_key),
+                their_next_nostr_public_key: Some(their_ephemeral_public_key),
                 our_previous_nostr_key: None,
                 our_current_nostr_key,
                 our_next_nostr_key,
@@ -292,7 +197,6 @@ impl Session {
                 previous_sending_chain_message_count: 0,
                 skipped_keys: BTreeMap::new(),
             },
-            name: name.unwrap_or_else(|| "session".to_string()),
         })
     }
 
@@ -307,14 +211,13 @@ impl Session {
             || self.state.skipped_keys.contains_key(&sender)
     }
 
-    pub fn plan_send(&self, rumor: &Rumor, now: UnixSeconds) -> Result<SendPlan> {
+    pub fn plan_send(&self, payload: &[u8], now: UnixSeconds) -> Result<SendPlan> {
         if !self.can_send() {
-            return Err(DomainError::NotInitiator.into());
+            return Err(DomainError::CannotSendYet.into());
         }
 
         let mut next_state = self.state.clone();
-        let rumor_json = rumor.to_json()?;
-        let (header, ciphertext) = ratchet_encrypt(&mut next_state, &rumor_json)?;
+        let (header, ciphertext) = ratchet_encrypt(&mut next_state, payload)?;
         let our_current = self
             .state
             .our_current_nostr_key
@@ -334,14 +237,14 @@ impl Session {
 
         Ok(SendPlan {
             next_state,
-            envelope: OutgoingDirectMessageEnvelope {
+            envelope: MessageEnvelope {
                 sender: our_current.public_key,
                 signer_secret_key: our_current.private_key,
                 created_at: now,
                 encrypted_header,
                 ciphertext,
             },
-            rumor: rumor.clone(),
+            payload: payload.to_vec(),
         })
     }
 
@@ -349,14 +252,14 @@ impl Session {
         self.state = plan.next_state;
         SendOutcome {
             envelope: plan.envelope,
-            rumor: plan.rumor,
+            payload: plan.payload,
         }
     }
 
     pub fn plan_receive<R>(
         &self,
         ctx: &mut ProtocolContext<'_, R>,
-        envelope: &IncomingDirectMessageEnvelope,
+        envelope: &MessageEnvelope,
     ) -> Result<ReceivePlan>
     where
         R: RngCore + CryptoRng,
@@ -391,17 +294,16 @@ impl Session {
             ratchet_step(&mut next_state, ctx.rng)?;
         }
 
-        let plaintext = ratchet_decrypt(
+        let payload = ratchet_decrypt(
             &mut next_state,
             &header,
             &envelope.ciphertext,
             envelope.sender,
         )?;
-        let rumor = Rumor::from_json(&plaintext)?;
 
         Ok(ReceivePlan {
             next_state,
-            rumor,
+            payload,
             sender: envelope.sender,
         })
     }
@@ -409,13 +311,13 @@ impl Session {
     pub fn apply_receive(&mut self, plan: ReceivePlan) -> ReceiveOutcome {
         self.state = plan.next_state;
         ReceiveOutcome {
-            rumor: plan.rumor,
+            payload: plan.payload,
             sender: plan.sender,
         }
     }
 }
 
-fn ratchet_encrypt(state: &mut SessionState, plaintext: &str) -> Result<(Header, String)> {
+fn ratchet_encrypt(state: &mut SessionState, plaintext: &[u8]) -> Result<(Header, String)> {
     let sending_chain_key = state
         .sending_chain_key
         .ok_or(DomainError::SessionNotReady)?;
@@ -443,7 +345,7 @@ fn ratchet_decrypt(
     header: &Header,
     ciphertext: &str,
     sender: DevicePubkey,
-) -> Result<String> {
+) -> Result<Vec<u8>> {
     if let Some(plaintext) = try_skipped_message_keys(state, header, ciphertext, sender)? {
         return Ok(plaintext);
     }
@@ -468,8 +370,7 @@ fn ratchet_decrypt(
         .decode(ciphertext)
         .map_err(|e| crate::Error::Decryption(e.to_string()))?;
 
-    let plaintext_bytes = nip44::v2::decrypt_to_bytes(&conversation_key, &ciphertext_bytes)?;
-    String::from_utf8(plaintext_bytes).map_err(|e| crate::Error::Decryption(e.to_string()))
+    nip44::v2::decrypt_to_bytes(&conversation_key, &ciphertext_bytes).map_err(Into::into)
 }
 
 fn ratchet_step<R>(state: &mut SessionState, rng: &mut R) -> Result<()>
@@ -539,17 +440,14 @@ fn try_skipped_message_keys(
     header: &Header,
     ciphertext: &str,
     sender: DevicePubkey,
-) -> Result<Option<String>> {
+) -> Result<Option<Vec<u8>>> {
     if let Some(entry) = state.skipped_keys.get_mut(&sender) {
         if let Some(message_key) = entry.message_keys.remove(&header.number) {
             let conversation_key = nip44::v2::ConversationKey::new(message_key);
             let ciphertext_bytes = base64::engine::general_purpose::STANDARD
                 .decode(ciphertext)
                 .map_err(|e| crate::Error::Decryption(e.to_string()))?;
-            let plaintext_bytes =
-                nip44::v2::decrypt_to_bytes(&conversation_key, &ciphertext_bytes)?;
-            let plaintext = String::from_utf8(plaintext_bytes)
-                .map_err(|e| crate::Error::Decryption(e.to_string()))?;
+            let plaintext = nip44::v2::decrypt_to_bytes(&conversation_key, &ciphertext_bytes)?;
             if entry.message_keys.is_empty() {
                 state.skipped_keys.remove(&sender);
             }
@@ -587,7 +485,7 @@ fn decrypt_header(
         }
     }
 
-    Err(CodecError::InvalidHeader.into())
+    Err(crate::Error::Parse("invalid header".to_string()))
 }
 
 fn prune_skipped_message_keys(map: &mut BTreeMap<u32, [u8; 32]>) {
@@ -685,17 +583,12 @@ fn decode_hex_32(value: &str) -> std::result::Result<[u8; 32], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::UnixMillis;
     use rand::{rngs::StdRng, SeedableRng};
 
     fn context(seed: u64) -> ProtocolContext<'static, StdRng> {
         let rng = Box::new(StdRng::seed_from_u64(seed));
         let rng = Box::leak(rng);
-        ProtocolContext::new(
-            UnixSeconds(1_700_000_000),
-            UnixMillis(1_700_000_000_123),
-            rng,
-        )
+        ProtocolContext::new(UnixSeconds(1_700_000_000), rng)
     }
 
     #[test]
@@ -707,46 +600,26 @@ mod tests {
         let shared_secret = [7u8; 32];
 
         let mut init_ctx_alice = context(1);
-        let alice = Session::init(
-            &mut init_ctx_alice,
-            bob_pub,
-            alice_secret,
-            true,
-            shared_secret,
-            None,
-        )
-        .unwrap();
+        let alice =
+            Session::new_initiator(&mut init_ctx_alice, bob_pub, alice_secret, shared_secret)
+                .unwrap();
         let mut init_ctx_bob = context(2);
-        let mut bob = Session::init(
-            &mut init_ctx_bob,
-            alice_pub,
-            bob_secret,
-            false,
-            shared_secret,
-            None,
-        )
-        .unwrap();
+        let mut bob =
+            Session::new_responder(&mut init_ctx_bob, alice_pub, bob_secret, shared_secret)
+                .unwrap();
 
-        let mut ctx = context(9);
-        let rumor =
-            Rumor::from_content(&mut ctx, DirectMessageContent::Text("hello".to_string())).unwrap();
-        let send_plan = alice.plan_send(&rumor, ctx.now_secs).unwrap();
+        let payload = b"hello".to_vec();
+        let send_plan = alice
+            .plan_send(&payload, UnixSeconds(1_700_000_010))
+            .unwrap();
         let send_outcome = alice.clone().apply_send(send_plan.clone());
 
         let mut recv_ctx = context(10);
         let receive_plan = bob
-            .plan_receive(
-                &mut recv_ctx,
-                &IncomingDirectMessageEnvelope {
-                    sender: send_outcome.envelope.sender,
-                    created_at: send_outcome.envelope.created_at,
-                    encrypted_header: send_outcome.envelope.encrypted_header.clone(),
-                    ciphertext: send_outcome.envelope.ciphertext.clone(),
-                },
-            )
+            .plan_receive(&mut recv_ctx, &send_outcome.envelope)
             .unwrap();
         let outcome = bob.apply_receive(receive_plan);
-        assert_eq!(outcome.rumor.content, "hello");
+        assert_eq!(outcome.payload, payload);
     }
 
     #[test]
@@ -758,42 +631,22 @@ mod tests {
         let shared_secret = [8u8; 32];
 
         let mut init_ctx_alice = context(3);
-        let alice = Session::init(
-            &mut init_ctx_alice,
-            bob_pub,
-            alice_secret,
-            true,
-            shared_secret,
-            None,
-        )
-        .unwrap();
+        let alice =
+            Session::new_initiator(&mut init_ctx_alice, bob_pub, alice_secret, shared_secret)
+                .unwrap();
         let mut init_ctx_bob = context(4);
-        let bob = Session::init(
-            &mut init_ctx_bob,
-            alice_pub,
-            bob_secret,
-            false,
-            shared_secret,
-            None,
-        )
-        .unwrap();
+        let bob = Session::new_responder(&mut init_ctx_bob, alice_pub, bob_secret, shared_secret)
+            .unwrap();
         let bob_before = bob.state.clone();
 
-        let mut ctx = context(12);
-        let rumor = Rumor::from_content(&mut ctx, DirectMessageContent::Typing).unwrap();
-        let send_plan = alice.plan_send(&rumor, ctx.now_secs).unwrap();
+        let payload = b"typing".to_vec();
+        let send_plan = alice
+            .plan_send(&payload, UnixSeconds(1_700_000_011))
+            .unwrap();
 
         let mut recv_ctx = context(13);
         let _ = bob
-            .plan_receive(
-                &mut recv_ctx,
-                &IncomingDirectMessageEnvelope {
-                    sender: send_plan.envelope.sender,
-                    created_at: send_plan.envelope.created_at,
-                    encrypted_header: send_plan.envelope.encrypted_header.clone(),
-                    ciphertext: send_plan.envelope.ciphertext.clone(),
-                },
-            )
+            .plan_receive(&mut recv_ctx, &send_plan.envelope)
             .unwrap();
 
         assert_eq!(bob.state, bob_before);
@@ -808,48 +661,27 @@ mod tests {
         let shared_secret = [9u8; 32];
 
         let mut init_ctx_alice = context(5);
-        let alice = Session::init(
-            &mut init_ctx_alice,
-            bob_pub,
-            alice_secret,
-            true,
-            shared_secret,
-            None,
-        )
-        .unwrap();
+        let alice =
+            Session::new_initiator(&mut init_ctx_alice, bob_pub, alice_secret, shared_secret)
+                .unwrap();
         let mut init_ctx_bob = context(6);
-        let mut bob = Session::init(
-            &mut init_ctx_bob,
-            alice_pub,
-            bob_secret,
-            false,
-            shared_secret,
-            None,
-        )
-        .unwrap();
+        let mut bob =
+            Session::new_responder(&mut init_ctx_bob, alice_pub, bob_secret, shared_secret)
+                .unwrap();
 
-        let mut send_ctx = context(14);
-        let rumor = Rumor::from_content(
-            &mut send_ctx,
-            DirectMessageContent::Text("hello".to_string()),
-        )
-        .unwrap();
-        let send_plan = alice.plan_send(&rumor, send_ctx.now_secs).unwrap();
+        let payload = b"hello".to_vec();
+        let send_plan = alice
+            .plan_send(&payload, UnixSeconds(1_700_000_012))
+            .unwrap();
         let envelope = alice.clone().apply_send(send_plan).envelope;
-        let incoming = IncomingDirectMessageEnvelope {
-            sender: envelope.sender,
-            created_at: envelope.created_at,
-            encrypted_header: envelope.encrypted_header.clone(),
-            ciphertext: envelope.ciphertext.clone(),
-        };
 
         let mut recv_ctx = context(15);
-        let first_plan = bob.plan_receive(&mut recv_ctx, &incoming).unwrap();
+        let first_plan = bob.plan_receive(&mut recv_ctx, &envelope).unwrap();
         let _ = bob.apply_receive(first_plan);
         let after_first = bob.state.clone();
 
         let mut replay_ctx = context(16);
-        let replay = bob.plan_receive(&mut replay_ctx, &incoming);
+        let replay = bob.plan_receive(&mut replay_ctx, &envelope);
         assert!(replay.is_err());
         assert_eq!(bob.state, after_first);
     }
@@ -859,26 +691,19 @@ mod tests {
         let alice_secret = [7u8; 32];
         let bob_secret = [8u8; 32];
         let alice_pub = device_pubkey_from_secret_bytes(&alice_secret).unwrap();
-        let bob_pub = device_pubkey_from_secret_bytes(&bob_secret).unwrap();
         let shared_secret = [10u8; 32];
 
         let mut init_ctx_bob = context(7);
-        let bob = Session::init(
-            &mut init_ctx_bob,
-            alice_pub,
-            bob_secret,
-            false,
-            shared_secret,
-            None,
-        )
-        .unwrap();
+        let bob = Session::new_responder(&mut init_ctx_bob, alice_pub, bob_secret, shared_secret)
+            .unwrap();
 
         let mut recv_ctx = context(17);
         let err = bob
             .plan_receive(
                 &mut recv_ctx,
-                &IncomingDirectMessageEnvelope {
-                    sender: bob_pub,
+                &MessageEnvelope {
+                    sender: device_pubkey_from_secret_bytes(&bob_secret).unwrap(),
+                    signer_secret_key: bob_secret,
                     created_at: UnixSeconds(1),
                     encrypted_header: "bad".to_string(),
                     ciphertext: "bad".to_string(),
