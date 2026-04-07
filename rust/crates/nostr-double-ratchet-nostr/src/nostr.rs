@@ -2,7 +2,7 @@ use base64::Engine;
 use nostr::nips::nip44;
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp, UnsignedEvent};
 use nostr_double_ratchet::{
-    AuthorizedDevice, DeviceId, DevicePubkey, DeviceRoster, Error as CoreError, Invite,
+    AuthorizedDevice, DevicePubkey, DeviceRoster, Error as CoreError, Invite,
     InviteResponseEnvelope, MessageEnvelope, OwnerPubkey, UnixSeconds,
 };
 use serde::{Deserialize, Serialize};
@@ -111,12 +111,6 @@ pub fn invite_url(invite: &Invite, root: &str) -> Result<String> {
         "createdAt".to_string(),
         serde_json::Value::Number(serde_json::Number::from(invite.created_at.get())),
     );
-    if let Some(device_id) = &invite.device_id {
-        data.insert(
-            "deviceId".to_string(),
-            serde_json::Value::String(device_id.as_str().to_string()),
-        );
-    }
     if let Some(owner) = invite.owner_public_key {
         data.insert(
             "owner".to_string(),
@@ -159,7 +153,6 @@ pub fn parse_invite_url(url: &str) -> Result<Invite> {
         shared_secret,
         inviter,
         inviter_ephemeral_private_key: None,
-        device_id: data["deviceId"].as_str().map(DeviceId::new),
         max_uses: None,
         used_by: Vec::new(),
         created_at: UnixSeconds(data["createdAt"].as_u64().unwrap_or(0)),
@@ -168,11 +161,7 @@ pub fn parse_invite_url(url: &str) -> Result<Invite> {
 }
 
 pub fn invite_unsigned_event(invite: &Invite) -> Result<UnsignedEvent> {
-    let device_id = invite
-        .device_id
-        .as_ref()
-        .ok_or_else(|| Error::InvalidEvent("invite device id required".to_string()))?;
-
+    let inviter_device_pubkey = invite.inviter.as_device();
     let author = invite.owner_public_key.unwrap_or(invite.inviter);
     let mut builder = EventBuilder::new(Kind::from(INVITE_EVENT_KIND as u16), "")
         .tag(tag([
@@ -182,7 +171,7 @@ pub fn invite_unsigned_event(invite: &Invite) -> Result<UnsignedEvent> {
         .tag(tag(["sharedSecret", &hex::encode(invite.shared_secret)])?)
         .tag(tag([
             "d",
-            &format!("double-ratchet/invites/{}", device_id.as_str()),
+            &format!("double-ratchet/invites/{}", inviter_device_pubkey),
         ])?)
         .tag(tag(["l", INVITE_LIST_LABEL])?)
         .custom_created_at(Timestamp::from(invite.created_at.get()));
@@ -198,13 +187,16 @@ pub fn parse_invite_event(event: &Event) -> Result<Invite> {
     verify_event_kind(event, INVITE_EVENT_KIND)?;
     event.verify()?;
 
-    let device_id = required_tag_value(event, "d")?
-        .strip_prefix("double-ratchet/invites/")
-        .map(DeviceId::new);
-
+    let inviter = parse_invite_d_tag(&required_tag_value(event, "d")?)?.as_owner();
     let owner_public_key = optional_tag_value(event, "ownerPublicKey")
         .map(|value| parse_owner_pubkey(&value))
         .transpose()?;
+    let expected_author = owner_public_key.unwrap_or(inviter);
+    if event.pubkey.to_bytes() != expected_author.as_device().to_bytes() {
+        return Err(Error::InvalidEvent(
+            "invite event author does not match claimed owner".to_string(),
+        ));
+    }
 
     Ok(Invite {
         inviter_ephemeral_public_key: parse_device_pubkey(&required_tag_value(
@@ -212,10 +204,8 @@ pub fn parse_invite_event(event: &Event) -> Result<Invite> {
             "ephemeralKey",
         )?)?,
         shared_secret: parse_hex_32(&required_tag_value(event, "sharedSecret")?)?,
-        inviter: owner_public_key
-            .unwrap_or_else(|| OwnerPubkey::from_bytes(event.pubkey.to_bytes())),
+        inviter,
         inviter_ephemeral_private_key: None,
-        device_id,
         max_uses: None,
         used_by: Vec::new(),
         created_at: UnixSeconds(event.created_at.as_u64()),
@@ -350,6 +340,13 @@ fn parse_device_pubkey(value: &str) -> Result<DevicePubkey> {
     Ok(DevicePubkey::from_bytes(pubkey.to_bytes()))
 }
 
+fn parse_invite_d_tag(value: &str) -> Result<DevicePubkey> {
+    let pubkey = value
+        .strip_prefix("double-ratchet/invites/")
+        .ok_or_else(|| Error::InvalidEvent("invalid invite d tag".to_string()))?;
+    parse_device_pubkey(pubkey)
+}
+
 fn parse_hex_32(value: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(value).map_err(|e| Error::InvalidEvent(e.to_string()))?;
     <[u8; 32]>::try_from(bytes.as_slice())
@@ -452,7 +449,6 @@ mod tests {
             shared_secret: [7u8; 32],
             inviter: owner_pubkey,
             inviter_ephemeral_private_key: Some([8u8; 32]),
-            device_id: Some(DeviceId::new("device-a")),
             max_uses: None,
             used_by: Vec::new(),
             created_at: UnixSeconds(22),
@@ -462,14 +458,12 @@ mod tests {
         let url = invite_url(&invite, "https://chat.iris.to").unwrap();
         let parsed_from_url = parse_invite_url(&url).unwrap();
         assert_eq!(parsed_from_url.inviter, invite.inviter);
-        assert_eq!(parsed_from_url.device_id, invite.device_id);
 
         let unsigned = invite_unsigned_event(&invite).unwrap();
         let keys = Keys::new(secret_key_from_bytes(&owner_secret).unwrap());
         let signed = unsigned.sign_with_keys(&keys).unwrap();
         let parsed_from_event = parse_invite_event(&signed).unwrap();
         assert_eq!(parsed_from_event.inviter, invite.inviter);
-        assert_eq!(parsed_from_event.device_id, invite.device_id);
     }
 
     #[test]

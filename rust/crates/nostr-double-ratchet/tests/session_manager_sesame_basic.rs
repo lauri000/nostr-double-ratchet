@@ -1,7 +1,7 @@
 mod support;
 
 use nostr_double_ratchet::{
-    DeviceId, RelayGap, Result, RosterSnapshotDecision, SessionManagerSnapshot, UnixSeconds,
+    RelayGap, Result, RosterSnapshotDecision, SessionManagerSnapshot, UnixSeconds,
 };
 use support::{
     context, manager_device, manager_device_snapshot, manager_observe_invite_response,
@@ -19,7 +19,7 @@ fn assert_gap(prepared: &nostr_double_ratchet::PreparedSend, expected: RelayGap)
 
 #[test]
 fn local_device_invite_is_stable_and_owned() -> Result<()> {
-    let alice = manager_device(1, 11, "alice-1");
+    let alice = manager_device(1, 11);
     let mut manager = session_manager(&alice);
 
     let mut first_ctx = context(1, 1_800_000_000);
@@ -36,9 +36,9 @@ fn local_device_invite_is_stable_and_owned() -> Result<()> {
 
 #[test]
 fn latest_roster_controls_authorized_device_roster() -> Result<()> {
-    let alice1 = manager_device(2, 21, "alice-1");
-    let alice2 = manager_device(2, 22, "alice-2");
-    let alice3 = manager_device(2, 23, "alice-3");
+    let alice1 = manager_device(2, 21);
+    let alice2 = manager_device(2, 22);
+    let alice3 = manager_device(2, 23);
     let mut manager = session_manager(&alice1);
 
     assert_eq!(
@@ -75,8 +75,8 @@ fn latest_roster_controls_authorized_device_roster() -> Result<()> {
 
 #[test]
 fn invite_observed_before_roster_becomes_usable_after_authorization() -> Result<()> {
-    let alice = manager_device(3, 31, "alice-1");
-    let bob = manager_device(4, 41, "bob-1");
+    let alice = manager_device(3, 31);
+    let bob = manager_device(4, 41);
     let mut alice_manager = session_manager(&alice);
     let mut bob_manager = session_manager(&bob);
 
@@ -107,10 +107,10 @@ fn invite_observed_before_roster_becomes_usable_after_authorization() -> Result<
 
 #[test]
 fn prepare_send_fans_out_to_recipient_devices_and_local_siblings() -> Result<()> {
-    let alice1 = manager_device(5, 51, "alice-1");
-    let alice2 = manager_device(5, 52, "alice-2");
-    let bob1 = manager_device(6, 61, "bob-1");
-    let bob2 = manager_device(6, 62, "bob-2");
+    let alice1 = manager_device(5, 51);
+    let alice2 = manager_device(5, 52);
+    let bob1 = manager_device(6, 61);
+    let bob2 = manager_device(6, 62);
 
     let mut alice_manager = session_manager(&alice1);
     let mut alice2_manager = session_manager(&alice2);
@@ -150,8 +150,8 @@ fn prepare_send_fans_out_to_recipient_devices_and_local_siblings() -> Result<()>
 
 #[test]
 fn prepare_send_bootstraps_from_public_invite_and_returns_invite_response() -> Result<()> {
-    let alice = manager_device(7, 71, "alice-1");
-    let bob = manager_device(8, 81, "bob-1");
+    let alice = manager_device(7, 71);
+    let bob = manager_device(8, 81);
 
     let mut alice_manager = session_manager(&alice);
     let mut bob_manager = session_manager(&bob);
@@ -190,8 +190,8 @@ fn prepare_send_bootstraps_from_public_invite_and_returns_invite_response() -> R
 
 #[test]
 fn removed_device_is_excluded_from_send_but_can_still_decrypt_while_stale() -> Result<()> {
-    let alice = manager_device(9, 91, "alice-1");
-    let bob = manager_device(10, 101, "bob-1");
+    let alice = manager_device(9, 91);
+    let bob = manager_device(10, 101);
 
     let mut alice_manager = session_manager(&alice);
     let mut bob_manager = session_manager(&bob);
@@ -248,8 +248,8 @@ fn removed_device_is_excluded_from_send_but_can_still_decrypt_while_stale() -> R
 
 #[test]
 fn snapshot_roundtrip_preserves_established_active_sessions_without_new_bootstrap() -> Result<()> {
-    let alice = manager_device(11, 111, "alice-1");
-    let bob = manager_device(12, 121, "bob-1");
+    let alice = manager_device(11, 111);
+    let bob = manager_device(12, 121);
 
     let mut alice_manager = session_manager(&alice);
     let mut bob_manager = session_manager(&bob);
@@ -306,9 +306,9 @@ fn snapshot_roundtrip_preserves_established_active_sessions_without_new_bootstra
 
 #[test]
 fn peer_device_added_after_conversation_bootstraps_only_new_device() -> Result<()> {
-    let alice = manager_device(13, 131, "alice-1");
-    let bob1 = manager_device(14, 141, "bob-1");
-    let bob2 = manager_device(14, 142, "bob-2");
+    let alice = manager_device(13, 131);
+    let bob1 = manager_device(14, 141);
+    let bob2 = manager_device(14, 142);
 
     let mut alice_manager = session_manager(&alice);
     let mut bob1_manager = session_manager(&bob1);
@@ -340,20 +340,14 @@ fn peer_device_added_after_conversation_bootstraps_only_new_device() -> Result<(
 
 #[test]
 fn newer_public_invite_supersedes_older_one() -> Result<()> {
-    let alice = manager_device(15, 151, "alice-1");
-    let bob = manager_device(16, 161, "bob-1");
+    let alice = manager_device(15, 151);
+    let bob = manager_device(16, 161);
     let mut manager = session_manager(&alice);
 
     manager.observe_peer_roster(bob.owner_pubkey, roster_for(&[&bob], 80));
 
-    let newer =
-        support::custom_public_device_invite(&bob, 80, 1_800_000_700, Some(bob.device_id.clone()))?;
-    let older = support::custom_public_device_invite(
-        &bob,
-        81,
-        1_800_000_699,
-        Some(DeviceId::new("older-id")),
-    )?;
+    let newer = support::custom_public_device_invite(&bob, 80, 1_800_000_700)?;
+    let older = support::custom_public_device_invite(&bob, 81, 1_800_000_699)?;
     manager.observe_device_invite(bob.owner_pubkey, newer.clone())?;
     manager.observe_device_invite(bob.owner_pubkey, older)?;
 
@@ -369,15 +363,14 @@ fn newer_public_invite_supersedes_older_one() -> Result<()> {
             .map(|invite| invite.created_at),
         Some(newer.created_at)
     );
-    assert_eq!(bob_record.device_id, newer.device_id);
     Ok(())
 }
 
 #[test]
 fn snapshot_is_deterministic_for_users_devices_and_sessions() -> Result<()> {
-    let alice1 = manager_device(17, 171, "alice-1");
-    let alice2 = manager_device(17, 172, "alice-2");
-    let bob1 = manager_device(18, 181, "bob-1");
+    let alice1 = manager_device(17, 171);
+    let alice2 = manager_device(17, 172);
+    let bob1 = manager_device(18, 181);
 
     let mut left = session_manager(&alice1);
     let mut right = session_manager(&alice1);

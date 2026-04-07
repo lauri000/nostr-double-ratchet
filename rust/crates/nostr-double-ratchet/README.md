@@ -25,7 +25,6 @@ Core data types:
 - `ProtocolContext`
 - `SessionManagerSnapshot`
 - `SessionState`
-- `DeviceId`
 - `DevicePubkey`
 - `OwnerPubkey`
 - `UnixSeconds`

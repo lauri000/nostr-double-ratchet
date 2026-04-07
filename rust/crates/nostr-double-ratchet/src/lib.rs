@@ -9,7 +9,7 @@ pub mod types;
 mod utils;
 
 pub use error::{DomainError, Error, Result};
-pub use ids::{DeviceId, DevicePubkey, OwnerPubkey, UnixSeconds};
+pub use ids::{DevicePubkey, OwnerPubkey, UnixSeconds};
 pub use invite::{Invite, InviteResponse, InviteResponseEnvelope};
 pub use roster::{AuthorizedDevice, DeviceRoster, RosterSnapshotDecision};
 pub use session::{

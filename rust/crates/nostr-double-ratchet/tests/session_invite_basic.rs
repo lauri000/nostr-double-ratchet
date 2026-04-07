@@ -148,15 +148,10 @@ fn session_state_serde_roundtrip_mid_conversation() -> Result<()> {
 
 #[test]
 fn owned_invite_serde_roundtrip_preserves_bootstrap_capability() -> Result<()> {
-    let alice = actor(13, "alice-device");
-    let bob = actor(14, "bob-device");
+    let alice = actor(13);
+    let bob = actor(14);
     let mut invite_ctx = context(1000, 1_700_100_800);
-    let invite = Invite::create_new(
-        &mut invite_ctx,
-        alice.owner_pubkey,
-        Some(alice.device_id.clone()),
-        None,
-    )?;
+    let invite = Invite::create_new(&mut invite_ctx, alice.owner_pubkey, None)?;
     let mut restored_owned_invite: Invite =
         serde_json::from_str(&serde_json::to_string(&invite).unwrap()).unwrap();
 
@@ -168,7 +163,6 @@ fn owned_invite_serde_roundtrip_preserves_bootstrap_capability() -> Result<()> {
         &mut bob_accept_ctx,
         bob.device_pubkey,
         bob.secret_key,
-        Some(bob.device_id.clone()),
     )?;
     let response_event = codec::invite_response_event(&response_envelope)?;
     let incoming_response = codec::parse_invite_response_event(&response_event)?;
@@ -191,17 +185,12 @@ fn owned_invite_serde_roundtrip_preserves_bootstrap_capability() -> Result<()> {
 
 #[test]
 fn invite_owner_claim_with_roster_verifies() -> Result<()> {
-    let alice = actor(15, "alice-device");
-    let bob = actor(16, "bob-device");
-    let claimed_owner = actor(17, "owner-device");
+    let alice = actor(15);
+    let bob = actor(16);
+    let claimed_owner = actor(17);
 
     let mut invite_ctx = context(1100, 1_700_100_900);
-    let mut owned_invite = Invite::create_new(
-        &mut invite_ctx,
-        alice.owner_pubkey,
-        Some(alice.device_id.clone()),
-        None,
-    )?;
+    let mut owned_invite = Invite::create_new(&mut invite_ctx, alice.owner_pubkey, None)?;
     let public_invite = codec::parse_invite_url(&codec::invite_url(&owned_invite, ROOT_URL)?)?;
 
     let mut bob_accept_ctx = context(1101, 1_700_100_901);
@@ -209,7 +198,6 @@ fn invite_owner_claim_with_roster_verifies() -> Result<()> {
         &mut bob_accept_ctx,
         bob.device_pubkey,
         bob.secret_key,
-        Some(bob.device_id.clone()),
         Some(claimed_owner.owner_pubkey),
     )?;
     let response_event = codec::invite_response_event(&response_envelope)?;

@@ -9,8 +9,8 @@ use support::{
 
 #[test]
 fn missing_roster_surfaces_gap_not_hidden_failure() -> Result<()> {
-    let alice = manager_device(21, 211, "alice-1");
-    let bob = manager_device(22, 221, "bob-1");
+    let alice = manager_device(21, 211);
+    let bob = manager_device(22, 221);
     let mut alice_manager = session_manager(&alice);
 
     let mut send_ctx = context(1, 1_810_000_000);
@@ -27,8 +27,8 @@ fn missing_roster_surfaces_gap_not_hidden_failure() -> Result<()> {
 
 #[test]
 fn missing_device_invite_surfaces_gap_not_hidden_failure() -> Result<()> {
-    let alice = manager_device(23, 231, "alice-1");
-    let bob = manager_device(24, 241, "bob-1");
+    let alice = manager_device(23, 231);
+    let bob = manager_device(24, 241);
     let mut alice_manager = session_manager(&alice);
 
     alice_manager.observe_peer_roster(bob.owner_pubkey, roster_for(&[&bob], 10));
@@ -40,7 +40,6 @@ fn missing_device_invite_surfaces_gap_not_hidden_failure() -> Result<()> {
         vec![RelayGap::MissingDeviceInvite {
             owner_pubkey: bob.owner_pubkey,
             device_pubkey: bob.device_pubkey,
-            device_id: None,
         }]
     );
     assert!(prepared.deliveries.is_empty());
@@ -49,8 +48,8 @@ fn missing_device_invite_surfaces_gap_not_hidden_failure() -> Result<()> {
 
 #[test]
 fn restore_rejects_mismatched_local_secret_key() -> Result<()> {
-    let alice = manager_device(25, 251, "alice-1");
-    let wrong = manager_device(26, 161, "wrong-1");
+    let alice = manager_device(25, 251);
+    let wrong = manager_device(26, 161);
     let manager = session_manager(&alice);
     let snapshot = manager.snapshot();
 
@@ -64,13 +63,12 @@ fn restore_rejects_mismatched_local_secret_key() -> Result<()> {
 
 #[test]
 fn malformed_device_invite_observation_does_not_corrupt_state() -> Result<()> {
-    let alice = manager_device(27, 171, "alice-1");
-    let bob = manager_device(28, 181, "bob-1");
+    let alice = manager_device(27, 171);
+    let bob = manager_device(28, 181);
     let mut manager = session_manager(&alice);
     let before = snapshot(&manager.snapshot());
 
-    let mut wrong_owner_invite =
-        support::custom_public_device_invite(&bob, 3, 1_810_000_020, Some(bob.device_id.clone()))?;
+    let mut wrong_owner_invite = support::custom_public_device_invite(&bob, 3, 1_810_000_020)?;
     wrong_owner_invite.owner_public_key = Some(alice.owner_pubkey);
     let result = manager.observe_device_invite(bob.owner_pubkey, wrong_owner_invite);
     assert!(result.is_err());
@@ -80,8 +78,8 @@ fn malformed_device_invite_observation_does_not_corrupt_state() -> Result<()> {
 
 #[test]
 fn invite_response_replay_is_rejected_and_state_unchanged() -> Result<()> {
-    let alice = manager_device(7, 71, "alice-1");
-    let bob = manager_device(8, 81, "bob-1");
+    let alice = manager_device(7, 71);
+    let bob = manager_device(8, 81);
 
     let mut alice_manager = session_manager(&alice);
     let mut bob_manager = session_manager(&bob);
@@ -120,8 +118,8 @@ fn invite_response_replay_is_rejected_and_state_unchanged() -> Result<()> {
 
 #[test]
 fn message_replay_on_active_session_is_rejected_without_corruption() -> Result<()> {
-    let alice = manager_device(9, 91, "alice-1");
-    let bob = manager_device(10, 101, "bob-1");
+    let alice = manager_device(9, 91);
+    let bob = manager_device(10, 101);
 
     let mut alice_manager = session_manager(&alice);
     let mut bob_manager = session_manager(&bob);
@@ -170,8 +168,8 @@ fn message_replay_on_active_session_is_rejected_without_corruption() -> Result<(
 #[test]
 fn partial_restore_with_cached_invite_but_no_roster_still_surfaces_missing_roster_gap() -> Result<()>
 {
-    let alice = manager_device(33, 231, "alice-1");
-    let bob = manager_device(34, 241, "bob-1");
+    let alice = manager_device(33, 231);
+    let bob = manager_device(34, 241);
     let mut manager = session_manager(&alice);
     let mut bob_manager = session_manager(&bob);
 
@@ -195,8 +193,8 @@ fn partial_restore_with_cached_invite_but_no_roster_still_surfaces_missing_roste
 
 #[test]
 fn stale_roster_replay_does_not_resurrect_removed_device() -> Result<()> {
-    let alice = manager_device(35, 101, "alice-1");
-    let bob = manager_device(36, 111, "bob-1");
+    let alice = manager_device(35, 101);
+    let bob = manager_device(36, 111);
     let mut manager = session_manager(&alice);
 
     manager.observe_peer_roster(bob.owner_pubkey, roster_for(&[&bob], 50));
@@ -219,8 +217,8 @@ fn stale_roster_replay_does_not_resurrect_removed_device() -> Result<()> {
 
 #[test]
 fn pruned_stale_device_is_not_sendable_after_late_old_invite_observation() -> Result<()> {
-    let alice = manager_device(11, 111, "alice-1");
-    let bob = manager_device(12, 121, "bob-1");
+    let alice = manager_device(11, 111);
+    let bob = manager_device(12, 121);
     let mut manager = session_manager(&alice);
     let mut bob_manager = session_manager(&bob);
 
@@ -240,8 +238,8 @@ fn pruned_stale_device_is_not_sendable_after_late_old_invite_observation() -> Re
 
 #[test]
 fn late_message_after_pruned_stale_record_is_ignored() -> Result<()> {
-    let alice = manager_device(13, 131, "alice-1");
-    let bob = manager_device(14, 141, "bob-1");
+    let alice = manager_device(13, 131);
+    let bob = manager_device(14, 141);
 
     let mut alice_manager = session_manager(&alice);
     let mut bob_manager = session_manager(&bob);
@@ -294,8 +292,8 @@ fn late_message_after_pruned_stale_record_is_ignored() -> Result<()> {
 
 #[test]
 fn tampered_delivery_does_not_corrupt_receiver_state() -> Result<()> {
-    let alice = manager_device(15, 151, "alice-1");
-    let bob = manager_device(16, 161, "bob-1");
+    let alice = manager_device(15, 151);
+    let bob = manager_device(16, 161);
 
     let mut alice_manager = session_manager(&alice);
     let mut bob_manager = session_manager(&bob);

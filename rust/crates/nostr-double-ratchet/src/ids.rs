@@ -4,9 +4,6 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct UnixSeconds(pub u64);
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DeviceId(String);
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OwnerPubkey([u8; 32]);
 
@@ -16,16 +13,6 @@ pub struct DevicePubkey([u8; 32]);
 impl UnixSeconds {
     pub fn get(self) -> u64 {
         self.0
-    }
-}
-
-impl DeviceId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
     }
 }
 
@@ -65,12 +52,6 @@ impl DevicePubkey {
     }
 }
 
-impl fmt::Debug for DeviceId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "DeviceId({})", self.0)
-    }
-}
-
 impl fmt::Debug for OwnerPubkey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "OwnerPubkey({})", hex::encode(self.0))
@@ -83,12 +64,6 @@ impl fmt::Debug for DevicePubkey {
     }
 }
 
-impl fmt::Display for DeviceId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 impl fmt::Display for OwnerPubkey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::encode(self.0))
@@ -98,24 +73,6 @@ impl fmt::Display for OwnerPubkey {
 impl fmt::Display for DevicePubkey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::encode(self.0))
-    }
-}
-
-impl Serialize for DeviceId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for DeviceId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Ok(Self(String::deserialize(deserializer)?))
     }
 }
 

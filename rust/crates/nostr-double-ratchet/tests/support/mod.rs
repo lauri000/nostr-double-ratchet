@@ -4,7 +4,7 @@ use base64::Engine;
 use nostr::nips::nip44::{self, Version};
 use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, SecretKey, Tag, Timestamp};
 use nostr_double_ratchet::{
-    AuthorizedDevice, Delivery, DeviceId, DevicePubkey, DeviceRecordSnapshot, DeviceRoster, Invite,
+    AuthorizedDevice, Delivery, DevicePubkey, DeviceRecordSnapshot, DeviceRoster, Invite,
     InviteResponse, InviteResponseEnvelope, MessageEnvelope, OwnerPubkey, PreparedSend,
     ProcessedInviteResponse, ProtocolContext, ReceivedMessage, Result, RosterSnapshotDecision,
     Session, SessionManager, SessionManagerSnapshot, SessionState, UnixSeconds, UserRecordSnapshot,
@@ -20,7 +20,6 @@ pub struct Actor {
     pub keys: Keys,
     pub device_pubkey: DevicePubkey,
     pub owner_pubkey: OwnerPubkey,
-    pub device_id: DeviceId,
 }
 
 pub struct ManagerDevice {
@@ -30,7 +29,6 @@ pub struct ManagerDevice {
     pub secret_key: [u8; 32],
     pub keys: Keys,
     pub device_pubkey: DevicePubkey,
-    pub device_id: DeviceId,
 }
 
 pub struct InviteBootstrap {
@@ -91,7 +89,7 @@ pub fn assert_payload_eq(actual: &[u8], expected: &[u8]) {
     assert_eq!(actual, expected);
 }
 
-pub fn actor(secret_fill: u8, device_id: &str) -> Actor {
+pub fn actor(secret_fill: u8) -> Actor {
     let secret_key = [secret_fill; 32];
     let keys = Keys::new(SecretKey::from_slice(&secret_key).unwrap());
     let device_pubkey = DevicePubkey::from_bytes(keys.public_key().to_bytes());
@@ -100,11 +98,10 @@ pub fn actor(secret_fill: u8, device_id: &str) -> Actor {
         keys,
         device_pubkey,
         owner_pubkey: device_pubkey.as_owner(),
-        device_id: DeviceId::new(device_id),
     }
 }
 
-pub fn manager_device(owner_fill: u8, device_fill: u8, device_id: &str) -> ManagerDevice {
+pub fn manager_device(owner_fill: u8, device_fill: u8) -> ManagerDevice {
     let owner_secret_key = [owner_fill; 32];
     let owner_keys = Keys::new(SecretKey::from_slice(&owner_secret_key).unwrap());
     let owner_pubkey = OwnerPubkey::from_bytes(owner_keys.public_key().to_bytes());
@@ -118,16 +115,11 @@ pub fn manager_device(owner_fill: u8, device_fill: u8, device_id: &str) -> Manag
         secret_key,
         keys,
         device_pubkey,
-        device_id: DeviceId::new(device_id),
     }
 }
 
 pub fn session_manager(device: &ManagerDevice) -> SessionManager {
-    SessionManager::new(
-        device.owner_pubkey,
-        device.secret_key,
-        Some(device.device_id.clone()),
-    )
+    SessionManager::new(device.owner_pubkey, device.secret_key)
 }
 
 pub fn roster_for(devices: &[&ManagerDevice], created_at: u64) -> DeviceRoster {
@@ -168,11 +160,9 @@ pub fn custom_public_device_invite(
     device: &ManagerDevice,
     seed: u64,
     now_secs: u64,
-    device_id: Option<DeviceId>,
 ) -> Result<Invite> {
     let mut ctx = context(seed, now_secs);
-    let mut invite =
-        Invite::create_new(&mut ctx, device.device_pubkey.as_owner(), device_id, None)?;
+    let mut invite = Invite::create_new(&mut ctx, device.device_pubkey.as_owner(), None)?;
     invite.owner_public_key = Some(device.owner_pubkey);
     let _ = device;
     public_invite_via_url(&invite)
@@ -281,8 +271,8 @@ pub fn direct_session_pair(
     bob_fill: u8,
     base_secs: u64,
 ) -> Result<(Actor, Actor, Session, Session)> {
-    let alice = actor(alice_fill, "alice-device");
-    let bob = actor(bob_fill, "bob-device");
+    let alice = actor(alice_fill);
+    let bob = actor(bob_fill);
     let shared_secret = [77u8; 32];
 
     let mut alice_init = context(10 + alice_fill as u64, base_secs);
@@ -313,16 +303,11 @@ pub fn bootstrap_via_invite_event(base_secs: u64) -> Result<InviteBootstrap> {
 }
 
 fn bootstrap_via_invite(base_secs: u64, via_url: bool) -> Result<InviteBootstrap> {
-    let alice = actor(11, "alice-device");
-    let bob = actor(12, "bob-device");
+    let alice = actor(11);
+    let bob = actor(12);
 
     let mut invite_ctx = context(100, base_secs);
-    let mut owned_invite = Invite::create_new(
-        &mut invite_ctx,
-        alice.owner_pubkey,
-        Some(alice.device_id.clone()),
-        None,
-    )?;
+    let mut owned_invite = Invite::create_new(&mut invite_ctx, alice.owner_pubkey, None)?;
 
     let public_invite = if via_url {
         public_invite_via_url(&owned_invite)?
@@ -335,7 +320,6 @@ fn bootstrap_via_invite(base_secs: u64, via_url: bool) -> Result<InviteBootstrap
         &mut accept_ctx,
         bob.device_pubkey,
         bob.secret_key,
-        Some(bob.device_id.clone()),
     )?;
 
     let event = codec::invite_response_event(&response_envelope)?;
@@ -361,16 +345,11 @@ pub fn invite_response_fixture(
     base_secs: u64,
     max_uses: Option<usize>,
 ) -> Result<InviteResponseFixture> {
-    let alice = actor(51, "alice-device");
-    let bob = actor(52, "bob-device");
+    let alice = actor(51);
+    let bob = actor(52);
 
     let mut invite_ctx = context(300, base_secs);
-    let owned_invite = Invite::create_new(
-        &mut invite_ctx,
-        alice.owner_pubkey,
-        Some(alice.device_id.clone()),
-        max_uses,
-    )?;
+    let owned_invite = Invite::create_new(&mut invite_ctx, alice.owner_pubkey, max_uses)?;
     let public_invite = public_invite_via_url(&owned_invite)?;
 
     let mut accept_ctx = context(301, base_secs + 1);
@@ -378,7 +357,6 @@ pub fn invite_response_fixture(
         &mut accept_ctx,
         bob.device_pubkey,
         bob.secret_key,
-        Some(bob.device_id.clone()),
     )?;
 
     Ok(InviteResponseFixture {
