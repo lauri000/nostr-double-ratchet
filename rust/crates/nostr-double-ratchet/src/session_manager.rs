@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_INACTIVE_SESSIONS: usize = 10;
-const DEFAULT_MAX_RELAY_LATENCY_SECS: u64 = 7 * 24 * 60 * 60;
-
 #[derive(Debug, Clone)]
 pub struct SessionManager {
     local_owner_pubkey: OwnerPubkey,
@@ -18,7 +16,6 @@ pub struct SessionManager {
     local_device_id: Option<DeviceId>,
     local_invite: Option<Invite>,
     users: BTreeMap<OwnerPubkey, UserRecord>,
-    max_relay_latency: UnixSeconds,
 }
 
 #[derive(Debug, Clone)]
@@ -150,7 +147,6 @@ impl SessionManager {
             local_device_id,
             local_invite: None,
             users: BTreeMap::new(),
-            max_relay_latency: UnixSeconds(DEFAULT_MAX_RELAY_LATENCY_SECS),
         }
     }
 
@@ -181,7 +177,6 @@ impl SessionManager {
             local_device_id: snapshot.local_device_id,
             local_invite: snapshot.local_invite,
             users,
-            max_relay_latency: UnixSeconds(DEFAULT_MAX_RELAY_LATENCY_SECS),
         })
     }
 
@@ -395,17 +390,13 @@ impl SessionManager {
         Ok(None)
     }
 
-    pub fn prune_stale(&mut self, now: UnixSeconds) -> PruneReport {
+    pub fn prune_stale(&mut self, _now: UnixSeconds) -> PruneReport {
         let mut removed_devices = Vec::new();
         let mut removed_users = Vec::new();
-        let retention = self.max_relay_latency.get();
 
         self.users.retain(|owner_pubkey, user| {
             user.devices.retain(|device_pubkey, record| {
-                let keep = !record.is_stale
-                    || record.stale_since.is_none_or(|stale_since| {
-                        now.get().saturating_sub(stale_since.get()) <= retention
-                    });
+                let keep = !record.is_stale;
                 if !keep {
                     removed_devices.push((*owner_pubkey, *device_pubkey));
                 }
