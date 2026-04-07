@@ -1,6 +1,6 @@
 use crate::{
-    random_secret_key_bytes, secret_key_from_bytes, DeviceId, DevicePubkey, DeviceRoster,
-    DomainError, OwnerPubkey, ProtocolContext, Result, Session, UnixSeconds,
+    random_secret_key_bytes, secret_key_from_bytes, DevicePubkey, DeviceRoster, DomainError,
+    OwnerPubkey, ProtocolContext, Result, Session, UnixSeconds,
 };
 use base64::Engine;
 use nostr::nips::nip44::{self, Version};
@@ -19,7 +19,6 @@ pub struct Invite {
         with = "serde_option_bytes_array"
     )]
     pub inviter_ephemeral_private_key: Option<[u8; 32]>,
-    pub device_id: Option<DeviceId>,
     pub max_uses: Option<usize>,
     pub used_by: Vec<DevicePubkey>,
     pub created_at: UnixSeconds,
@@ -30,7 +29,6 @@ pub struct Invite {
 pub struct InviteResponse {
     pub session: Session,
     pub invitee_identity: DevicePubkey,
-    pub device_id: Option<DeviceId>,
     pub owner_public_key: Option<OwnerPubkey>,
 }
 
@@ -65,7 +63,6 @@ impl Invite {
     pub fn create_new<R>(
         ctx: &mut ProtocolContext<'_, R>,
         inviter: OwnerPubkey,
-        device_id: Option<DeviceId>,
         max_uses: Option<usize>,
     ) -> Result<Self>
     where
@@ -81,7 +78,6 @@ impl Invite {
             shared_secret,
             inviter,
             inviter_ephemeral_private_key: Some(inviter_ephemeral_private_key),
-            device_id,
             max_uses,
             used_by: Vec::new(),
             created_at: ctx.now,
@@ -94,18 +90,11 @@ impl Invite {
         ctx: &mut ProtocolContext<'_, R>,
         invitee_public_key: DevicePubkey,
         invitee_private_key: [u8; 32],
-        device_id: Option<DeviceId>,
     ) -> Result<(Session, InviteResponseEnvelope)>
     where
         R: RngCore + CryptoRng,
     {
-        self.accept_with_owner(
-            ctx,
-            invitee_public_key,
-            invitee_private_key,
-            device_id,
-            None,
-        )
+        self.accept_with_owner(ctx, invitee_public_key, invitee_private_key, None)
     }
 
     pub fn accept_with_owner<R>(
@@ -113,7 +102,6 @@ impl Invite {
         ctx: &mut ProtocolContext<'_, R>,
         invitee_public_key: DevicePubkey,
         invitee_private_key: [u8; 32],
-        device_id: Option<DeviceId>,
         owner_public_key: Option<OwnerPubkey>,
     ) -> Result<(Session, InviteResponseEnvelope)>
     where
@@ -134,7 +122,6 @@ impl Invite {
 
         let payload = InviteResponsePayload {
             session_key: invitee_session_public_key,
-            device_id: device_id.clone(),
             owner_public_key,
         };
 
@@ -233,7 +220,6 @@ impl Invite {
         Ok(InviteResponse {
             session,
             invitee_identity: inner_event.pubkey,
-            device_id: payload.device_id,
             owner_public_key: payload.owner_public_key,
         })
     }
@@ -271,8 +257,6 @@ struct InviteResponseInnerEvent {
 struct InviteResponsePayload {
     #[serde(rename = "sessionKey")]
     session_key: DevicePubkey,
-    #[serde(rename = "deviceId", skip_serializing_if = "Option::is_none")]
-    device_id: Option<DeviceId>,
     #[serde(rename = "ownerPublicKey", skip_serializing_if = "Option::is_none")]
     owner_public_key: Option<OwnerPubkey>,
 }

@@ -1,7 +1,7 @@
 use crate::{
-    DeviceId, DevicePubkey, DeviceRoster, DomainError, Invite, InviteResponse,
-    InviteResponseEnvelope, MessageEnvelope, OwnerPubkey, ProtocolContext, Result,
-    RosterSnapshotDecision, Session, SessionState, UnixSeconds,
+    DevicePubkey, DeviceRoster, DomainError, Invite, InviteResponse, InviteResponseEnvelope,
+    MessageEnvelope, OwnerPubkey, ProtocolContext, Result, RosterSnapshotDecision, Session,
+    SessionState, UnixSeconds,
 };
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,6 @@ pub struct SessionManager {
     local_owner_pubkey: OwnerPubkey,
     local_device_pubkey: DevicePubkey,
     local_device_secret_key: [u8; 32],
-    local_device_id: Option<DeviceId>,
     local_invite: Option<Invite>,
     users: BTreeMap<OwnerPubkey, UserRecord>,
 }
@@ -28,7 +27,6 @@ struct UserRecord {
 #[derive(Debug, Clone)]
 struct DeviceRecord {
     device_pubkey: DevicePubkey,
-    device_id: Option<DeviceId>,
     authorized: bool,
     is_stale: bool,
     stale_since: Option<UnixSeconds>,
@@ -43,7 +41,6 @@ struct DeviceRecord {
 pub struct SessionManagerSnapshot {
     pub local_owner_pubkey: OwnerPubkey,
     pub local_device_pubkey: DevicePubkey,
-    pub local_device_id: Option<DeviceId>,
     pub local_invite: Option<Invite>,
     pub users: Vec<UserRecordSnapshot>,
 }
@@ -58,7 +55,6 @@ pub struct UserRecordSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceRecordSnapshot {
     pub device_pubkey: DevicePubkey,
-    pub device_id: Option<DeviceId>,
     pub authorized: bool,
     pub is_stale: bool,
     pub stale_since: Option<UnixSeconds>,
@@ -82,7 +78,6 @@ pub struct PreparedSend {
 pub struct Delivery {
     pub owner_pubkey: OwnerPubkey,
     pub device_pubkey: DevicePubkey,
-    pub device_id: Option<DeviceId>,
     pub envelope: MessageEnvelope,
 }
 
@@ -90,14 +85,12 @@ pub struct Delivery {
 pub struct ProcessedInviteResponse {
     pub owner_pubkey: OwnerPubkey,
     pub device_pubkey: DevicePubkey,
-    pub device_id: Option<DeviceId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceivedMessage {
     pub owner_pubkey: OwnerPubkey,
     pub device_pubkey: DevicePubkey,
-    pub device_id: Option<DeviceId>,
     pub payload: Vec<u8>,
 }
 
@@ -109,7 +102,6 @@ pub enum RelayGap {
     MissingDeviceInvite {
         owner_pubkey: OwnerPubkey,
         device_pubkey: DevicePubkey,
-        device_id: Option<DeviceId>,
     },
 }
 
@@ -135,7 +127,6 @@ impl SessionManager {
     pub fn new(
         local_owner_pubkey: OwnerPubkey,
         local_device_secret_key: [u8; 32],
-        local_device_id: Option<DeviceId>,
     ) -> Self {
         let local_device_pubkey = crate::device_pubkey_from_secret_bytes(&local_device_secret_key)
             .expect("local device secret key must derive a valid device public key");
@@ -144,7 +135,6 @@ impl SessionManager {
             local_owner_pubkey,
             local_device_pubkey,
             local_device_secret_key,
-            local_device_id,
             local_invite: None,
             users: BTreeMap::new(),
         }
@@ -174,7 +164,6 @@ impl SessionManager {
             local_owner_pubkey: snapshot.local_owner_pubkey,
             local_device_pubkey: snapshot.local_device_pubkey,
             local_device_secret_key,
-            local_device_id: snapshot.local_device_id,
             local_invite: snapshot.local_invite,
             users,
         })
@@ -184,7 +173,6 @@ impl SessionManager {
         SessionManagerSnapshot {
             local_owner_pubkey: self.local_owner_pubkey,
             local_device_pubkey: self.local_device_pubkey,
-            local_device_id: self.local_device_id.clone(),
             local_invite: self.local_invite.clone(),
             users: self.users.values().map(UserRecord::snapshot).collect(),
         }
@@ -198,7 +186,6 @@ impl SessionManager {
             let mut invite = Invite::create_new(
                 ctx,
                 self.local_device_pubkey.as_owner(),
-                self.local_device_id.clone(),
                 None,
             )?;
             if self.local_owner_pubkey != self.local_device_pubkey.as_owner() {
@@ -247,7 +234,6 @@ impl SessionManager {
         let InviteResponse {
             session,
             invitee_identity,
-            device_id,
             owner_public_key,
         } = owned_invite.process_response(ctx, envelope, self.local_device_secret_key)?;
 
@@ -256,15 +242,11 @@ impl SessionManager {
         let owner_pubkey = owner_public_key.unwrap_or_else(|| invitee_identity.as_owner());
         let user = self.user_record_mut(owner_pubkey);
         let record = user.device_record_mut(invitee_identity, ctx.now);
-        if device_id.is_some() {
-            record.device_id = device_id.clone();
-        }
         record.upsert_session(session, ctx.now);
 
         Ok(Some(ProcessedInviteResponse {
             owner_pubkey,
             device_pubkey: invitee_identity,
-            device_id,
         }))
     }
 
@@ -300,15 +282,9 @@ impl SessionManager {
                     }
                 }
                 None => {
-                    let record = self
-                        .users
-                        .get(&target.owner_pubkey)
-                        .and_then(|user| user.devices.get(&target.device_pubkey))
-                        .expect("target record must exist");
                     relay_gaps.push(RelayGap::MissingDeviceInvite {
                         owner_pubkey: target.owner_pubkey,
                         device_pubkey: target.device_pubkey,
-                        device_id: record.device_id.clone(),
                     });
                 }
             }
@@ -357,7 +333,6 @@ impl SessionManager {
                     return Ok(Some(ReceivedMessage {
                         owner_pubkey: sender_owner,
                         device_pubkey,
-                        device_id: record.device_id.clone(),
                         payload: outcome.payload,
                     }));
                 }
@@ -381,7 +356,6 @@ impl SessionManager {
                 return Ok(Some(ReceivedMessage {
                     owner_pubkey: sender_owner,
                     device_pubkey,
-                    device_id: record.device_id.clone(),
                     payload: outcome.payload,
                 }));
             }
@@ -433,7 +407,6 @@ impl SessionManager {
             .then_some(self.local_owner_pubkey);
         let local_device_pubkey = self.local_device_pubkey;
         let local_device_secret_key = self.local_device_secret_key;
-        let local_device_id = self.local_device_id.clone();
         let user = self.user_record_mut(owner_pubkey);
         let record = user.device_record_mut(device_pubkey, ctx.now);
 
@@ -475,7 +448,6 @@ impl SessionManager {
                 Delivery {
                     owner_pubkey,
                     device_pubkey,
-                    device_id: record.device_id.clone(),
                     envelope,
                 },
                 None,
@@ -490,7 +462,6 @@ impl SessionManager {
             ctx,
             local_device_pubkey,
             local_device_secret_key,
-            local_device_id,
             claimed_owner,
         )?;
         let envelope = session
@@ -502,7 +473,6 @@ impl SessionManager {
             Delivery {
                 owner_pubkey,
                 device_pubkey,
-                device_id: record.device_id.clone(),
                 envelope,
             },
             Some(invite_response),
@@ -577,12 +547,6 @@ impl SessionManager {
             .public_invite
             .as_ref()
             .is_none_or(|existing| public_invite.created_at >= existing.created_at);
-
-        if public_invite.device_id.is_some()
-            && (should_replace_invite || record.device_id.is_none())
-        {
-            record.device_id = public_invite.device_id.clone();
-        }
 
         record.created_at = merge_created_at(record.created_at, public_invite.created_at);
         if should_replace_invite {
@@ -687,7 +651,6 @@ impl DeviceRecord {
     fn new(device_pubkey: DevicePubkey, created_at: UnixSeconds) -> Self {
         Self {
             device_pubkey,
-            device_id: None,
             authorized: false,
             is_stale: false,
             stale_since: None,
@@ -702,7 +665,6 @@ impl DeviceRecord {
     fn from_snapshot(snapshot: DeviceRecordSnapshot) -> Self {
         Self {
             device_pubkey: snapshot.device_pubkey,
-            device_id: snapshot.device_id,
             authorized: snapshot.authorized,
             is_stale: snapshot.is_stale,
             stale_since: snapshot.stale_since,
@@ -721,7 +683,6 @@ impl DeviceRecord {
     fn snapshot(&self) -> DeviceRecordSnapshot {
         DeviceRecordSnapshot {
             device_pubkey: self.device_pubkey,
-            device_id: self.device_id.clone(),
             authorized: self.authorized,
             is_stale: self.is_stale,
             stale_since: self.stale_since,
