@@ -29,6 +29,42 @@ The core does not expose:
 `SessionManager` is the supported application API. `Session` and `Invite` stay public for direct
 device-to-device integrations.
 
+## Architecture
+
+The current fork is intentionally split into a pure domain layer and a Nostr adapter layer.
+
+```mermaid
+flowchart LR
+  App["Application code"] --> Adapter["nostr-double-ratchet-nostr"]
+  Adapter --> Core["nostr-double-ratchet"]
+
+  Core --> SM["SessionManager"]
+  Core --> Low["Session / Invite"]
+  Core --> Types["DeviceRoster / MessageEnvelope / InviteResponseEnvelope / snapshots"]
+
+  Adapter --> Nostr["Nostr events / invite URLs / roster events"]
+```
+
+The core crate has no relay runtime, storage abstraction, background workers, or FFI surface.
+Apps own transport, persistence, and scheduling.
+
+## Typical Use
+
+```mermaid
+flowchart TD
+  Roster["Observe local and peer rosters"] --> Invite["Observe peer invites"]
+  Invite --> Prepare["SessionManager.prepare_send(...)"]
+  Prepare --> Deliveries["message deliveries"]
+  Prepare --> Responses["invite responses"]
+  Prepare --> Gaps["relay gaps"]
+  Deliveries --> Encode["adapter encodes Nostr events"]
+  Responses --> Encode
+  Encode --> Publish["application publishes to relays"]
+  Publish --> Receive["application receives relay events"]
+  Receive --> Parse["adapter parses events"]
+  Parse --> Apply["SessionManager.receive(...) / observe_invite_response(...)"]
+```
+
 ## Repository Layout
 
 - `rust/crates/nostr-double-ratchet/`: domain core
