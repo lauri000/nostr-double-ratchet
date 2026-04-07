@@ -168,6 +168,7 @@ fn prepare_send_bootstraps_from_public_invite_and_returns_invite_response() -> R
     assert_eq!(prepared.deliveries.len(), 1);
     assert_eq!(prepared.invite_responses.len(), 1);
 
+    bob_manager.observe_peer_roster(alice.owner_pubkey, roster_for(&[&alice], 29));
     let mut observe_ctx = context(32, 1_800_000_302);
     let observed = manager_observe_invite_response(
         &mut bob_manager,
@@ -363,6 +364,47 @@ fn newer_public_invite_supersedes_older_one() -> Result<()> {
             .map(|invite| invite.created_at),
         Some(newer.created_at)
     );
+    Ok(())
+}
+
+#[test]
+fn verified_owner_claim_migrates_session_to_claimed_owner() -> Result<()> {
+    let alice = manager_device(19, 191);
+    let bob = manager_device(20, 201);
+
+    let mut alice_manager = session_manager(&alice);
+    let mut bob_manager = session_manager(&bob);
+
+    bob_manager.observe_peer_roster(alice.owner_pubkey, roster_for(&[&alice], 82));
+    bob_manager.observe_device_invite(
+        alice.owner_pubkey,
+        manager_public_device_invite(&mut alice_manager, &alice, 82, 1_800_000_820)?,
+    )?;
+
+    let mut send_ctx = context(83, 1_800_000_821);
+    let prepared =
+        bob_manager.prepare_send(&mut send_ctx, alice.owner_pubkey, b"owner-claim".to_vec())?;
+
+    let mut observe_ctx = context(84, 1_800_000_822);
+    let observed = manager_observe_invite_response(
+        &mut alice_manager,
+        &mut observe_ctx,
+        &prepared.invite_responses[0],
+    )?
+    .expect("invite response should be processed");
+    assert_eq!(observed.owner_pubkey, bob.device_pubkey.as_owner());
+
+    alice_manager.observe_peer_roster(bob.owner_pubkey, roster_for(&[&bob], 83));
+
+    let snapshot = alice_manager.snapshot();
+    let verified_user = manager_user_snapshot(&snapshot, bob.owner_pubkey);
+    let verified_device = manager_device_snapshot(verified_user, bob.device_pubkey);
+    assert_eq!(verified_device.claimed_owner_pubkey, None);
+    assert!(verified_device.active_session.is_some());
+    assert!(snapshot
+        .users
+        .iter()
+        .all(|user| user.owner_pubkey != bob.device_pubkey.as_owner()));
     Ok(())
 }
 

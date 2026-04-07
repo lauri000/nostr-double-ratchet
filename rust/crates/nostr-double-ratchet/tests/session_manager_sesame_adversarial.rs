@@ -291,6 +291,42 @@ fn late_message_after_pruned_stale_record_is_ignored() -> Result<()> {
 }
 
 #[test]
+fn unverified_owner_claim_is_parked_under_device_owner_until_roster_arrives() -> Result<()> {
+    let alice = manager_device(41, 141);
+    let bob = manager_device(42, 142);
+
+    let mut alice_manager = session_manager(&alice);
+    let mut bob_manager = session_manager(&bob);
+
+    bob_manager.observe_peer_roster(alice.owner_pubkey, roster_for(&[&alice], 90));
+    bob_manager.observe_device_invite(
+        alice.owner_pubkey,
+        manager_public_device_invite(&mut alice_manager, &alice, 90, 1_810_000_900)?,
+    )?;
+
+    let mut send_ctx = context(18, 1_810_000_901);
+    let prepared =
+        bob_manager.prepare_send(&mut send_ctx, alice.owner_pubkey, b"owner-claim".to_vec())?;
+
+    let mut observe_ctx = context(19, 1_810_000_902);
+    let observed = manager_observe_invite_response(
+        &mut alice_manager,
+        &mut observe_ctx,
+        &prepared.invite_responses[0],
+    )?
+    .expect("invite response should be processed");
+
+    assert_eq!(observed.owner_pubkey, bob.device_pubkey.as_owner());
+
+    let snapshot = alice_manager.snapshot();
+    let parked_user = manager_user_snapshot(&snapshot, bob.device_pubkey.as_owner());
+    let parked_device = manager_device_snapshot(parked_user, bob.device_pubkey);
+    assert_eq!(parked_device.claimed_owner_pubkey, Some(bob.owner_pubkey));
+    assert!(parked_device.active_session.is_some());
+    Ok(())
+}
+
+#[test]
 fn tampered_delivery_does_not_corrupt_receiver_state() -> Result<()> {
     let alice = manager_device(15, 151);
     let bob = manager_device(16, 161);

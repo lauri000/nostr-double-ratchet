@@ -316,11 +316,8 @@ fn bootstrap_via_invite(base_secs: u64, via_url: bool) -> Result<InviteBootstrap
     };
 
     let mut accept_ctx = context(101, base_secs + 1);
-    let (bob_session, response_envelope) = public_invite.accept(
-        &mut accept_ctx,
-        bob.device_pubkey,
-        bob.secret_key,
-    )?;
+    let (bob_session, response_envelope) =
+        public_invite.accept(&mut accept_ctx, bob.device_pubkey, bob.secret_key)?;
 
     let event = codec::invite_response_event(&response_envelope)?;
     let incoming = codec::parse_invite_response_event(&event)?;
@@ -353,11 +350,8 @@ pub fn invite_response_fixture(
     let public_invite = public_invite_via_url(&owned_invite)?;
 
     let mut accept_ctx = context(301, base_secs + 1);
-    let (bob_session, response_envelope) = public_invite.accept(
-        &mut accept_ctx,
-        bob.device_pubkey,
-        bob.secret_key,
-    )?;
+    let (bob_session, response_envelope) =
+        public_invite.accept(&mut accept_ctx, bob.device_pubkey, bob.secret_key)?;
 
     Ok(InviteResponseFixture {
         alice,

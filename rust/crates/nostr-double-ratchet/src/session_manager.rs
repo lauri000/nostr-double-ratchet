@@ -30,6 +30,7 @@ struct DeviceRecord {
     authorized: bool,
     is_stale: bool,
     stale_since: Option<UnixSeconds>,
+    claimed_owner_pubkey: Option<OwnerPubkey>,
     public_invite: Option<Invite>,
     active_session: Option<Session>,
     inactive_sessions: Vec<Session>,
@@ -58,6 +59,8 @@ pub struct DeviceRecordSnapshot {
     pub authorized: bool,
     pub is_stale: bool,
     pub stale_since: Option<UnixSeconds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_owner_pubkey: Option<OwnerPubkey>,
     pub public_invite: Option<Invite>,
     pub active_session: Option<SessionState>,
     pub inactive_sessions: Vec<SessionState>,
@@ -124,10 +127,7 @@ enum SendSessionSource {
 }
 
 impl SessionManager {
-    pub fn new(
-        local_owner_pubkey: OwnerPubkey,
-        local_device_secret_key: [u8; 32],
-    ) -> Self {
+    pub fn new(local_owner_pubkey: OwnerPubkey, local_device_secret_key: [u8; 32]) -> Self {
         let local_device_pubkey = crate::device_pubkey_from_secret_bytes(&local_device_secret_key)
             .expect("local device secret key must derive a valid device public key");
 
@@ -183,11 +183,7 @@ impl SessionManager {
         R: RngCore + CryptoRng,
     {
         if self.local_invite.is_none() {
-            let mut invite = Invite::create_new(
-                ctx,
-                self.local_device_pubkey.as_owner(),
-                None,
-            )?;
+            let mut invite = Invite::create_new(ctx, self.local_device_pubkey.as_owner(), None)?;
             if self.local_owner_pubkey != self.local_device_pubkey.as_owner() {
                 invite.owner_public_key = Some(self.local_owner_pubkey);
             }
@@ -239,9 +235,22 @@ impl SessionManager {
 
         self.local_invite = Some(owned_invite);
 
-        let owner_pubkey = owner_public_key.unwrap_or_else(|| invitee_identity.as_owner());
+        let device_owner_pubkey = invitee_identity.as_owner();
+        let claimed_owner_pubkey = owner_public_key
+            .filter(|claimed_owner_pubkey| *claimed_owner_pubkey != device_owner_pubkey);
+        let owner_pubkey = claimed_owner_pubkey
+            .filter(|claimed_owner_pubkey| {
+                self.users
+                    .get(claimed_owner_pubkey)
+                    .and_then(|user| user.roster.as_ref())
+                    .and_then(|roster| roster.get_device(&invitee_identity))
+                    .is_some()
+            })
+            .unwrap_or(device_owner_pubkey);
         let user = self.user_record_mut(owner_pubkey);
         let record = user.device_record_mut(invitee_identity, ctx.now);
+        record.claimed_owner_pubkey = claimed_owner_pubkey
+            .filter(|claimed_owner_pubkey| *claimed_owner_pubkey != owner_pubkey);
         record.upsert_session(session, ctx.now);
 
         Ok(Some(ProcessedInviteResponse {
@@ -588,7 +597,80 @@ impl SessionManager {
             }
         }
 
+        self.reconcile_verified_claimed_devices(owner_pubkey, &next_roster, next_roster.created_at);
+
         decision
+    }
+
+    fn reconcile_verified_claimed_devices(
+        &mut self,
+        owner_pubkey: OwnerPubkey,
+        roster: &DeviceRoster,
+        now: UnixSeconds,
+    ) {
+        let roster_devices = authorized_device_set(roster);
+        if roster_devices.is_empty() {
+            return;
+        }
+
+        let source_owners: Vec<OwnerPubkey> = self
+            .users
+            .keys()
+            .copied()
+            .filter(|candidate_owner_pubkey| *candidate_owner_pubkey != owner_pubkey)
+            .collect();
+
+        let mut migrated = Vec::new();
+        let mut empty_sources = Vec::new();
+
+        for source_owner_pubkey in source_owners {
+            let matching_devices = self
+                .users
+                .get(&source_owner_pubkey)
+                .map(|user| {
+                    user.devices
+                        .values()
+                        .filter(|record| {
+                            record.claimed_owner_pubkey == Some(owner_pubkey)
+                                && roster_devices.contains(&record.device_pubkey)
+                        })
+                        .map(|record| record.device_pubkey)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            if matching_devices.is_empty() {
+                continue;
+            }
+
+            if let Some(user) = self.users.get_mut(&source_owner_pubkey) {
+                for device_pubkey in matching_devices {
+                    if let Some(mut record) = user.devices.remove(&device_pubkey) {
+                        record.claimed_owner_pubkey = None;
+                        migrated.push(record);
+                    }
+                }
+
+                if user.devices.is_empty() && user.roster.is_none() {
+                    empty_sources.push(source_owner_pubkey);
+                }
+            }
+        }
+
+        for source_owner_pubkey in empty_sources {
+            self.users.remove(&source_owner_pubkey);
+        }
+
+        if migrated.is_empty() {
+            return;
+        }
+
+        let user = self.user_record_mut(owner_pubkey);
+        for record in migrated {
+            let device_pubkey = record.device_pubkey;
+            user.device_record_mut(device_pubkey, record.created_at)
+                .absorb(record, now);
+        }
     }
 
     fn user_record_mut(&mut self, owner_pubkey: OwnerPubkey) -> &mut UserRecord {
@@ -654,6 +736,7 @@ impl DeviceRecord {
             authorized: false,
             is_stale: false,
             stale_since: None,
+            claimed_owner_pubkey: None,
             public_invite: None,
             active_session: None,
             inactive_sessions: Vec::new(),
@@ -668,6 +751,7 @@ impl DeviceRecord {
             authorized: snapshot.authorized,
             is_stale: snapshot.is_stale,
             stale_since: snapshot.stale_since,
+            claimed_owner_pubkey: snapshot.claimed_owner_pubkey,
             public_invite: snapshot.public_invite,
             active_session: snapshot.active_session.map(Session::new),
             inactive_sessions: snapshot
@@ -686,6 +770,7 @@ impl DeviceRecord {
             authorized: self.authorized,
             is_stale: self.is_stale,
             stale_since: self.stale_since,
+            claimed_owner_pubkey: self.claimed_owner_pubkey,
             public_invite: self.public_invite.clone(),
             active_session: self
                 .active_session
@@ -757,6 +842,44 @@ impl DeviceRecord {
             self.inactive_sessions.truncate(MAX_INACTIVE_SESSIONS);
         }
         self.last_activity = Some(now);
+    }
+
+    fn absorb(&mut self, mut other: DeviceRecord, now: UnixSeconds) {
+        self.authorized |= other.authorized;
+        self.is_stale &= other.is_stale;
+        self.stale_since = match (self.stale_since, other.stale_since) {
+            (Some(existing), Some(incoming)) => Some(existing.min(incoming)),
+            (None, incoming) => incoming,
+            (existing, None) => existing,
+        };
+        self.claimed_owner_pubkey = self
+            .claimed_owner_pubkey
+            .or(other.claimed_owner_pubkey.take());
+        self.created_at = merge_created_at(self.created_at, other.created_at);
+
+        if let Some(public_invite) = other.public_invite.take() {
+            let should_replace_invite = self
+                .public_invite
+                .as_ref()
+                .is_none_or(|existing| public_invite.created_at >= existing.created_at);
+            if should_replace_invite {
+                self.public_invite = Some(public_invite);
+            }
+        }
+
+        if let Some(session) = other.active_session.take() {
+            self.upsert_session(session, now);
+        }
+
+        for session in other.inactive_sessions.drain(..) {
+            self.upsert_session(session, now);
+        }
+
+        self.last_activity = match (self.last_activity, other.last_activity) {
+            (Some(existing), Some(incoming)) => Some(existing.max(incoming)),
+            (None, incoming) => incoming,
+            (existing, None) => existing,
+        };
     }
 
     fn promote_inactive_session(&mut self, session: Session) {

@@ -162,11 +162,8 @@ fn wrong_inviter_private_key_cannot_process_response() -> Result<()> {
     let public_invite = codec::parse_invite_url(&codec::invite_url(&owned_invite, ROOT_URL)?)?;
 
     let mut accept_ctx = context(12, 1_700_200_601);
-    let (_bob_session, response_envelope) = public_invite.accept(
-        &mut accept_ctx,
-        bob.device_pubkey,
-        bob.secret_key,
-    )?;
+    let (_bob_session, response_envelope) =
+        public_invite.accept(&mut accept_ctx, bob.device_pubkey, bob.secret_key)?;
     let response_event = codec::invite_response_event(&response_envelope)?;
     let incoming_response = codec::parse_invite_response_event(&response_event)?;
 
@@ -187,11 +184,8 @@ fn tampered_invite_response_is_rejected_and_invite_state_stays_usable() -> Resul
     let public_invite = codec::parse_invite_url(&codec::invite_url(&owned_invite, ROOT_URL)?)?;
 
     let mut accept_ctx = context(15, 1_700_200_701);
-    let (mut bob_session, response_envelope) = public_invite.accept(
-        &mut accept_ctx,
-        bob.device_pubkey,
-        bob.secret_key,
-    )?;
+    let (mut bob_session, response_envelope) =
+        public_invite.accept(&mut accept_ctx, bob.device_pubkey, bob.secret_key)?;
     let response_event = codec::invite_response_event(&response_envelope)?;
     let incoming_response = codec::parse_invite_response_event(&response_event)?;
 
@@ -260,11 +254,8 @@ fn public_only_invite_cannot_process_response() -> Result<()> {
     let mut public_invite = codec::parse_invite_url(&codec::invite_url(&owned_invite, ROOT_URL)?)?;
 
     let mut accept_ctx = context(21, 1_700_200_801);
-    let (_bob_session, response_envelope) = public_invite.accept(
-        &mut accept_ctx,
-        bob.device_pubkey,
-        bob.secret_key,
-    )?;
+    let (_bob_session, response_envelope) =
+        public_invite.accept(&mut accept_ctx, bob.device_pubkey, bob.secret_key)?;
     let response_event = codec::invite_response_event(&response_envelope)?;
     let incoming_response = codec::parse_invite_response_event(&response_event)?;
 

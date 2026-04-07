@@ -48,7 +48,7 @@ pub struct SessionState {
     pub skipped_keys: BTreeMap<DevicePubkey, SkippedKeysEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageEnvelope {
     pub sender: DevicePubkey,
     pub signer_secret_key: [u8; 32],

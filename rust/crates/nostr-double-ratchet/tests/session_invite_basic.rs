@@ -159,11 +159,8 @@ fn owned_invite_serde_roundtrip_preserves_bootstrap_capability() -> Result<()> {
         codec::parse_invite_url(&codec::invite_url(&restored_owned_invite, ROOT_URL)?)?;
 
     let mut bob_accept_ctx = context(1001, 1_700_100_801);
-    let (mut bob_session, response_envelope) = public_invite.accept(
-        &mut bob_accept_ctx,
-        bob.device_pubkey,
-        bob.secret_key,
-    )?;
+    let (mut bob_session, response_envelope) =
+        public_invite.accept(&mut bob_accept_ctx, bob.device_pubkey, bob.secret_key)?;
     let response_event = codec::invite_response_event(&response_envelope)?;
     let incoming_response = codec::parse_invite_response_event(&response_event)?;
 
