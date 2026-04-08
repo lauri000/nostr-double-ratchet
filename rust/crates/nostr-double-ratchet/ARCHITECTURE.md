@@ -221,14 +221,14 @@ flowchart TD
   D --> E["migrate when roster proof arrives"]
 ```
 
-One internal compatibility mechanism still exists:
+Current verification staging:
 
 - unverified owner claims are parked under a provisional owner bucket derived from the device
   pubkey bytes
 - once a roster proves that device belongs to the claimed owner, the record is migrated
 
-That mechanism is no longer exposed as a public conversion API, but it still exists internally as a
-verification staging strategy.
+That mechanism is not a public API shim. It is the current internal way to stage unverified owner
+claims until roster proof arrives.
 
 ## Remaining Constraint
 
@@ -236,6 +236,6 @@ The main unresolved architectural constraint is unchanged:
 
 - roster events are still modeled as owner-authored replaceable snapshots
 
-That is a deliberate compatibility choice for now. If the project later wants secondary devices to
-publish authoritative roster updates without access to the owner signing key, that will require a
-larger event-authority redesign rather than another cleanup pass.
+If the project later wants secondary devices to publish authoritative roster updates without access
+to the owner signing key, that will require a larger event-authority redesign rather than another
+cleanup pass.

@@ -1,11 +1,8 @@
-use base64::Engine;
-use nostr::nips::nip44;
 use nostr::{Event, EventBuilder, Keys, Kind, Tag, Timestamp, UnsignedEvent};
 use nostr_double_ratchet::{
     AuthorizedDevice, DevicePubkey, DeviceRoster, Error as CoreError, Invite,
     InviteResponseEnvelope, MessageEnvelope, OwnerPubkey, UnixSeconds,
 };
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const MESSAGE_EVENT_KIND: u32 = 1060;
@@ -135,7 +132,6 @@ pub fn parse_invite_url(url: &str) -> Result<Invite> {
     let inviter_device_pubkey = parse_device_pubkey(
         data.get("inviterDevice")
             .and_then(|value| value.as_str())
-            .or_else(|| data.get("inviter").and_then(|value| value.as_str()))
             .ok_or_else(|| Error::InvalidEvent("missing inviterDevice".to_string()))?,
     )?;
     let inviter_ephemeral_public_key = parse_device_pubkey(
@@ -364,53 +360,6 @@ fn owner_public_key(owner_pubkey: OwnerPubkey) -> Result<nostr::PublicKey> {
     Ok(nostr::PublicKey::from_slice(&owner_pubkey.to_bytes())?)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyEncryptedRosterLabels {
-    #[serde(rename = "type")]
-    payload_type: String,
-    v: u8,
-    #[serde(default)]
-    device_labels: Vec<LegacyStoredDeviceLabels>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyStoredDeviceLabels {
-    identity_pubkey: DevicePubkey,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    device_label: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    client_label: Option<String>,
-    updated_at: UnixSeconds,
-}
-
-pub fn parse_legacy_encrypted_roster_labels(
-    event: &Event,
-    owner_keys: &Keys,
-) -> Result<Vec<DevicePubkey>> {
-    if event.content.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let ciphertext_bytes = base64::engine::general_purpose::STANDARD
-        .decode(event.content.as_bytes())
-        .map_err(|e| Error::InvalidEvent(e.to_string()))?;
-    let conversation_key =
-        nip44::v2::ConversationKey::derive(owner_keys.secret_key(), &owner_keys.public_key());
-    let plaintext = String::from_utf8(nip44::v2::decrypt_to_bytes(
-        &conversation_key,
-        &ciphertext_bytes,
-    )?)
-    .map_err(|e| Error::InvalidEvent(e.to_string()))?;
-    let payload: LegacyEncryptedRosterLabels =
-        serde_json::from_str(&plaintext).map_err(|e| Error::InvalidEvent(e.to_string()))?;
-
-    Ok(payload
-        .device_labels
-        .into_iter()
-        .map(|label| label.identity_pubkey)
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,45 +496,6 @@ mod tests {
         let owner_keys = Keys::new(secret_key_from_bytes(&owner_secret).unwrap());
         let signed = unsigned.sign_with_keys(&owner_keys).unwrap();
         assert!(parse_invite_event(&signed).is_err());
-    }
-
-    #[test]
-    fn parse_invite_url_accepts_legacy_inviter_field() {
-        let owner_secret = [33u8; 32];
-        let owner_pubkey = OwnerPubkey::from_bytes(
-            Keys::new(secret_key_from_bytes(&owner_secret).unwrap())
-                .public_key()
-                .to_bytes(),
-        );
-        let inviter_secret = [34u8; 32];
-        let inviter_device_pubkey = DevicePubkey::from_bytes(
-            Keys::new(secret_key_from_bytes(&inviter_secret).unwrap())
-                .public_key()
-                .to_bytes(),
-        );
-        let ephemeral_secret = [35u8; 32];
-        let ephemeral_pubkey = DevicePubkey::from_bytes(
-            Keys::new(secret_key_from_bytes(&ephemeral_secret).unwrap())
-                .public_key()
-                .to_bytes(),
-        );
-        let legacy_url = format!(
-            "https://chat.iris.to#{}",
-            urlencoding::encode(
-                &serde_json::json!({
-                    "inviter": inviter_device_pubkey.to_string(),
-                    "ephemeralKey": ephemeral_pubkey.to_string(),
-                    "sharedSecret": hex::encode([7u8; 32]),
-                    "createdAt": 22,
-                    "owner": owner_pubkey.to_string(),
-                })
-                .to_string()
-            )
-        );
-
-        let invite = parse_invite_url(&legacy_url).unwrap();
-        assert_eq!(invite.inviter_device_pubkey, inviter_device_pubkey);
-        assert_eq!(invite.inviter_owner_pubkey, Some(owner_pubkey));
     }
 
     #[test]
