@@ -10,6 +10,7 @@ storage, or background orchestration.
 High-level API:
 
 - `SessionManager`
+- `RosterEditor`
 
 Lower-level primitives:
 
@@ -37,23 +38,44 @@ Core data types:
 - Device authorization is represented by `DeviceRoster`.
 - `SessionManager` owns multi-device Sesame-style state for decentralized relay input, but stays
   pure domain logic.
+- `RosterEditor` is the supported helper for building and editing full roster snapshots outside
+  `SessionManager`.
 
 No compatibility layer is kept for the removed APIs.
 
 ## Basic `SessionManager` Flow
 
-1. Construct a manager for the local device.
-2. Publish the local public invite with `ensure_local_invite(...)`.
-3. Apply the local roster and observe peer rosters.
-4. Observe peer device invites.
-5. Call `prepare_send(...)` to produce:
+1. Create a separate local device secret key and derive its public key with
+   `DevicePubkey::from_secret_bytes(...)`.
+2. Construct `SessionManager::new(local_owner_pubkey, local_device_secret_key)`.
+3. Build the authoritative local roster with `RosterEditor`.
+4. Publish the local public invite with `ensure_local_invite(...)`.
+5. Apply the local roster and observe peer rosters.
+6. Observe peer device invites.
+7. Call `prepare_send(...)` to produce:
    - `deliveries`
    - `invite_responses`
    - `relay_gaps`
-6. Feed invite responses and incoming messages back with:
+8. Feed invite responses and incoming messages back with:
    - `observe_invite_response(...)`
    - `receive(...)`
-7. Persist and restore with `snapshot()` / `SessionManager::from_snapshot(...)`.
+9. Persist and restore with `snapshot()` / `SessionManager::from_snapshot(...)`.
+
+## Device Roster CRUD
+
+Use `RosterEditor` for authoritative roster editing:
+
+- `RosterEditor::new()` or `RosterEditor::from_roster(...)`
+- `authorize_device(...)`
+- `revoke_device(...)`
+- `build(created_at)`
+
+This is snapshot CRUD:
+
+- add device = build and publish a newer full roster including it
+- remove device = build and publish a newer full roster omitting it
+- `SessionManager` consumes those snapshots with `apply_local_roster(...)` /
+  `observe_peer_roster(...)`
 
 ## Lower-Level Device-to-Device Usage
 
@@ -85,3 +107,7 @@ That crate translates:
 ```bash
 cargo test -p nostr-double-ratchet --manifest-path rust/Cargo.toml
 ```
+
+See [./TUTORIAL.md](./TUTORIAL.md) for the user-facing integration guide.
+See [./ARCHITECTURE.md](./ARCHITECTURE.md) for the current owner/device architecture, invite
+semantics, and recommended integration flow.

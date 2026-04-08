@@ -2,6 +2,7 @@ pub mod error;
 pub mod ids;
 pub mod invite;
 pub mod roster;
+pub mod roster_editor;
 pub mod session;
 pub mod session_manager;
 pub mod types;
@@ -12,6 +13,7 @@ pub use error::{DomainError, Error, Result};
 pub use ids::{DevicePubkey, OwnerPubkey, UnixSeconds};
 pub use invite::{Invite, InviteResponse, InviteResponseEnvelope};
 pub use roster::{AuthorizedDevice, DeviceRoster, RosterSnapshotDecision};
+pub use roster_editor::RosterEditor;
 pub use session::{
     Header, MessageEnvelope, ReceiveOutcome, ReceivePlan, SendOutcome, SendPlan,
     SerializableKeyPair, Session, SessionState, SkippedKeysEntry,
@@ -22,6 +24,7 @@ pub use session_manager::{
 };
 pub use types::{ProtocolContext, MAX_SKIP};
 
+pub(crate) use ids::owner_pubkey_from_device_pubkey;
 pub(crate) use utils::{
     device_pubkey_from_secret_bytes, kdf, random_secret_key_bytes, secret_key_from_bytes,
 };
@@ -34,6 +37,7 @@ mod architecture_tests {
             include_str!("ids.rs"),
             include_str!("invite.rs"),
             include_str!("roster.rs"),
+            include_str!("roster_editor.rs"),
             include_str!("session.rs"),
             include_str!("session_manager.rs"),
             include_str!("types.rs"),

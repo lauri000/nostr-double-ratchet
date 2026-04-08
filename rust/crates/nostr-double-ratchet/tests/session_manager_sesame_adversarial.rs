@@ -4,7 +4,7 @@ use nostr_double_ratchet::{DomainError, Error, RelayGap, Result, UnixSeconds};
 use support::{
     context, manager_device, manager_device_snapshot, manager_observe_invite_response,
     manager_public_device_invite, manager_receive_delivery, manager_user_snapshot, mutate_text,
-    restore_manager, roster_for, session_manager, snapshot,
+    provisional_owner_pubkey, restore_manager, roster_for, session_manager, snapshot,
 };
 
 #[test]
@@ -69,10 +69,31 @@ fn malformed_device_invite_observation_does_not_corrupt_state() -> Result<()> {
     let before = snapshot(&manager.snapshot());
 
     let mut wrong_owner_invite = support::custom_public_device_invite(&bob, 3, 1_810_000_020)?;
-    wrong_owner_invite.owner_public_key = Some(alice.owner_pubkey);
+    wrong_owner_invite.inviter_owner_pubkey = Some(alice.owner_pubkey);
     let result = manager.observe_device_invite(bob.owner_pubkey, wrong_owner_invite);
     assert!(result.is_err());
     assert_eq!(snapshot(&manager.snapshot()), before);
+    Ok(())
+}
+
+#[test]
+fn invite_response_without_owner_claim_is_rejected_for_session_manager() -> Result<()> {
+    let alice = manager_device(29, 191);
+    let bob = manager_device(30, 192);
+    let mut alice_manager = session_manager(&alice);
+
+    let public_invite = manager_public_device_invite(&mut alice_manager, &alice, 4, 1_810_000_021)?;
+    let mut accept_ctx = context(5, 1_810_000_022);
+    let (_session, envelope) =
+        public_invite.accept(&mut accept_ctx, bob.device_pubkey, bob.secret_key)?;
+
+    let mut observe_ctx = context(6, 1_810_000_023);
+    let result = manager_observe_invite_response(&mut alice_manager, &mut observe_ctx, &envelope);
+    assert!(matches!(
+        result,
+        Err(Error::Domain(DomainError::InvalidState(message)))
+            if message.contains("missing owner claim")
+    ));
     Ok(())
 }
 
@@ -316,10 +337,13 @@ fn unverified_owner_claim_is_parked_under_device_owner_until_roster_arrives() ->
     )?
     .expect("invite response should be processed");
 
-    assert_eq!(observed.owner_pubkey, bob.device_pubkey.as_owner());
+    assert_eq!(
+        observed.owner_pubkey,
+        provisional_owner_pubkey(bob.device_pubkey)
+    );
 
     let snapshot = alice_manager.snapshot();
-    let parked_user = manager_user_snapshot(&snapshot, bob.device_pubkey.as_owner());
+    let parked_user = manager_user_snapshot(&snapshot, provisional_owner_pubkey(bob.device_pubkey));
     let parked_device = manager_device_snapshot(parked_user, bob.device_pubkey);
     assert_eq!(parked_device.claimed_owner_pubkey, Some(bob.owner_pubkey));
     assert!(parked_device.active_session.is_some());

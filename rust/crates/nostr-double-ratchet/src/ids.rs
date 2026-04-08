@@ -24,10 +24,6 @@ impl OwnerPubkey {
     pub fn to_bytes(self) -> [u8; 32] {
         self.0
     }
-
-    pub fn as_device(self) -> DevicePubkey {
-        DevicePubkey(self.0)
-    }
 }
 
 impl DevicePubkey {
@@ -35,12 +31,15 @@ impl DevicePubkey {
         Self(bytes)
     }
 
-    pub fn to_bytes(self) -> [u8; 32] {
-        self.0
+    pub fn from_secret_bytes(secret_key_bytes: [u8; 32]) -> Result<Self, crate::Error> {
+        let secret_key = nostr::SecretKey::from_slice(&secret_key_bytes)
+            .map_err(|e| crate::Error::Parse(e.to_string()))?;
+        let public_key = nostr::Keys::new(secret_key).public_key();
+        Ok(Self(public_key.to_bytes()))
     }
 
-    pub fn as_owner(self) -> OwnerPubkey {
-        OwnerPubkey(self.0)
+    pub fn to_bytes(self) -> [u8; 32] {
+        self.0
     }
 
     pub(crate) fn from_nostr(pubkey: nostr::PublicKey) -> Self {
@@ -121,4 +120,8 @@ impl<'de> Deserialize<'de> for DevicePubkey {
 pub(crate) fn parse_hex_pubkey(value: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(value).map_err(|e| e.to_string())?;
     <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| "expected 32-byte public key".to_string())
+}
+
+pub(crate) fn owner_pubkey_from_device_pubkey(device_pubkey: DevicePubkey) -> OwnerPubkey {
+    OwnerPubkey::from_bytes(device_pubkey.to_bytes())
 }

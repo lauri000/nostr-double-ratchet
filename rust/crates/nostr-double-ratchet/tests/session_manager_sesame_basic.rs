@@ -6,7 +6,7 @@ use nostr_double_ratchet::{
 use support::{
     context, manager_device, manager_device_snapshot, manager_observe_invite_response,
     manager_public_device_invite, manager_receive_delivery, manager_user_snapshot, payload_text,
-    prepared_targets, restore_manager, roster_for, session_manager,
+    prepared_targets, provisional_owner_pubkey, restore_manager, roster_for, session_manager,
 };
 
 fn assert_gap(prepared: &nostr_double_ratchet::PreparedSend, expected: RelayGap) {
@@ -28,8 +28,8 @@ fn local_device_invite_is_stable_and_owned() -> Result<()> {
     let second = manager.ensure_local_invite(&mut second_ctx)?.clone();
 
     assert_eq!(first, second);
-    assert_eq!(first.inviter, alice.device_pubkey.as_owner());
-    assert_eq!(first.owner_public_key, Some(alice.owner_pubkey));
+    assert_eq!(first.inviter_device_pubkey, alice.device_pubkey);
+    assert_eq!(first.inviter_owner_pubkey, Some(alice.owner_pubkey));
     assert!(first.inviter_ephemeral_private_key.is_some());
     Ok(())
 }
@@ -392,7 +392,10 @@ fn verified_owner_claim_migrates_session_to_claimed_owner() -> Result<()> {
         &prepared.invite_responses[0],
     )?
     .expect("invite response should be processed");
-    assert_eq!(observed.owner_pubkey, bob.device_pubkey.as_owner());
+    assert_eq!(
+        observed.owner_pubkey,
+        provisional_owner_pubkey(bob.device_pubkey)
+    );
 
     alice_manager.observe_peer_roster(bob.owner_pubkey, roster_for(&[&bob], 83));
 
@@ -404,7 +407,7 @@ fn verified_owner_claim_migrates_session_to_claimed_owner() -> Result<()> {
     assert!(snapshot
         .users
         .iter()
-        .all(|user| user.owner_pubkey != bob.device_pubkey.as_owner()));
+        .all(|user| user.owner_pubkey != provisional_owner_pubkey(bob.device_pubkey)));
     Ok(())
 }
 

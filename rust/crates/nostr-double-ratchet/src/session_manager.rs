@@ -183,10 +183,12 @@ impl SessionManager {
         R: RngCore + CryptoRng,
     {
         if self.local_invite.is_none() {
-            let mut invite = Invite::create_new(ctx, self.local_device_pubkey.as_owner(), None)?;
-            if self.local_owner_pubkey != self.local_device_pubkey.as_owner() {
-                invite.owner_public_key = Some(self.local_owner_pubkey);
-            }
+            let invite = Invite::create_new(
+                ctx,
+                self.local_device_pubkey,
+                Some(self.local_owner_pubkey),
+                None,
+            )?;
             self.observe_public_invite(self.local_owner_pubkey, invite.clone())?;
             self.local_invite = Some(invite);
         }
@@ -229,33 +231,36 @@ impl SessionManager {
         let mut owned_invite = invite;
         let InviteResponse {
             session,
-            invitee_identity,
-            owner_public_key,
+            invitee_device_pubkey,
+            invitee_owner_pubkey,
         } = owned_invite.process_response(ctx, envelope, self.local_device_secret_key)?;
 
         self.local_invite = Some(owned_invite);
 
-        let device_owner_pubkey = invitee_identity.as_owner();
-        let claimed_owner_pubkey = owner_public_key
-            .filter(|claimed_owner_pubkey| *claimed_owner_pubkey != device_owner_pubkey);
+        let device_owner_pubkey = crate::owner_pubkey_from_device_pubkey(invitee_device_pubkey);
+        let invitee_owner_pubkey = invitee_owner_pubkey.ok_or_else(|| {
+            DomainError::InvalidState("invite response missing owner claim".to_string())
+        })?;
+        let claimed_owner_pubkey =
+            (invitee_owner_pubkey != device_owner_pubkey).then_some(invitee_owner_pubkey);
         let owner_pubkey = claimed_owner_pubkey
             .filter(|claimed_owner_pubkey| {
                 self.users
                     .get(claimed_owner_pubkey)
                     .and_then(|user| user.roster.as_ref())
-                    .and_then(|roster| roster.get_device(&invitee_identity))
+                    .and_then(|roster| roster.get_device(&invitee_device_pubkey))
                     .is_some()
             })
             .unwrap_or(device_owner_pubkey);
         let user = self.user_record_mut(owner_pubkey);
-        let record = user.device_record_mut(invitee_identity, ctx.now);
+        let record = user.device_record_mut(invitee_device_pubkey, ctx.now);
         record.claimed_owner_pubkey = claimed_owner_pubkey
             .filter(|claimed_owner_pubkey| *claimed_owner_pubkey != owner_pubkey);
         record.upsert_session(session, ctx.now);
 
         Ok(Some(ProcessedInviteResponse {
             owner_pubkey,
-            device_pubkey: invitee_identity,
+            device_pubkey: invitee_device_pubkey,
         }))
     }
 
@@ -412,8 +417,7 @@ impl SessionManager {
     where
         R: RngCore + CryptoRng,
     {
-        let claimed_owner = (self.local_owner_pubkey != self.local_device_pubkey.as_owner())
-            .then_some(self.local_owner_pubkey);
+        let claimed_owner = Some(self.local_owner_pubkey);
         let local_device_pubkey = self.local_device_pubkey;
         let local_device_secret_key = self.local_device_secret_key;
         let user = self.user_record_mut(owner_pubkey);
@@ -537,15 +541,16 @@ impl SessionManager {
     }
 
     fn observe_public_invite(&mut self, owner_pubkey: OwnerPubkey, invite: Invite) -> Result<()> {
-        let resolved_owner = invite.owner_public_key.unwrap_or(invite.inviter);
-        if resolved_owner != owner_pubkey {
-            return Err(DomainError::InvalidState(format!(
-                "invite owner mismatch: expected {owner_pubkey}, got {resolved_owner}"
-            ))
-            .into());
+        if let Some(inviter_owner_pubkey) = invite.inviter_owner_pubkey {
+            if inviter_owner_pubkey != owner_pubkey {
+                return Err(DomainError::InvalidState(format!(
+                    "invite owner mismatch: expected {owner_pubkey}, got {inviter_owner_pubkey}"
+                ))
+                .into());
+            }
         }
 
-        let device_pubkey = invite.inviter.as_device();
+        let device_pubkey = invite.inviter_device_pubkey;
         let mut public_invite = invite;
         public_invite.inviter_ephemeral_private_key = None;
 

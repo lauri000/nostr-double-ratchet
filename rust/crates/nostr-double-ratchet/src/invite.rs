@@ -1,6 +1,6 @@
 use crate::{
-    random_secret_key_bytes, secret_key_from_bytes, DevicePubkey, DeviceRoster, DomainError,
-    OwnerPubkey, ProtocolContext, Result, Session, UnixSeconds,
+    owner_pubkey_from_device_pubkey, random_secret_key_bytes, secret_key_from_bytes, DevicePubkey,
+    DeviceRoster, DomainError, OwnerPubkey, ProtocolContext, Result, Session, UnixSeconds,
 };
 use base64::Engine;
 use nostr::nips::nip44::{self, Version};
@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Invite {
+    pub inviter_device_pubkey: DevicePubkey,
     pub inviter_ephemeral_public_key: DevicePubkey,
     #[serde(with = "serde_bytes_array")]
     pub shared_secret: [u8; 32],
-    pub inviter: OwnerPubkey,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -22,14 +22,14 @@ pub struct Invite {
     pub max_uses: Option<usize>,
     pub used_by: Vec<DevicePubkey>,
     pub created_at: UnixSeconds,
-    pub owner_public_key: Option<OwnerPubkey>,
+    pub inviter_owner_pubkey: Option<OwnerPubkey>,
 }
 
 #[derive(Debug, Clone)]
 pub struct InviteResponse {
     pub session: Session,
-    pub invitee_identity: DevicePubkey,
-    pub owner_public_key: Option<OwnerPubkey>,
+    pub invitee_device_pubkey: DevicePubkey,
+    pub invitee_owner_pubkey: Option<OwnerPubkey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,19 +42,21 @@ pub struct InviteResponseEnvelope {
 }
 
 impl InviteResponse {
-    pub fn resolved_owner_pubkey(&self) -> OwnerPubkey {
-        self.owner_public_key
-            .unwrap_or_else(|| self.invitee_identity.as_owner())
+    pub fn claimed_owner_pubkey(&self) -> Option<OwnerPubkey> {
+        self.invitee_owner_pubkey
     }
 
     pub fn has_verified_owner_claim(&self, roster: Option<&DeviceRoster>) -> bool {
-        let owner = self.resolved_owner_pubkey();
-        if owner == self.invitee_identity.as_owner() {
+        let Some(owner_pubkey) = self.invitee_owner_pubkey else {
+            return false;
+        };
+
+        if owner_pubkey == owner_pubkey_from_device_pubkey(self.invitee_device_pubkey) {
             return true;
         }
 
         roster
-            .and_then(|roster| roster.get_device(&self.invitee_identity))
+            .and_then(|roster| roster.get_device(&self.invitee_device_pubkey))
             .is_some()
     }
 }
@@ -62,7 +64,8 @@ impl InviteResponse {
 impl Invite {
     pub fn create_new<R>(
         ctx: &mut ProtocolContext<'_, R>,
-        inviter: OwnerPubkey,
+        inviter_device_pubkey: DevicePubkey,
+        inviter_owner_pubkey: Option<OwnerPubkey>,
         max_uses: Option<usize>,
     ) -> Result<Self>
     where
@@ -74,14 +77,14 @@ impl Invite {
         let shared_secret = random_secret_key_bytes(ctx.rng)?;
 
         Ok(Self {
+            inviter_device_pubkey,
             inviter_ephemeral_public_key,
             shared_secret,
-            inviter,
             inviter_ephemeral_private_key: Some(inviter_ephemeral_private_key),
             max_uses,
             used_by: Vec::new(),
             created_at: ctx.now,
-            owner_public_key: None,
+            inviter_owner_pubkey,
         })
     }
 
@@ -102,7 +105,7 @@ impl Invite {
         ctx: &mut ProtocolContext<'_, R>,
         invitee_public_key: DevicePubkey,
         invitee_private_key: [u8; 32],
-        owner_public_key: Option<OwnerPubkey>,
+        invitee_owner_pubkey: Option<OwnerPubkey>,
     ) -> Result<(Session, InviteResponseEnvelope)>
     where
         R: RngCore + CryptoRng,
@@ -122,13 +125,13 @@ impl Invite {
 
         let payload = InviteResponsePayload {
             session_key: invitee_session_public_key,
-            owner_public_key,
+            owner_pubkey: invitee_owner_pubkey,
         };
 
         let invitee_sk = secret_key_from_bytes(&invitee_private_key)?;
         let dh_encrypted = nip44::encrypt(
             &invitee_sk,
-            &self.inviter.as_device().to_nostr()?,
+            &self.inviter_device_pubkey.to_nostr()?,
             serde_json::to_string(&payload)?,
             Version::V2,
         )?;
@@ -219,8 +222,8 @@ impl Invite {
 
         Ok(InviteResponse {
             session,
-            invitee_identity: inner_event.pubkey,
-            owner_public_key: payload.owner_public_key,
+            invitee_device_pubkey: inner_event.pubkey,
+            invitee_owner_pubkey: payload.owner_pubkey,
         })
     }
 
@@ -258,7 +261,7 @@ struct InviteResponsePayload {
     #[serde(rename = "sessionKey")]
     session_key: DevicePubkey,
     #[serde(rename = "ownerPublicKey", skip_serializing_if = "Option::is_none")]
-    owner_public_key: Option<OwnerPubkey>,
+    owner_pubkey: Option<OwnerPubkey>,
 }
 
 mod serde_bytes_array {

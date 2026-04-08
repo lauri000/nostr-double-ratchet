@@ -97,7 +97,7 @@ pub fn actor(secret_fill: u8) -> Actor {
         secret_key,
         keys,
         device_pubkey,
-        owner_pubkey: device_pubkey.as_owner(),
+        owner_pubkey: OwnerPubkey::from_bytes(device_pubkey.to_bytes()),
     }
 }
 
@@ -162,9 +162,12 @@ pub fn custom_public_device_invite(
     now_secs: u64,
 ) -> Result<Invite> {
     let mut ctx = context(seed, now_secs);
-    let mut invite = Invite::create_new(&mut ctx, device.device_pubkey.as_owner(), None)?;
-    invite.owner_public_key = Some(device.owner_pubkey);
-    let _ = device;
+    let invite = Invite::create_new(
+        &mut ctx,
+        device.device_pubkey,
+        Some(device.owner_pubkey),
+        None,
+    )?;
     public_invite_via_url(&invite)
 }
 
@@ -307,7 +310,7 @@ fn bootstrap_via_invite(base_secs: u64, via_url: bool) -> Result<InviteBootstrap
     let bob = actor(12);
 
     let mut invite_ctx = context(100, base_secs);
-    let mut owned_invite = Invite::create_new(&mut invite_ctx, alice.owner_pubkey, None)?;
+    let mut owned_invite = Invite::create_new(&mut invite_ctx, alice.device_pubkey, None, None)?;
 
     let public_invite = if via_url {
         public_invite_via_url(&owned_invite)?
@@ -346,7 +349,7 @@ pub fn invite_response_fixture(
     let bob = actor(52);
 
     let mut invite_ctx = context(300, base_secs);
-    let owned_invite = Invite::create_new(&mut invite_ctx, alice.owner_pubkey, max_uses)?;
+    let owned_invite = Invite::create_new(&mut invite_ctx, alice.device_pubkey, None, max_uses)?;
     let public_invite = public_invite_via_url(&owned_invite)?;
 
     let mut accept_ctx = context(301, base_secs + 1);
@@ -549,7 +552,7 @@ fn build_invite_payload_ciphertext(
 ) -> Result<String> {
     let dh_encrypted = nip44::encrypt(
         &SecretKey::from_slice(&invitee.secret_key).unwrap(),
-        &nostr_pubkey(invite.inviter.as_device()),
+        &nostr_pubkey(invite.inviter_device_pubkey),
         payload_json,
         Version::V2,
     )?;
@@ -564,6 +567,10 @@ fn nostr_pubkey(pubkey: DevicePubkey) -> PublicKey {
 
 fn codec_error(error: nostr::event::unsigned::Error) -> nostr_double_ratchet::Error {
     nostr_double_ratchet::Error::Parse(error.to_string())
+}
+
+pub fn provisional_owner_pubkey(device_pubkey: DevicePubkey) -> OwnerPubkey {
+    OwnerPubkey::from_bytes(device_pubkey.to_bytes())
 }
 
 pub trait SessionManagerCompatExt {

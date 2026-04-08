@@ -96,8 +96,8 @@ pub fn parse_message_event(event: &Event) -> Result<MessageEnvelope> {
 pub fn invite_url(invite: &Invite, root: &str) -> Result<String> {
     let mut data = serde_json::Map::new();
     data.insert(
-        "inviter".to_string(),
-        serde_json::Value::String(invite.inviter.to_string()),
+        "inviterDevice".to_string(),
+        serde_json::Value::String(invite.inviter_device_pubkey.to_string()),
     );
     data.insert(
         "ephemeralKey".to_string(),
@@ -111,7 +111,7 @@ pub fn invite_url(invite: &Invite, root: &str) -> Result<String> {
         "createdAt".to_string(),
         serde_json::Value::Number(serde_json::Number::from(invite.created_at.get())),
     );
-    if let Some(owner) = invite.owner_public_key {
+    if let Some(owner) = invite.inviter_owner_pubkey {
         data.insert(
             "owner".to_string(),
             serde_json::Value::String(owner.to_string()),
@@ -132,10 +132,11 @@ pub fn parse_invite_url(url: &str) -> Result<Invite> {
     let decoded = urlencoding::decode(hash).map_err(|e| Error::InvalidEvent(e.to_string()))?;
     let data: serde_json::Value = serde_json::from_str(&decoded)?;
 
-    let inviter = parse_owner_pubkey(
-        data["inviter"]
-            .as_str()
-            .ok_or_else(|| Error::InvalidEvent("missing inviter".to_string()))?,
+    let inviter_device_pubkey = parse_device_pubkey(
+        data.get("inviterDevice")
+            .and_then(|value| value.as_str())
+            .or_else(|| data.get("inviter").and_then(|value| value.as_str()))
+            .ok_or_else(|| Error::InvalidEvent("missing inviterDevice".to_string()))?,
     )?;
     let inviter_ephemeral_public_key = parse_device_pubkey(
         data["ephemeralKey"]
@@ -149,20 +150,19 @@ pub fn parse_invite_url(url: &str) -> Result<Invite> {
     )?;
 
     Ok(Invite {
+        inviter_device_pubkey,
         inviter_ephemeral_public_key,
         shared_secret,
-        inviter,
         inviter_ephemeral_private_key: None,
         max_uses: None,
         used_by: Vec::new(),
         created_at: UnixSeconds(data["createdAt"].as_u64().unwrap_or(0)),
-        owner_public_key: data["owner"].as_str().map(parse_owner_pubkey).transpose()?,
+        inviter_owner_pubkey: data["owner"].as_str().map(parse_owner_pubkey).transpose()?,
     })
 }
 
 pub fn invite_unsigned_event(invite: &Invite) -> Result<UnsignedEvent> {
-    let inviter_device_pubkey = invite.inviter.as_device();
-    let author = invite.owner_public_key.unwrap_or(invite.inviter);
+    let inviter_device_pubkey = invite.inviter_device_pubkey;
     let mut builder = EventBuilder::new(Kind::from(INVITE_EVENT_KIND as u16), "")
         .tag(tag([
             "ephemeralKey",
@@ -176,40 +176,39 @@ pub fn invite_unsigned_event(invite: &Invite) -> Result<UnsignedEvent> {
         .tag(tag(["l", INVITE_LIST_LABEL])?)
         .custom_created_at(Timestamp::from(invite.created_at.get()));
 
-    if let Some(owner_public_key) = invite.owner_public_key {
-        builder = builder.tag(tag(["ownerPublicKey", &owner_public_key.to_string()])?);
+    if let Some(inviter_owner_pubkey) = invite.inviter_owner_pubkey {
+        builder = builder.tag(tag(["ownerPublicKey", &inviter_owner_pubkey.to_string()])?);
     }
 
-    Ok(builder.build(public_key(author.as_device())?))
+    Ok(builder.build(public_key(inviter_device_pubkey)?))
 }
 
 pub fn parse_invite_event(event: &Event) -> Result<Invite> {
     verify_event_kind(event, INVITE_EVENT_KIND)?;
     event.verify()?;
 
-    let inviter = parse_invite_d_tag(&required_tag_value(event, "d")?)?.as_owner();
-    let owner_public_key = optional_tag_value(event, "ownerPublicKey")
+    let inviter_device_pubkey = parse_invite_d_tag(&required_tag_value(event, "d")?)?;
+    let inviter_owner_pubkey = optional_tag_value(event, "ownerPublicKey")
         .map(|value| parse_owner_pubkey(&value))
         .transpose()?;
-    let expected_author = owner_public_key.unwrap_or(inviter);
-    if event.pubkey.to_bytes() != expected_author.as_device().to_bytes() {
+    if event.pubkey.to_bytes() != inviter_device_pubkey.to_bytes() {
         return Err(Error::InvalidEvent(
-            "invite event author does not match claimed owner".to_string(),
+            "invite event author does not match inviter device".to_string(),
         ));
     }
 
     Ok(Invite {
+        inviter_device_pubkey,
         inviter_ephemeral_public_key: parse_device_pubkey(&required_tag_value(
             event,
             "ephemeralKey",
         )?)?,
         shared_secret: parse_hex_32(&required_tag_value(event, "sharedSecret")?)?,
-        inviter,
         inviter_ephemeral_private_key: None,
         max_uses: None,
         used_by: Vec::new(),
         created_at: UnixSeconds(event.created_at.as_u64()),
-        owner_public_key,
+        inviter_owner_pubkey,
     })
 }
 
@@ -265,7 +264,7 @@ pub fn roster_unsigned_event(
         ])?);
     }
 
-    Ok(builder.build(public_key(owner_pubkey.as_device())?))
+    Ok(builder.build(owner_public_key(owner_pubkey)?))
 }
 
 pub fn parse_roster_event(event: &Event) -> Result<DecodedRosterEvent> {
@@ -361,6 +360,10 @@ fn public_key(device_pubkey: DevicePubkey) -> Result<nostr::PublicKey> {
     Ok(nostr::PublicKey::from_slice(&device_pubkey.to_bytes())?)
 }
 
+fn owner_public_key(owner_pubkey: OwnerPubkey) -> Result<nostr::PublicKey> {
+    Ok(nostr::PublicKey::from_slice(&owner_pubkey.to_bytes())?)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LegacyEncryptedRosterLabels {
     #[serde(rename = "type")]
@@ -438,32 +441,55 @@ mod tests {
     #[test]
     fn invite_url_and_event_roundtrip() {
         let owner_secret = [31u8; 32];
-        let owner_pubkey = DevicePubkey::from_bytes(
+        let owner_pubkey = OwnerPubkey::from_bytes(
             Keys::new(secret_key_from_bytes(&owner_secret).unwrap())
                 .public_key()
                 .to_bytes(),
-        )
-        .as_owner();
+        );
+        let signer_secret = [32u8; 32];
+        let inviter_device_pubkey = DevicePubkey::from_bytes(
+            Keys::new(secret_key_from_bytes(&signer_secret).unwrap())
+                .public_key()
+                .to_bytes(),
+        );
         let invite = Invite {
+            inviter_device_pubkey,
             inviter_ephemeral_public_key: DevicePubkey::from_bytes([9u8; 32]),
             shared_secret: [7u8; 32],
-            inviter: owner_pubkey,
             inviter_ephemeral_private_key: Some([8u8; 32]),
             max_uses: None,
             used_by: Vec::new(),
             created_at: UnixSeconds(22),
-            owner_public_key: Some(owner_pubkey),
+            inviter_owner_pubkey: Some(owner_pubkey),
         };
 
         let url = invite_url(&invite, "https://chat.iris.to").unwrap();
         let parsed_from_url = parse_invite_url(&url).unwrap();
-        assert_eq!(parsed_from_url.inviter, invite.inviter);
+        assert_eq!(
+            parsed_from_url.inviter_device_pubkey,
+            invite.inviter_device_pubkey
+        );
+        assert_eq!(
+            parsed_from_url.inviter_owner_pubkey,
+            invite.inviter_owner_pubkey
+        );
 
         let unsigned = invite_unsigned_event(&invite).unwrap();
-        let keys = Keys::new(secret_key_from_bytes(&owner_secret).unwrap());
+        let keys = Keys::new(secret_key_from_bytes(&signer_secret).unwrap());
+        assert_eq!(
+            keys.public_key().to_bytes(),
+            inviter_device_pubkey.to_bytes()
+        );
         let signed = unsigned.sign_with_keys(&keys).unwrap();
         let parsed_from_event = parse_invite_event(&signed).unwrap();
-        assert_eq!(parsed_from_event.inviter, invite.inviter);
+        assert_eq!(
+            parsed_from_event.inviter_device_pubkey,
+            invite.inviter_device_pubkey
+        );
+        assert_eq!(
+            parsed_from_event.inviter_owner_pubkey,
+            invite.inviter_owner_pubkey
+        );
     }
 
     #[test]
@@ -493,14 +519,83 @@ mod tests {
     }
 
     #[test]
-    fn roster_event_roundtrip() {
-        let owner_secret = [41u8; 32];
-        let owner = DevicePubkey::from_bytes(
+    fn invite_event_requires_device_author() {
+        let owner_secret = [31u8; 32];
+        let owner_pubkey = OwnerPubkey::from_bytes(
             Keys::new(secret_key_from_bytes(&owner_secret).unwrap())
                 .public_key()
                 .to_bytes(),
-        )
-        .as_owner();
+        );
+        let device_secret = [32u8; 32];
+        let inviter_device_pubkey = DevicePubkey::from_bytes(
+            Keys::new(secret_key_from_bytes(&device_secret).unwrap())
+                .public_key()
+                .to_bytes(),
+        );
+        let invite = Invite {
+            inviter_device_pubkey,
+            inviter_ephemeral_public_key: DevicePubkey::from_bytes([9u8; 32]),
+            shared_secret: [7u8; 32],
+            inviter_ephemeral_private_key: Some([8u8; 32]),
+            max_uses: None,
+            used_by: Vec::new(),
+            created_at: UnixSeconds(22),
+            inviter_owner_pubkey: Some(owner_pubkey),
+        };
+
+        let unsigned = invite_unsigned_event(&invite).unwrap();
+        let owner_keys = Keys::new(secret_key_from_bytes(&owner_secret).unwrap());
+        let signed = unsigned.sign_with_keys(&owner_keys).unwrap();
+        assert!(parse_invite_event(&signed).is_err());
+    }
+
+    #[test]
+    fn parse_invite_url_accepts_legacy_inviter_field() {
+        let owner_secret = [33u8; 32];
+        let owner_pubkey = OwnerPubkey::from_bytes(
+            Keys::new(secret_key_from_bytes(&owner_secret).unwrap())
+                .public_key()
+                .to_bytes(),
+        );
+        let inviter_secret = [34u8; 32];
+        let inviter_device_pubkey = DevicePubkey::from_bytes(
+            Keys::new(secret_key_from_bytes(&inviter_secret).unwrap())
+                .public_key()
+                .to_bytes(),
+        );
+        let ephemeral_secret = [35u8; 32];
+        let ephemeral_pubkey = DevicePubkey::from_bytes(
+            Keys::new(secret_key_from_bytes(&ephemeral_secret).unwrap())
+                .public_key()
+                .to_bytes(),
+        );
+        let legacy_url = format!(
+            "https://chat.iris.to#{}",
+            urlencoding::encode(
+                &serde_json::json!({
+                    "inviter": inviter_device_pubkey.to_string(),
+                    "ephemeralKey": ephemeral_pubkey.to_string(),
+                    "sharedSecret": hex::encode([7u8; 32]),
+                    "createdAt": 22,
+                    "owner": owner_pubkey.to_string(),
+                })
+                .to_string()
+            )
+        );
+
+        let invite = parse_invite_url(&legacy_url).unwrap();
+        assert_eq!(invite.inviter_device_pubkey, inviter_device_pubkey);
+        assert_eq!(invite.inviter_owner_pubkey, Some(owner_pubkey));
+    }
+
+    #[test]
+    fn roster_event_roundtrip() {
+        let owner_secret = [41u8; 32];
+        let owner = OwnerPubkey::from_bytes(
+            Keys::new(secret_key_from_bytes(&owner_secret).unwrap())
+                .public_key()
+                .to_bytes(),
+        );
         let device_secret = [42u8; 32];
         let device_pubkey = DevicePubkey::from_bytes(
             Keys::new(secret_key_from_bytes(&device_secret).unwrap())

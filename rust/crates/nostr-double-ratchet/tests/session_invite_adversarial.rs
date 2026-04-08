@@ -158,7 +158,7 @@ fn wrong_inviter_private_key_cannot_process_response() -> Result<()> {
     let wrong_alice = actor(35);
 
     let mut invite_ctx = context(11, 1_700_200_600);
-    let mut owned_invite = Invite::create_new(&mut invite_ctx, alice.owner_pubkey, None)?;
+    let mut owned_invite = Invite::create_new(&mut invite_ctx, alice.device_pubkey, None, None)?;
     let public_invite = codec::parse_invite_url(&codec::invite_url(&owned_invite, ROOT_URL)?)?;
 
     let mut accept_ctx = context(12, 1_700_200_601);
@@ -180,7 +180,7 @@ fn tampered_invite_response_is_rejected_and_invite_state_stays_usable() -> Resul
     let bob = actor(37);
 
     let mut invite_ctx = context(14, 1_700_200_700);
-    let mut owned_invite = Invite::create_new(&mut invite_ctx, alice.owner_pubkey, None)?;
+    let mut owned_invite = Invite::create_new(&mut invite_ctx, alice.device_pubkey, None, None)?;
     let public_invite = codec::parse_invite_url(&codec::invite_url(&owned_invite, ROOT_URL)?)?;
 
     let mut accept_ctx = context(15, 1_700_200_701);
@@ -250,7 +250,7 @@ fn public_only_invite_cannot_process_response() -> Result<()> {
     let bob = actor(39);
 
     let mut invite_ctx = context(20, 1_700_200_800);
-    let owned_invite = Invite::create_new(&mut invite_ctx, alice.owner_pubkey, None)?;
+    let owned_invite = Invite::create_new(&mut invite_ctx, alice.device_pubkey, None, None)?;
     let mut public_invite = codec::parse_invite_url(&codec::invite_url(&owned_invite, ROOT_URL)?)?;
 
     let mut accept_ctx = context(21, 1_700_200_801);
@@ -309,7 +309,7 @@ fn forged_owner_claim_without_roster_proof_stays_unverified() -> Result<()> {
     let unrelated = actor(43);
 
     let mut invite_ctx = context(23, 1_700_200_900);
-    let mut owned_invite = Invite::create_new(&mut invite_ctx, alice.owner_pubkey, None)?;
+    let mut owned_invite = Invite::create_new(&mut invite_ctx, alice.device_pubkey, None, None)?;
     let public_invite = codec::parse_invite_url(&codec::invite_url(&owned_invite, ROOT_URL)?)?;
 
     let mut accept_ctx = context(24, 1_700_200_901);
@@ -334,7 +334,10 @@ fn forged_owner_claim_without_roster_proof_stays_unverified() -> Result<()> {
         )],
     );
 
-    assert_eq!(response.resolved_owner_pubkey(), claimed_owner.owner_pubkey);
+    assert_eq!(
+        response.claimed_owner_pubkey(),
+        Some(claimed_owner.owner_pubkey)
+    );
     assert!(!response.has_verified_owner_claim(None));
     assert!(!response.has_verified_owner_claim(Some(&unrelated_roster)));
     Ok(())

@@ -14,6 +14,7 @@ The core crate keeps only:
 - `Session`: low-level device-to-device ratchet
 - `Invite`: low-level bootstrap primitive
 - `SessionManager`: the only high-level multi-device API
+- `RosterEditor`: standalone helper for device-roster CRUD
 - typed ids, rosters, snapshots, explicit errors, and `ProtocolContext`
 
 The core does not expose:
@@ -26,8 +27,8 @@ The core does not expose:
 - group state
 - Nostr event or invite URL codecs
 
-`SessionManager` is the supported application API. `Session` and `Invite` stay public for direct
-device-to-device integrations.
+`SessionManager` is the supported owner/device application API. `Session` and `Invite` stay public
+for direct device-to-device integrations that do not want roster or multi-device orchestration.
 
 ## Architecture
 
@@ -39,6 +40,7 @@ flowchart LR
   Adapter --> Core["nostr-double-ratchet"]
 
   Core --> SM["SessionManager"]
+  Core --> RE["RosterEditor"]
   Core --> Low["Session / Invite"]
   Core --> Types["DeviceRoster / MessageEnvelope / InviteResponseEnvelope / snapshots"]
 
@@ -52,7 +54,8 @@ Apps own transport, persistence, and scheduling.
 
 ```mermaid
 flowchart TD
-  Roster["Observe local and peer rosters"] --> Invite["Observe peer invites"]
+  Edit["Edit full roster snapshot with RosterEditor"] --> Roster["Apply / observe local and peer rosters"]
+  Roster --> Invite["Observe peer invites"]
   Invite --> Prepare["SessionManager.prepare_send(...)"]
   Prepare --> Deliveries["message deliveries"]
   Prepare --> Responses["invite responses"]
@@ -64,6 +67,21 @@ flowchart TD
   Receive --> Parse["adapter parses events"]
   Parse --> Apply["SessionManager.receive(...) / observe_invite_response(...)"]
 ```
+
+## Session vs SessionManager
+
+```mermaid
+flowchart TD
+  A["Use Session + Invite"] --> A1["direct pairwise device-to-device"]
+  B["Use SessionManager"] --> B1["owner/device model"]
+  B1 --> B2["always create a separate local device key"]
+  B2 --> B3["even when the local roster has only one device"]
+```
+
+Recommended rule:
+- direct D2D should use `Session` / `Invite` directly
+- `SessionManager` should always be given a distinct local device secret key
+- device-roster CRUD should happen outside `SessionManager`, then be applied as full snapshots
 
 ## Repository Layout
 
@@ -89,3 +107,7 @@ pnpm -C ts test:once
   workers are built into the core.
 
 See [rust/README.md](./rust/README.md) for the Rust workspace overview.
+See [rust/crates/nostr-double-ratchet/TUTORIAL.md](./rust/crates/nostr-double-ratchet/TUTORIAL.md)
+for the user-facing integration tutorial.
+See [rust/crates/nostr-double-ratchet/ARCHITECTURE.md](./rust/crates/nostr-double-ratchet/ARCHITECTURE.md)
+for the current owner/device architecture and usage flow.
