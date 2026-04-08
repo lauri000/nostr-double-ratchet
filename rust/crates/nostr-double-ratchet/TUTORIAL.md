@@ -15,6 +15,7 @@ It answers four practical questions:
 flowchart TD
   A["Do you need only one pairwise encrypted conversation between devices?"] -->|yes| B["Use Session + Invite"]
   A -->|no, I need owner/device orchestration or future multi-device| C["Use SessionManager + RosterEditor"]
+  C -->|and pairwise-fanout groups| D["Layer GroupManager above SessionManager"]
 ```
 
 - Use `Session` + `Invite` for direct device-to-device encryption.
@@ -22,6 +23,8 @@ flowchart TD
   - one owner identity
   - one or more authorized devices
   - a roster of those devices
+- Use `GroupManager` above `SessionManager` when you want group membership and admin semantics but
+  still want to transport everything over the existing pairwise session layer.
 
 If you choose `SessionManager`, always create a separate device key even if the roster has only one device.
 
@@ -48,6 +51,7 @@ The core crate does:
 
 - manage ratchet state
 - manage owner/device records in `SessionManager`
+- manage pairwise-fanout group state in `GroupManager`
 - build roster snapshots with `RosterEditor`
 - produce `MessageEnvelope`, `Invite`, and `InviteResponseEnvelope`
 
@@ -57,6 +61,7 @@ The core crate does not:
 - publish to relays
 - persist your owner secret
 - decide your UI flow
+- define Nostr event kinds for group payloads in this pass
 
 The Nostr adapter crate does:
 

@@ -20,6 +20,9 @@ pub enum DomainError {
     #[error("invite already used")]
     InviteAlreadyUsed,
 
+    #[error("invalid group operation: {0}")]
+    InvalidGroupOperation(String),
+
     #[error("invalid state: {0}")]
     InvalidState(String),
 }

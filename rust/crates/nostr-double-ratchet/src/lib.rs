@@ -1,4 +1,6 @@
 pub mod error;
+pub mod group;
+pub mod group_manager;
 pub mod ids;
 pub mod invite;
 pub mod roster;
@@ -10,6 +12,11 @@ pub mod types;
 mod utils;
 
 pub use error::{DomainError, Error, Result};
+pub use group::{
+    GroupCreateResult, GroupIncomingEvent, GroupManagerSnapshot, GroupPreparedSend,
+    GroupReceivedMessage, GroupSnapshot,
+};
+pub use group_manager::GroupManager;
 pub use ids::{DevicePubkey, OwnerPubkey, UnixSeconds};
 pub use invite::{Invite, InviteResponse, InviteResponseEnvelope};
 pub use roster::{AuthorizedDevice, DeviceRoster, RosterSnapshotDecision};
@@ -36,6 +43,8 @@ mod architecture_tests {
         const FILES: &[&str] = &[
             include_str!("ids.rs"),
             include_str!("invite.rs"),
+            include_str!("group.rs"),
+            include_str!("group_manager.rs"),
             include_str!("roster.rs"),
             include_str!("roster_editor.rs"),
             include_str!("session.rs"),

@@ -14,6 +14,7 @@ For a user-facing integration guide, start with [./TUTORIAL.md](./TUTORIAL.md).
 - `SessionManager` always creates invites from the local device pubkey and always includes the
   local owner claim.
 - `RosterEditor` stays separate from `SessionManager` and remains the supported roster-CRUD helper.
+- `GroupManager` now sits above `SessionManager` for pairwise-fanout group metadata and chat.
 
 ## Topology
 
@@ -21,6 +22,7 @@ For a user-facing integration guide, start with [./TUTORIAL.md](./TUTORIAL.md).
 flowchart LR
   App["App code"] --> RE["RosterEditor"]
   App --> SM["SessionManager"]
+  App --> GM["GroupManager"]
   App --> D2D["Session + Invite"]
   App --> Adapter["nostr-double-ratchet-nostr"]
 
@@ -29,6 +31,8 @@ flowchart LR
 
   SM --> InviteResponse["InviteResponseEnvelope"]
   SM --> Message["MessageEnvelope"]
+  GM --> GroupPayload["group control / group message payload bytes"]
+  GroupPayload --> SM
   D2D --> Message
 
   Adapter --> Nostr["Nostr events / URLs"]
@@ -50,6 +54,7 @@ Rules:
 
 - `Session` and `Invite` are direct device-to-device primitives.
 - `SessionManager` is the owner/device orchestration layer.
+- `GroupManager` is a separate group-state layer above `SessionManager`.
 - When using `SessionManager`, always generate a separate local device key, even if the roster has
   only one device.
 
@@ -128,6 +133,35 @@ sequenceDiagram
   App->>SM: observe_peer_roster(...) / observe_device_invite(...)
   App->>SM: observe_invite_response(...) / receive(...)
 ```
+
+## GroupManager Flow
+
+```mermaid
+sequenceDiagram
+  participant App
+  participant GM as GroupManager
+  participant SM as SessionManager
+  participant Relay
+
+  App->>GM: create_group / update_name / add_members / send_message
+  GM->>SM: prepare_send(...) once per remote owner
+  SM-->>GM: PreparedSend
+  GM-->>App: GroupPreparedSend
+  App->>Relay: publish deliveries / invite responses
+
+  Relay-->>App: pairwise group payload bytes
+  App->>SM: receive(...)
+  SM-->>App: decrypted payload + sender owner
+  App->>GM: handle_incoming(sender_owner, payload)
+  GM-->>App: MetadataUpdated / Message
+```
+
+Current v1 group rules:
+
+- group membership is in owner pubkeys
+- group control is revision-based
+- admins are enforced in the core crate
+- v1 uses pairwise fanout, not a separate group ratchet or epoch key
 
 ## How To Use It
 

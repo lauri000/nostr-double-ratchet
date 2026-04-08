@@ -10,6 +10,7 @@ storage, or background orchestration.
 High-level API:
 
 - `SessionManager`
+- `GroupManager`
 - `RosterEditor`
 
 Lower-level primitives:
@@ -25,6 +26,7 @@ Core data types:
 - `AuthorizedDevice`
 - `ProtocolContext`
 - `SessionManagerSnapshot`
+- `GroupManagerSnapshot`
 - `SessionState`
 - `DevicePubkey`
 - `OwnerPubkey`
@@ -38,6 +40,8 @@ Core data types:
 - Device authorization is represented by `DeviceRoster`.
 - `SessionManager` owns multi-device Sesame-style state for decentralized relay input, but stays
   pure domain logic.
+- `GroupManager` owns group semantics above `SessionManager` and uses pairwise fanout for v1 group
+  control and group messages.
 - `RosterEditor` is the supported helper for building and editing full roster snapshots outside
   `SessionManager`.
 
@@ -76,6 +80,16 @@ This is snapshot CRUD:
 - remove device = build and publish a newer full roster omitting it
 - `SessionManager` consumes those snapshots with `apply_local_roster(...)` /
   `observe_peer_roster(...)`
+
+## Pairwise-Fanout Groups
+
+Use `GroupManager` above `SessionManager` when you want Signal-shaped group semantics without
+adding a separate group ratchet yet:
+
+- group membership is expressed in owner pubkeys
+- `GroupManager` returns merged `deliveries`, `invite_responses`, and `relay_gaps`
+- `SessionManager` remains pairwise-only and unchanged in role
+- group control and group chat payloads are carried inside ordinary pairwise payload bytes
 
 ## Lower-Level Device-to-Device Usage
 

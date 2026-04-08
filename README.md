@@ -14,6 +14,7 @@ The core crate keeps only:
 - `Session`: low-level device-to-device ratchet
 - `Invite`: low-level bootstrap primitive
 - `SessionManager`: the only high-level multi-device API
+- `GroupManager`: pairwise-fanout group-state layer above `SessionManager`
 - `RosterEditor`: standalone helper for device-roster CRUD
 - typed ids, rosters, snapshots, explicit errors, and `ProtocolContext`
 
@@ -24,11 +25,12 @@ The core does not expose:
 - `AppKeys`
 - `Rumor`
 - `DirectMessageContent`
-- group state
 - Nostr event or invite URL codecs
 
-`SessionManager` is the supported owner/device application API. `Session` and `Invite` stay public
-for direct device-to-device integrations that do not want roster or multi-device orchestration.
+`SessionManager` is the supported owner/device application API. `GroupManager` sits above it when
+you want pairwise-fanout groups without moving group semantics into the app. `Session` and
+`Invite` stay public for direct device-to-device integrations that do not want roster or
+multi-device orchestration.
 
 ## Architecture
 
@@ -40,6 +42,7 @@ flowchart LR
   Adapter --> Core["nostr-double-ratchet"]
 
   Core --> SM["SessionManager"]
+  Core --> GM["GroupManager"]
   Core --> RE["RosterEditor"]
   Core --> Low["Session / Invite"]
   Core --> Types["DeviceRoster / MessageEnvelope / InviteResponseEnvelope / snapshots"]
@@ -57,6 +60,7 @@ flowchart TD
   Edit["Edit full roster snapshot with RosterEditor"] --> Roster["Apply / observe local and peer rosters"]
   Roster --> Invite["Observe peer invites"]
   Invite --> Prepare["SessionManager.prepare_send(...)"]
+  Prepare --> Group["optional GroupManager fanout / handle_incoming"]
   Prepare --> Deliveries["message deliveries"]
   Prepare --> Responses["invite responses"]
   Prepare --> Gaps["relay gaps"]
@@ -74,6 +78,7 @@ flowchart TD
 flowchart TD
   A["Use Session + Invite"] --> A1["direct pairwise device-to-device"]
   B["Use SessionManager"] --> B1["owner/device model"]
+  C["Use GroupManager + SessionManager"] --> C1["pairwise-fanout groups"]
   B1 --> B2["always create a separate local device key"]
   B2 --> B3["even when the local roster has only one device"]
 ```
@@ -81,6 +86,7 @@ flowchart TD
 Recommended rule:
 - direct D2D should use `Session` / `Invite` directly
 - `SessionManager` should always be given a distinct local device secret key
+- `GroupManager` should be layered above `SessionManager`, not inside it
 - device-roster CRUD should happen outside `SessionManager`, then be applied as full snapshots
 
 ## Repository Layout

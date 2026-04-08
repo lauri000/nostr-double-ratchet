@@ -4,12 +4,13 @@ Rust now ships as two crates:
 
 | Crate | Description |
 |---|---|
-| [nostr-double-ratchet](./crates/nostr-double-ratchet) | Domain core with `SessionManager`, `RosterEditor`, `Session`, `Invite`, `DeviceRoster`, and snapshots |
+| [nostr-double-ratchet](./crates/nostr-double-ratchet) | Domain core with `SessionManager`, `GroupManager`, `RosterEditor`, `Session`, `Invite`, `DeviceRoster`, and snapshots |
 | [nostr-double-ratchet-nostr](./crates/nostr-double-ratchet-nostr) | Nostr adapter for events, invite URLs, invite responses, and roster events |
 
 ## Core Rules
 
-- `SessionManager` is the only supported high-level API.
+- `SessionManager` is the owner/device orchestration API.
+- `GroupManager` is the pairwise-fanout group layer above `SessionManager`.
 - `RosterEditor` is the supported roster-CRUD helper outside `SessionManager`.
 - `Session` and `Invite` remain public for lower-level device-to-device usage.
 - The core is synchronous and ownership-driven.
@@ -21,6 +22,7 @@ Rust now ships as two crates:
 Core crate:
 
 - `SessionManager`
+- `GroupManager`
 - `RosterEditor`
 - `Session`
 - `Invite`
@@ -30,6 +32,7 @@ Core crate:
 - `AuthorizedDevice`
 - `ProtocolContext`
 - `SessionManagerSnapshot`
+- `GroupManagerSnapshot`
 - `SessionState`
 
 Adapter crate:
@@ -47,6 +50,7 @@ Adapter crate:
 
 - Use `Session` + `Invite` for direct device-to-device integrations.
 - Use `SessionManager` for owner/device orchestration.
+- Use `GroupManager` on top of `SessionManager` for pairwise-fanout group chat.
 - When using `SessionManager`, always create a separate local device key, even if the roster has only one device.
 - Build and edit the authoritative roster with `RosterEditor`, then apply it with `SessionManager::apply_local_roster(...)`.
 
