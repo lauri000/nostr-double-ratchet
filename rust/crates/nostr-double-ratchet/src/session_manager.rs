@@ -636,8 +636,16 @@ impl SessionManager {
                     user.devices
                         .values()
                         .filter(|record| {
-                            record.claimed_owner_pubkey == Some(owner_pubkey)
-                                && roster_devices.contains(&record.device_pubkey)
+                            if !roster_devices.contains(&record.device_pubkey) {
+                                return false;
+                            }
+                            if record.claimed_owner_pubkey == Some(owner_pubkey) {
+                                return true;
+                            }
+                            user.roster
+                                .as_ref()
+                                .and_then(|roster| roster.get_device(&record.device_pubkey))
+                                .is_none()
                         })
                         .map(|record| record.device_pubkey)
                         .collect::<Vec<_>>()

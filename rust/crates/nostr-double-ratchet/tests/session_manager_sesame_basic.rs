@@ -412,6 +412,42 @@ fn verified_owner_claim_migrates_session_to_claimed_owner() -> Result<()> {
 }
 
 #[test]
+fn verified_roster_migrates_ownerless_provisional_invite_record() -> Result<()> {
+    let alice = manager_device(21, 211);
+    let bob = manager_device(22, 221);
+
+    let mut alice_manager = session_manager(&alice);
+    let mut bob_manager = session_manager(&bob);
+
+    let mut ownerless_invite =
+        manager_public_device_invite(&mut bob_manager, &bob, 85, 1_800_000_850)?;
+    ownerless_invite.inviter_owner_pubkey = None;
+
+    alice_manager.observe_device_invite(
+        provisional_owner_pubkey(bob.device_pubkey),
+        ownerless_invite,
+    )?;
+
+    let provisional_before = alice_manager.snapshot();
+    let provisional_user =
+        manager_user_snapshot(&provisional_before, provisional_owner_pubkey(bob.device_pubkey));
+    let provisional_device = manager_device_snapshot(provisional_user, bob.device_pubkey);
+    assert!(provisional_device.public_invite.is_some());
+
+    alice_manager.observe_peer_roster(bob.owner_pubkey, roster_for(&[&bob], 86));
+
+    let snapshot = alice_manager.snapshot();
+    let verified_user = manager_user_snapshot(&snapshot, bob.owner_pubkey);
+    let verified_device = manager_device_snapshot(verified_user, bob.device_pubkey);
+    assert!(verified_device.public_invite.is_some());
+    assert!(snapshot
+        .users
+        .iter()
+        .all(|user| user.owner_pubkey != provisional_owner_pubkey(bob.device_pubkey)));
+    Ok(())
+}
+
+#[test]
 fn snapshot_is_deterministic_for_users_devices_and_sessions() -> Result<()> {
     let alice1 = manager_device(17, 171);
     let alice2 = manager_device(17, 172);
