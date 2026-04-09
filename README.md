@@ -99,10 +99,16 @@ Recommended rule:
 ## Development
 
 ```bash
-cargo test --manifest-path rust/Cargo.toml
+./scripts/test_fast.sh
+./scripts/test_rust.sh
 cargo clippy --manifest-path rust/Cargo.toml --workspace --tests -- -D warnings
 pnpm -C ts test:once
 ```
+
+Default local gates:
+
+- `./scripts/test_fast.sh`: canonical fast Rust gate
+- `./scripts/test_rust.sh`: explicit full Rust workspace test entrypoint
 
 ## Notes
 
