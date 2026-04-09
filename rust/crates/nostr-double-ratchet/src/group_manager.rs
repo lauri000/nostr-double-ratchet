@@ -45,6 +45,16 @@ pub(crate) enum GroupPairwisePayloadV1 {
         created_at: UnixSeconds,
         updated_at: UnixSeconds,
     },
+    SyncGroup {
+        group_id: String,
+        revision: u64,
+        name: String,
+        created_by: OwnerPubkey,
+        members: Vec<OwnerPubkey>,
+        admins: Vec<OwnerPubkey>,
+        created_at: UnixSeconds,
+        updated_at: UnixSeconds,
+    },
     RenameGroup {
         group_id: String,
         base_revision: u64,
@@ -206,6 +216,7 @@ impl GroupManager {
     {
         let record = self.group_record(group_id)?.clone();
         record.ensure_member(self.local_owner_pubkey)?;
+        let recipients = record.remote_members(self.local_owner_pubkey);
 
         let payload = GroupPairwisePayloadV1::GroupMessage {
             group_id: record.group_id.clone(),
@@ -213,13 +224,35 @@ impl GroupManager {
             body,
         };
 
-        self.fanout_payload(
+        let mut prepared = GroupPreparedSend {
+            group_id: record.group_id.clone(),
+            deliveries: Vec::new(),
+            invite_responses: Vec::new(),
+            relay_gaps: Vec::new(),
+        };
+        if session_manager.snapshot().users.into_iter().any(|user| {
+            user.owner_pubkey == self.local_owner_pubkey
+                && user.devices.iter().any(|device| {
+                    device.device_pubkey != session_manager.snapshot().local_device_pubkey
+                        && device.authorized
+                        && !device.is_stale
+                })
+        }) {
+            // Existing groups need an explicit state sync for newly linked sibling devices.
+            // This is sent only to local siblings, not to remote group members.
+            let bootstrapped = self.local_sibling_sync(session_manager, ctx, &record)?;
+            merge_group_prepared(&mut prepared, bootstrapped);
+        }
+
+        let sent = self.fanout_payload(
             session_manager,
             ctx,
             &record.group_id,
-            record.remote_members(self.local_owner_pubkey),
+            recipients,
             &payload,
-        )
+        )?;
+        merge_group_prepared(&mut prepared, sent);
+        Ok(prepared)
     }
 
     pub fn update_name<R>(
@@ -614,6 +647,42 @@ impl GroupManager {
                     GroupIncomingEvent::MetadataUpdated(snapshot)
                 }
             }
+            GroupPairwisePayloadV1::SyncGroup {
+                group_id,
+                revision,
+                name,
+                created_by,
+                members,
+                admins,
+                created_at,
+                updated_at,
+            } => {
+                let record = GroupRecord::from_sync_payload(
+                    group_id,
+                    name,
+                    created_by,
+                    members,
+                    admins,
+                    revision,
+                    created_at,
+                    updated_at,
+                    sender_owner,
+                    self.local_owner_pubkey,
+                )?;
+                if let Some(existing) = self.groups.get(&record.group_id) {
+                    if existing == &record || existing.revision > record.revision {
+                        GroupIncomingEvent::MetadataUpdated(existing.snapshot())
+                    } else {
+                        let snapshot = record.snapshot();
+                        self.groups.insert(record.group_id.clone(), record);
+                        GroupIncomingEvent::MetadataUpdated(snapshot)
+                    }
+                } else {
+                    let snapshot = record.snapshot();
+                    self.groups.insert(record.group_id.clone(), record);
+                    GroupIncomingEvent::MetadataUpdated(snapshot)
+                }
+            }
             GroupPairwisePayloadV1::RenameGroup {
                 group_id,
                 base_revision,
@@ -711,6 +780,28 @@ impl GroupManager {
         };
 
         Ok(Some(event))
+    }
+
+    fn local_sibling_sync<R>(
+        &mut self,
+        session_manager: &mut SessionManager,
+        ctx: &mut ProtocolContext<'_, R>,
+        record: &GroupRecord,
+    ) -> Result<GroupPreparedSend>
+    where
+        R: RngCore + CryptoRng,
+    {
+        let payload = serde_json::to_vec(&GroupWireEnvelopeV1 {
+            version: 1,
+            payload: record.sync_payload(),
+        })?;
+        let prepared = session_manager.prepare_local_sibling_send(ctx, payload)?;
+        Ok(GroupPreparedSend {
+            group_id: record.group_id.clone(),
+            deliveries: prepared.deliveries,
+            invite_responses: prepared.invite_responses,
+            relay_gaps: prepared.relay_gaps,
+        })
     }
 
     fn fanout_payload<R>(
@@ -815,6 +906,44 @@ impl GroupRecord {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn from_sync_payload(
+        group_id: String,
+        name: String,
+        created_by: OwnerPubkey,
+        members: Vec<OwnerPubkey>,
+        admins: Vec<OwnerPubkey>,
+        revision: u64,
+        created_at: UnixSeconds,
+        updated_at: UnixSeconds,
+        sender_owner: OwnerPubkey,
+        local_owner: OwnerPubkey,
+    ) -> Result<Self> {
+        let member_set = validate_unique_owners(&members, "members")?;
+        let admin_set = validate_unique_owners(&admins, "admins")?;
+        if sender_owner != local_owner {
+            return Err(group_error("sync group sender must match local owner"));
+        }
+        if !member_set.contains(&sender_owner) {
+            return Err(group_error("sync group sender must be a member"));
+        }
+        if revision == 0 {
+            return Err(group_error("sync group revision must be at least 1"));
+        }
+        validate_group_invariants(&member_set, &admin_set)?;
+
+        Ok(Self {
+            group_id,
+            name,
+            created_by,
+            members: member_set,
+            admins: admin_set,
+            revision,
+            created_at,
+            updated_at,
+        })
+    }
+
     fn snapshot(&self) -> GroupSnapshot {
         GroupSnapshot {
             group_id: self.group_id.clone(),
@@ -833,6 +962,19 @@ impl GroupRecord {
             group_id: self.group_id.clone(),
             base_revision: 0,
             new_revision: self.revision,
+            name: self.name.clone(),
+            created_by: self.created_by,
+            members: self.members.iter().copied().collect(),
+            admins: self.admins.iter().copied().collect(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+
+    fn sync_payload(&self) -> GroupPairwisePayloadV1 {
+        GroupPairwisePayloadV1::SyncGroup {
+            group_id: self.group_id.clone(),
+            revision: self.revision,
             name: self.name.clone(),
             created_by: self.created_by,
             members: self.members.iter().copied().collect(),

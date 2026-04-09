@@ -315,6 +315,54 @@ impl SessionManager {
         })
     }
 
+    pub fn prepare_local_sibling_send<R>(
+        &mut self,
+        ctx: &mut ProtocolContext<'_, R>,
+        payload: Vec<u8>,
+    ) -> Result<PreparedSend>
+    where
+        R: RngCore + CryptoRng,
+    {
+        let mut targets = BTreeSet::new();
+        self.collect_local_sibling_targets(&mut targets);
+
+        let mut deliveries = Vec::new();
+        let mut invite_responses = Vec::new();
+        let mut relay_gaps = Vec::new();
+
+        for target in targets {
+            match self.prepare_device_delivery(
+                ctx,
+                target.owner_pubkey,
+                target.device_pubkey,
+                &payload,
+            )? {
+                Some((delivery, maybe_response)) => {
+                    deliveries.push(delivery);
+                    if let Some(response) = maybe_response {
+                        invite_responses.push(response);
+                    }
+                }
+                None => {
+                    relay_gaps.push(RelayGap::MissingDeviceInvite {
+                        owner_pubkey: target.owner_pubkey,
+                        device_pubkey: target.device_pubkey,
+                    });
+                }
+            }
+        }
+
+        relay_gaps.sort();
+
+        Ok(PreparedSend {
+            recipient_owner: self.local_owner_pubkey,
+            payload,
+            deliveries,
+            invite_responses,
+            relay_gaps,
+        })
+    }
+
     pub fn receive<R>(
         &mut self,
         ctx: &mut ProtocolContext<'_, R>,

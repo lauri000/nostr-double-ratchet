@@ -356,17 +356,17 @@ fn create_and_send_message_fan_out_to_remote_member_and_local_sibling() -> Resul
         1_900_000_209,
     )?;
 
-    assert_eq!(alice2_messages.len(), 1);
+    assert_eq!(alice2_messages.len(), 2);
     assert_eq!(bob_messages.len(), 1);
-    match &alice2_messages[0] {
-        GroupIncomingEvent::Message(message) => {
-            assert_eq!(message.group_id, created.group.group_id);
-            assert_eq!(message.sender_owner, alice1.owner_pubkey);
-            assert_eq!(message.body, b"hello-group".to_vec());
-            assert_eq!(message.revision, 1);
-        }
-        other => panic!("expected group message, got {other:?}"),
-    }
+    assert!(matches!(
+        alice2_messages.as_slice(),
+        [GroupIncomingEvent::MetadataUpdated(snapshot), GroupIncomingEvent::Message(message)]
+            if snapshot.group_id == created.group.group_id
+                && message.group_id == created.group.group_id
+                && message.sender_owner == alice1.owner_pubkey
+                && message.body == b"hello-group".to_vec()
+                && message.revision == 1
+    ));
     match &bob_messages[0] {
         GroupIncomingEvent::Message(message) => {
             assert_eq!(message.group_id, created.group.group_id);
@@ -385,6 +385,90 @@ fn create_and_send_message_fan_out_to_remote_member_and_local_sibling() -> Resul
         bob_groups.group(&created.group.group_id).expect("remote member has group").revision,
         1
     );
+    Ok(())
+}
+
+#[test]
+fn send_message_bootstraps_existing_group_to_new_local_sibling() -> Result<()> {
+    let alice1 = manager_device(17, 171);
+    let alice2 = manager_device(17, 172);
+    let bob = manager_device(18, 181);
+
+    let mut alice1_manager = session_manager(&alice1);
+    let mut alice2_manager = session_manager(&alice2);
+    let mut bob_manager = session_manager(&bob);
+
+    let mut alice1_groups = GroupManager::new(alice1.owner_pubkey);
+    let mut alice2_groups = GroupManager::new(alice2.owner_pubkey);
+    let _bob_groups = GroupManager::new(bob.owner_pubkey);
+
+    alice1_manager.apply_local_roster(roster_for(&[&alice1], 70));
+    alice1_manager.observe_peer_roster(bob.owner_pubkey, roster_for(&[&bob], 71));
+    alice1_manager.observe_device_invite(
+        bob.owner_pubkey,
+        manager_public_device_invite(&mut bob_manager, &bob, 72, 1_900_001_300)?,
+    )?;
+
+    let mut create_ctx = context(73, 1_900_001_301);
+    let created = alice1_groups.create_group(
+        &mut alice1_manager,
+        &mut create_ctx,
+        "Late sibling".to_string(),
+        vec![bob.owner_pubkey],
+    )?;
+
+    alice1_manager.apply_local_roster(roster_for(&[&alice1, &alice2], 76));
+    alice2_manager.apply_local_roster(roster_for(&[&alice1, &alice2], 76));
+    alice1_manager.observe_device_invite(
+        alice1.owner_pubkey,
+        manager_public_device_invite(&mut alice2_manager, &alice2, 77, 1_900_001_304)?,
+    )?;
+
+    let mut send_ctx = context(78, 1_900_001_305);
+    let sent = alice1_groups.send_message(
+        &mut alice1_manager,
+        &mut send_ctx,
+        &created.group.group_id,
+        b"hello-late-sibling".to_vec(),
+    )?;
+
+    observe_matching_invite_responses(
+        &mut alice2_manager,
+        &sent.invite_responses,
+        79,
+        1_900_001_306,
+    )?;
+    observe_matching_invite_responses(
+        &mut bob_manager,
+        &sent.invite_responses,
+        80,
+        1_900_001_307,
+    )?;
+    let alice2_events = deliver_group_events(
+        &mut alice2_manager,
+        &mut alice2_groups,
+        alice1.owner_pubkey,
+        &sent,
+        alice2.device_pubkey,
+        81,
+        1_900_001_308,
+    )?;
+    assert_eq!(alice2_events.len(), 2);
+    assert!(matches!(
+        alice2_events.as_slice(),
+        [GroupIncomingEvent::MetadataUpdated(snapshot), GroupIncomingEvent::Message(message)]
+            if snapshot.group_id == created.group.group_id
+                && message.group_id == created.group.group_id
+                && message.body == b"hello-late-sibling".to_vec()
+    ));
+    assert_eq!(
+        alice2_groups
+            .group(&created.group.group_id)
+            .expect("local sibling has group after bootstrap")
+            .revision,
+        1
+    );
+
     Ok(())
 }
 
