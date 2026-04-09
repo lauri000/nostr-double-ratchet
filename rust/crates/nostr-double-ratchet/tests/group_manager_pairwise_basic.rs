@@ -91,6 +91,63 @@ fn create_group_creates_local_state_and_snapshot_roundtrip() -> Result<()> {
 }
 
 #[test]
+fn retry_create_group_reuses_existing_group_id_without_remutating_state() -> Result<()> {
+    let alice = manager_device(15, 151);
+    let bob = manager_device(16, 161);
+
+    let mut alice_manager = session_manager(&alice);
+    let mut bob_manager = session_manager(&bob);
+    let mut alice_groups = GroupManager::new(alice.owner_pubkey);
+    let mut bob_groups = GroupManager::new(bob.owner_pubkey);
+
+    let mut create_ctx = context(17, 1_900_001_100);
+    let created = alice_groups.create_group(
+        &mut alice_manager,
+        &mut create_ctx,
+        "RetryCreate".to_string(),
+        vec![bob.owner_pubkey],
+    )?;
+    assert_eq!(created.prepared.deliveries.len(), 0);
+    assert_eq!(alice_groups.groups().len(), 1);
+
+    bob_manager.observe_peer_roster(alice.owner_pubkey, roster_for(&[&alice], 60));
+    alice_manager.observe_peer_roster(bob.owner_pubkey, roster_for(&[&bob], 61));
+    alice_manager.observe_device_invite(
+        bob.owner_pubkey,
+        manager_public_device_invite(&mut bob_manager, &bob, 18, 1_900_001_101)?,
+    )?;
+
+    let mut retry_ctx = context(19, 1_900_001_102);
+    let retried = alice_groups.retry_create_group(
+        &mut alice_manager,
+        &mut retry_ctx,
+        &created.group.group_id,
+        vec![bob.owner_pubkey],
+    )?;
+
+    assert_eq!(alice_groups.groups().len(), 1);
+    assert_eq!(
+        alice_groups.group(&created.group.group_id).expect("group exists").group_id,
+        created.group.group_id
+    );
+    assert_eq!(retried.group_id, created.group.group_id);
+    assert_eq!(retried.deliveries.len(), 1);
+
+    observe_matching_invite_responses(&mut bob_manager, &retried.invite_responses, 20, 1_900_001_103)?;
+    let events = deliver_group_events(
+        &mut bob_manager,
+        &mut bob_groups,
+        alice.owner_pubkey,
+        &retried,
+        bob.device_pubkey,
+        21,
+        1_900_001_104,
+    )?;
+    assert!(matches!(events.as_slice(), [GroupIncomingEvent::MetadataUpdated(snapshot)] if snapshot.group_id == created.group.group_id));
+    Ok(())
+}
+
+#[test]
 fn add_members_bootstraps_new_member_with_current_group_state() -> Result<()> {
     let alice = manager_device(3, 31);
     let bob = manager_device(4, 41);
@@ -146,6 +203,70 @@ fn add_members_bootstraps_new_member_with_current_group_state() -> Result<()> {
         bob_groups.group(&created.group.group_id).expect("group created on new member").revision,
         2
     );
+    Ok(())
+}
+
+#[test]
+fn retry_add_members_reuses_applied_group_state() -> Result<()> {
+    let alice = manager_device(22, 221);
+    let bob = manager_device(23, 231);
+
+    let mut alice_manager = session_manager(&alice);
+    let mut bob_manager = session_manager(&bob);
+    let mut alice_groups = GroupManager::new(alice.owner_pubkey);
+    let mut bob_groups = GroupManager::new(bob.owner_pubkey);
+
+    let mut create_ctx = context(22, 1_900_001_200);
+    let created =
+        alice_groups.create_group(&mut alice_manager, &mut create_ctx, "RetryAdd".to_string(), vec![])?;
+
+    let mut add_ctx = context(24, 1_900_001_202);
+    let initial = alice_groups.add_members(
+        &mut alice_manager,
+        &mut add_ctx,
+        &created.group.group_id,
+        vec![bob.owner_pubkey],
+    )?;
+    assert!(initial.deliveries.is_empty());
+    assert_eq!(
+        initial.relay_gaps,
+        vec![nostr_double_ratchet::RelayGap::MissingRoster {
+            owner_pubkey: bob.owner_pubkey,
+        }]
+    );
+
+    bob_manager.observe_peer_roster(alice.owner_pubkey, roster_for(&[&alice], 62));
+    alice_manager.observe_peer_roster(bob.owner_pubkey, roster_for(&[&bob], 63));
+    alice_manager.observe_device_invite(
+        bob.owner_pubkey,
+        manager_public_device_invite(&mut bob_manager, &bob, 23, 1_900_001_201)?,
+    )?;
+
+    let mut retry_ctx = context(25, 1_900_001_203);
+    let retried = alice_groups.retry_add_members(
+        &mut alice_manager,
+        &mut retry_ctx,
+        &created.group.group_id,
+        vec![bob.owner_pubkey],
+    )?;
+
+    assert_eq!(
+        alice_groups.group(&created.group.group_id).expect("group exists").revision,
+        2
+    );
+    assert_eq!(retried.deliveries.len(), 1);
+
+    observe_matching_invite_responses(&mut bob_manager, &retried.invite_responses, 26, 1_900_001_204)?;
+    let events = deliver_group_events(
+        &mut bob_manager,
+        &mut bob_groups,
+        alice.owner_pubkey,
+        &retried,
+        bob.device_pubkey,
+        27,
+        1_900_001_205,
+    )?;
+    assert!(matches!(events.as_slice(), [GroupIncomingEvent::MetadataUpdated(snapshot)] if snapshot.revision == 2));
     Ok(())
 }
 

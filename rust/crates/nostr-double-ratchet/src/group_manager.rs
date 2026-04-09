@@ -13,7 +13,7 @@ pub struct GroupManager {
     groups: BTreeMap<String, GroupRecord>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct GroupRecord {
     group_id: String,
     name: String,
@@ -164,6 +164,36 @@ impl GroupManager {
         })
     }
 
+    pub fn retry_create_group<R>(
+        &mut self,
+        session_manager: &mut SessionManager,
+        ctx: &mut ProtocolContext<'_, R>,
+        group_id: &str,
+        recipients: Vec<OwnerPubkey>,
+    ) -> Result<GroupPreparedSend>
+    where
+        R: RngCore + CryptoRng,
+    {
+        let record = self.group_record(group_id)?.clone();
+        record.ensure_admin(self.local_owner_pubkey)?;
+
+        let recipients = validate_unique_owners(&recipients, "recipients")?
+            .into_iter()
+            .filter(|owner| *owner != self.local_owner_pubkey)
+            .collect::<Vec<_>>();
+        for recipient in &recipients {
+            record.ensure_member(*recipient)?;
+        }
+
+        self.fanout_payload(
+            session_manager,
+            ctx,
+            &record.group_id,
+            recipients,
+            &record.create_payload(),
+        )
+    }
+
     pub fn send_message<R>(
         &mut self,
         session_manager: &mut SessionManager,
@@ -222,6 +252,35 @@ impl GroupManager {
         )?;
         self.groups.insert(current.group_id.clone(), next);
         Ok(prepared)
+    }
+
+    pub fn retry_update_name<R>(
+        &mut self,
+        session_manager: &mut SessionManager,
+        ctx: &mut ProtocolContext<'_, R>,
+        group_id: &str,
+    ) -> Result<GroupPreparedSend>
+    where
+        R: RngCore + CryptoRng,
+    {
+        let current = self.group_record(group_id)?.clone();
+        current.ensure_admin(self.local_owner_pubkey)?;
+        let (base_revision, new_revision) = current.retry_delta_revisions("rename")?;
+
+        let payload = GroupPairwisePayloadV1::RenameGroup {
+            group_id: current.group_id.clone(),
+            base_revision,
+            new_revision,
+            name: current.name.clone(),
+        };
+
+        self.fanout_payload(
+            session_manager,
+            ctx,
+            &current.group_id,
+            current.remote_members(self.local_owner_pubkey),
+            &payload,
+        )
     }
 
     pub fn add_members<R>(
@@ -284,6 +343,61 @@ impl GroupManager {
         Ok(prepared)
     }
 
+    pub fn retry_add_members<R>(
+        &mut self,
+        session_manager: &mut SessionManager,
+        ctx: &mut ProtocolContext<'_, R>,
+        group_id: &str,
+        members: Vec<OwnerPubkey>,
+    ) -> Result<GroupPreparedSend>
+    where
+        R: RngCore + CryptoRng,
+    {
+        let additions = validate_unique_owners(&members, "members")?;
+        let current = self.group_record(group_id)?.clone();
+        current.ensure_admin(self.local_owner_pubkey)?;
+        let (base_revision, new_revision) = current.retry_delta_revisions("add members")?;
+        for owner in &additions {
+            current.ensure_member(*owner)?;
+        }
+
+        let delta_payload = GroupPairwisePayloadV1::AddMembers {
+            group_id: current.group_id.clone(),
+            base_revision,
+            new_revision,
+            members: additions.iter().copied().collect(),
+        };
+        let bootstrap_payload = current.create_payload();
+
+        let existing_recipients: Vec<_> = current
+            .remote_members(self.local_owner_pubkey)
+            .into_iter()
+            .filter(|owner| !additions.contains(owner))
+            .collect();
+        let new_recipients: Vec<_> = additions
+            .iter()
+            .copied()
+            .filter(|owner| *owner != self.local_owner_pubkey)
+            .collect();
+
+        let mut prepared = self.fanout_payload(
+            session_manager,
+            ctx,
+            &current.group_id,
+            existing_recipients,
+            &delta_payload,
+        )?;
+        let bootstrapped = self.fanout_payload(
+            session_manager,
+            ctx,
+            &current.group_id,
+            new_recipients,
+            &bootstrap_payload,
+        )?;
+        merge_group_prepared(&mut prepared, bootstrapped);
+        Ok(prepared)
+    }
+
     pub fn remove_members<R>(
         &mut self,
         session_manager: &mut SessionManager,
@@ -321,6 +435,55 @@ impl GroupManager {
         )?;
         self.groups.insert(current.group_id.clone(), next);
         Ok(prepared)
+    }
+
+    pub fn retry_remove_members<R>(
+        &mut self,
+        session_manager: &mut SessionManager,
+        ctx: &mut ProtocolContext<'_, R>,
+        group_id: &str,
+        members: Vec<OwnerPubkey>,
+    ) -> Result<GroupPreparedSend>
+    where
+        R: RngCore + CryptoRng,
+    {
+        let removals = validate_unique_owners(&members, "members")?;
+        let current = self.group_record(group_id)?.clone();
+        current.ensure_admin(self.local_owner_pubkey)?;
+        let (base_revision, new_revision) = current.retry_delta_revisions("remove members")?;
+        for owner in &removals {
+            if current.members.contains(owner) {
+                return Err(group_error(format!(
+                    "owner {owner} should already be removed before retrying removal"
+                )));
+            }
+        }
+
+        let payload = GroupPairwisePayloadV1::RemoveMembers {
+            group_id: current.group_id.clone(),
+            base_revision,
+            new_revision,
+            members: removals.iter().copied().collect(),
+        };
+
+        let mut recipients = current
+            .remote_members(self.local_owner_pubkey)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        recipients.extend(
+            removals
+                .iter()
+                .copied()
+                .filter(|owner| *owner != self.local_owner_pubkey),
+        );
+
+        self.fanout_payload(
+            session_manager,
+            ctx,
+            &current.group_id,
+            recipients.into_iter().collect(),
+            &payload,
+        )
     }
 
     pub fn add_admins<R>(
@@ -425,12 +588,6 @@ impl GroupManager {
                 created_at,
                 updated_at,
             } => {
-                if self.groups.contains_key(&group_id) {
-                    return Err(group_error(format!("group `{group_id}` already exists")));
-                }
-                if base_revision != 0 {
-                    return Err(group_error("create group base revision must be 0"));
-                }
                 let record = GroupRecord::from_create_payload(
                     group_id,
                     name,
@@ -442,9 +599,20 @@ impl GroupManager {
                     updated_at,
                     sender_owner,
                 )?;
-                let snapshot = record.snapshot();
-                self.groups.insert(record.group_id.clone(), record);
-                GroupIncomingEvent::MetadataUpdated(snapshot)
+                if let Some(existing) = self.groups.get(&record.group_id) {
+                    if existing == &record {
+                        GroupIncomingEvent::MetadataUpdated(existing.snapshot())
+                    } else {
+                        return Err(group_error(format!("group `{}` already exists", record.group_id)));
+                    }
+                } else {
+                    if base_revision != 0 {
+                        return Err(group_error("create group base revision must be 0"));
+                    }
+                    let snapshot = record.snapshot();
+                    self.groups.insert(record.group_id.clone(), record);
+                    GroupIncomingEvent::MetadataUpdated(snapshot)
+                }
             }
             GroupPairwisePayloadV1::RenameGroup {
                 group_id,
@@ -453,8 +621,12 @@ impl GroupManager {
                 name,
             } => {
                 let group = self.group_record_mut(&group_id)?;
-                group.apply_rename(sender_owner, name, base_revision, new_revision, group.updated_at)?;
-                GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                if group.reflects_rename(&name, new_revision) {
+                    GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                } else {
+                    group.apply_rename(sender_owner, name, base_revision, new_revision, group.updated_at)?;
+                    GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                }
             }
             GroupPairwisePayloadV1::AddMembers {
                 group_id,
@@ -464,8 +636,12 @@ impl GroupManager {
             } => {
                 let additions = validate_unique_owners(&members, "members")?;
                 let group = self.group_record_mut(&group_id)?;
-                group.apply_add_members(sender_owner, &additions, base_revision, new_revision, group.updated_at)?;
-                GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                if group.reflects_added_members(&additions, new_revision) {
+                    GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                } else {
+                    group.apply_add_members(sender_owner, &additions, base_revision, new_revision, group.updated_at)?;
+                    GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                }
             }
             GroupPairwisePayloadV1::RemoveMembers {
                 group_id,
@@ -475,8 +651,12 @@ impl GroupManager {
             } => {
                 let removals = validate_unique_owners(&members, "members")?;
                 let group = self.group_record_mut(&group_id)?;
-                group.apply_remove_members(sender_owner, &removals, base_revision, new_revision, group.updated_at)?;
-                GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                if group.reflects_removed_members(&removals, new_revision) {
+                    GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                } else {
+                    group.apply_remove_members(sender_owner, &removals, base_revision, new_revision, group.updated_at)?;
+                    GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                }
             }
             GroupPairwisePayloadV1::AddAdmins {
                 group_id,
@@ -486,8 +666,12 @@ impl GroupManager {
             } => {
                 let additions = validate_unique_owners(&admins, "admins")?;
                 let group = self.group_record_mut(&group_id)?;
-                group.apply_add_admins(sender_owner, &additions, base_revision, new_revision, group.updated_at)?;
-                GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                if group.reflects_added_admins(&additions, new_revision) {
+                    GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                } else {
+                    group.apply_add_admins(sender_owner, &additions, base_revision, new_revision, group.updated_at)?;
+                    GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                }
             }
             GroupPairwisePayloadV1::RemoveAdmins {
                 group_id,
@@ -497,8 +681,12 @@ impl GroupManager {
             } => {
                 let removals = validate_unique_owners(&admins, "admins")?;
                 let group = self.group_record_mut(&group_id)?;
-                group.apply_remove_admins(sender_owner, &removals, base_revision, new_revision, group.updated_at)?;
-                GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                if group.reflects_removed_admins(&removals, new_revision) {
+                    GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                } else {
+                    group.apply_remove_admins(sender_owner, &removals, base_revision, new_revision, group.updated_at)?;
+                    GroupIncomingEvent::MetadataUpdated(group.snapshot())
+                }
             }
             GroupPairwisePayloadV1::GroupMessage {
                 group_id,
@@ -698,6 +886,51 @@ impl GroupRecord {
             )));
         }
         Ok(())
+    }
+
+    fn retry_delta_revisions(&self, action: &str) -> Result<(u64, u64)> {
+        if self.revision < 2 {
+            return Err(group_error(format!(
+                "{action} retry requires an already-applied revision"
+            )));
+        }
+        Ok((self.revision - 1, self.revision))
+    }
+
+    fn reflects_rename(&self, name: &str, new_revision: u64) -> bool {
+        self.revision >= new_revision && self.name == name
+    }
+
+    fn reflects_added_members(
+        &self,
+        additions: &BTreeSet<OwnerPubkey>,
+        new_revision: u64,
+    ) -> bool {
+        self.revision >= new_revision && additions.iter().all(|owner| self.members.contains(owner))
+    }
+
+    fn reflects_removed_members(
+        &self,
+        removals: &BTreeSet<OwnerPubkey>,
+        new_revision: u64,
+    ) -> bool {
+        self.revision >= new_revision && removals.iter().all(|owner| !self.members.contains(owner))
+    }
+
+    fn reflects_added_admins(
+        &self,
+        additions: &BTreeSet<OwnerPubkey>,
+        new_revision: u64,
+    ) -> bool {
+        self.revision >= new_revision && additions.iter().all(|owner| self.admins.contains(owner))
+    }
+
+    fn reflects_removed_admins(
+        &self,
+        removals: &BTreeSet<OwnerPubkey>,
+        new_revision: u64,
+    ) -> bool {
+        self.revision >= new_revision && removals.iter().all(|owner| !self.admins.contains(owner))
     }
 
     fn apply_rename(

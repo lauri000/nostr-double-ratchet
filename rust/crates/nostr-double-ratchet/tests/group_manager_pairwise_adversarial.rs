@@ -172,7 +172,7 @@ fn incoming_control_from_non_admin_and_wrong_revision_message_are_rejected() -> 
 }
 
 #[test]
-fn duplicate_create_and_unknown_group_message_are_rejected() -> Result<()> {
+fn duplicate_create_is_idempotent_and_unknown_group_message_is_rejected() -> Result<()> {
     let alice = manager_device(11, 111);
     let bob = manager_device(12, 121);
     let (mut groups, _group_id) = create_remote_owned_group(alice.owner_pubkey, bob.owner_pubkey)?;
@@ -192,12 +192,8 @@ fn duplicate_create_and_unknown_group_message_are_rejected() -> Result<()> {
             "updated_at": 1_900_001_000u64
         }
     }))?;
-    let duplicate = groups.handle_incoming(bob.owner_pubkey, &duplicate_create);
-    assert!(matches!(
-        duplicate,
-        Err(Error::Domain(DomainError::InvalidGroupOperation(message)))
-            if message.contains("already exists")
-    ));
+    let duplicate = groups.handle_incoming(bob.owner_pubkey, &duplicate_create)?;
+    assert!(matches!(duplicate, Some(GroupIncomingEvent::MetadataUpdated(snapshot)) if snapshot.group_id == "group-1"));
 
     let unknown_message = serde_json::to_vec(&serde_json::json!({
         "version": 1,
@@ -214,6 +210,31 @@ fn duplicate_create_and_unknown_group_message_are_rejected() -> Result<()> {
         Err(Error::Domain(DomainError::InvalidGroupOperation(message)))
             if message.contains("unknown group")
     ));
+    Ok(())
+}
+
+#[test]
+fn duplicate_rename_is_idempotent() -> Result<()> {
+    let alice = manager_device(15, 151);
+    let bob = manager_device(16, 161);
+    let (mut groups, group_id) = create_remote_owned_group(alice.owner_pubkey, bob.owner_pubkey)?;
+
+    let rename = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "payload": {
+            "kind": "rename_group",
+            "group_id": group_id,
+            "base_revision": 1,
+            "new_revision": 2,
+            "name": "Renamed"
+        }
+    }))?;
+
+    let first = groups.handle_incoming(bob.owner_pubkey, &rename)?;
+    let second = groups.handle_incoming(bob.owner_pubkey, &rename)?;
+
+    assert!(matches!(first, Some(GroupIncomingEvent::MetadataUpdated(snapshot)) if snapshot.revision == 2 && snapshot.name == "Renamed"));
+    assert!(matches!(second, Some(GroupIncomingEvent::MetadataUpdated(snapshot)) if snapshot.revision == 2 && snapshot.name == "Renamed"));
     Ok(())
 }
 
