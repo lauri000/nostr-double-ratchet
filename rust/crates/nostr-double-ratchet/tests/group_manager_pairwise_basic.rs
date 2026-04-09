@@ -27,6 +27,21 @@ fn observe_matching_invite_responses(
     Ok(())
 }
 
+fn observe_matching_group_invite_responses(
+    manager: &mut nostr_double_ratchet::SessionManager,
+    prepared: &GroupPreparedSend,
+    seed: u64,
+    now_secs: u64,
+) -> Result<()> {
+    observe_matching_invite_responses(manager, &prepared.remote.invite_responses, seed, now_secs)?;
+    observe_matching_invite_responses(
+        manager,
+        &prepared.local_sibling.invite_responses,
+        seed,
+        now_secs,
+    )
+}
+
 fn deliver_group_events(
     manager: &mut nostr_double_ratchet::SessionManager,
     groups: &mut GroupManager,
@@ -40,8 +55,10 @@ fn deliver_group_events(
     let mut events = Vec::new();
 
     for delivery in prepared
+        .remote
         .deliveries
         .iter()
+        .chain(prepared.local_sibling.deliveries.iter())
         .filter(|delivery| delivery.device_pubkey == target_device)
     {
         if let Some(received) =
@@ -75,7 +92,7 @@ fn create_group_creates_local_state_and_snapshot_roundtrip() -> Result<()> {
     assert_eq!(created.group.revision, 1);
     assert_eq!(created.prepared.group_id, created.group.group_id);
     assert_eq!(
-        created.prepared.relay_gaps,
+        created.prepared.remote.relay_gaps,
         vec![nostr_double_ratchet::RelayGap::MissingRoster {
             owner_pubkey: bob.owner_pubkey,
         }]
@@ -107,7 +124,7 @@ fn retry_create_group_reuses_existing_group_id_without_remutating_state() -> Res
         "RetryCreate".to_string(),
         vec![bob.owner_pubkey],
     )?;
-    assert_eq!(created.prepared.deliveries.len(), 0);
+    assert_eq!(created.prepared.remote.deliveries.len(), 0);
     assert_eq!(alice_groups.groups().len(), 1);
 
     bob_manager.observe_peer_roster(alice.owner_pubkey, roster_for(&[&alice], 60));
@@ -131,9 +148,9 @@ fn retry_create_group_reuses_existing_group_id_without_remutating_state() -> Res
         created.group.group_id
     );
     assert_eq!(retried.group_id, created.group.group_id);
-    assert_eq!(retried.deliveries.len(), 1);
+    assert_eq!(retried.remote.deliveries.len(), 1);
 
-    observe_matching_invite_responses(&mut bob_manager, &retried.invite_responses, 20, 1_900_001_103)?;
+    observe_matching_group_invite_responses(&mut bob_manager, &retried, 20, 1_900_001_103)?;
     let events = deliver_group_events(
         &mut bob_manager,
         &mut bob_groups,
@@ -172,7 +189,7 @@ fn add_members_bootstraps_new_member_with_current_group_state() -> Result<()> {
     let prepared =
         alice_groups.add_members(&mut alice_manager, &mut add_ctx, &created.group.group_id, vec![bob.owner_pubkey])?;
 
-    observe_matching_invite_responses(&mut bob_manager, &prepared.invite_responses, 5, 1_900_000_103)?;
+    observe_matching_group_invite_responses(&mut bob_manager, &prepared, 5, 1_900_000_103)?;
     let events = deliver_group_events(
         &mut bob_manager,
         &mut bob_groups,
@@ -227,9 +244,9 @@ fn retry_add_members_reuses_applied_group_state() -> Result<()> {
         &created.group.group_id,
         vec![bob.owner_pubkey],
     )?;
-    assert!(initial.deliveries.is_empty());
+    assert!(initial.remote.deliveries.is_empty());
     assert_eq!(
-        initial.relay_gaps,
+        initial.remote.relay_gaps,
         vec![nostr_double_ratchet::RelayGap::MissingRoster {
             owner_pubkey: bob.owner_pubkey,
         }]
@@ -254,9 +271,9 @@ fn retry_add_members_reuses_applied_group_state() -> Result<()> {
         alice_groups.group(&created.group.group_id).expect("group exists").revision,
         2
     );
-    assert_eq!(retried.deliveries.len(), 1);
+    assert_eq!(retried.remote.deliveries.len(), 1);
 
-    observe_matching_invite_responses(&mut bob_manager, &retried.invite_responses, 26, 1_900_001_204)?;
+    observe_matching_group_invite_responses(&mut bob_manager, &retried, 26, 1_900_001_204)?;
     let events = deliver_group_events(
         &mut bob_manager,
         &mut bob_groups,
@@ -305,8 +322,8 @@ fn create_and_send_message_fan_out_to_remote_member_and_local_sibling() -> Resul
         vec![bob.owner_pubkey],
     )?;
 
-    observe_matching_invite_responses(&mut alice2_manager, &created.prepared.invite_responses, 8, 1_900_000_203)?;
-    observe_matching_invite_responses(&mut bob_manager, &created.prepared.invite_responses, 9, 1_900_000_204)?;
+    observe_matching_group_invite_responses(&mut alice2_manager, &created.prepared, 8, 1_900_000_203)?;
+    observe_matching_group_invite_responses(&mut bob_manager, &created.prepared, 9, 1_900_000_204)?;
 
     let alice2_events = deliver_group_events(
         &mut alice2_manager,
@@ -432,18 +449,8 @@ fn send_message_bootstraps_existing_group_to_new_local_sibling() -> Result<()> {
         b"hello-late-sibling".to_vec(),
     )?;
 
-    observe_matching_invite_responses(
-        &mut alice2_manager,
-        &sent.invite_responses,
-        79,
-        1_900_001_306,
-    )?;
-    observe_matching_invite_responses(
-        &mut bob_manager,
-        &sent.invite_responses,
-        80,
-        1_900_001_307,
-    )?;
+    observe_matching_group_invite_responses(&mut alice2_manager, &sent, 79, 1_900_001_306)?;
+    observe_matching_group_invite_responses(&mut bob_manager, &sent, 80, 1_900_001_307)?;
     let alice2_events = deliver_group_events(
         &mut alice2_manager,
         &mut alice2_groups,
@@ -487,7 +494,7 @@ fn send_message_merges_relay_gaps_from_members_without_transport_state() -> Resu
         "Gaps".to_string(),
         vec![bob.owner_pubkey, carol.owner_pubkey],
     )?;
-    assert_eq!(created.prepared.relay_gaps.len(), 2);
+    assert_eq!(created.prepared.remote.relay_gaps.len(), 2);
 
     manager.observe_peer_roster(bob.owner_pubkey, roster_for(&[&bob], 31));
     let mut send_ctx = context(16, 1_900_000_301);
@@ -503,6 +510,6 @@ fn send_message_merges_relay_gaps_from_members_without_transport_state() -> Resu
             device_pubkey: bob.device_pubkey,
         },
     ];
-    assert_eq!(prepared.relay_gaps, expected);
+    assert_eq!(prepared.remote.relay_gaps, expected);
     Ok(())
 }

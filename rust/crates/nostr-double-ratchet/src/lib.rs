@@ -13,7 +13,8 @@ mod utils;
 
 pub use error::{DomainError, Error, Result};
 pub use group::{
-    GroupCreateResult, GroupIncomingEvent, GroupManagerSnapshot, GroupPreparedSend,
+    GroupCreateResult, GroupIncomingEvent, GroupManagerSnapshot, GroupPreparedPublish,
+    GroupPreparedSend,
     GroupReceivedMessage, GroupSnapshot,
 };
 pub use group_manager::GroupManager;

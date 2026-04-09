@@ -1,7 +1,7 @@
 use crate::{
-    DomainError, GroupCreateResult, GroupIncomingEvent, GroupManagerSnapshot, GroupPreparedSend,
-    GroupReceivedMessage, GroupSnapshot, OwnerPubkey, ProtocolContext, Result, SessionManager,
-    UnixSeconds,
+    DomainError, GroupCreateResult, GroupIncomingEvent, GroupManagerSnapshot, GroupPreparedPublish,
+    GroupPreparedSend, GroupReceivedMessage, GroupSnapshot, OwnerPubkey, ProtocolContext, Result,
+    SessionManager, UnixSeconds,
 };
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -163,7 +163,11 @@ impl GroupManager {
         };
         let payload = record.create_payload();
         let recipients = record.remote_members(self.local_owner_pubkey);
-        let prepared = self.fanout_payload(session_manager, ctx, &group_id, recipients, &payload)?;
+        let prepared = GroupPreparedSend {
+            group_id: group_id.clone(),
+            remote: self.fanout_payload(session_manager, ctx, &group_id, recipients, &payload)?,
+            local_sibling: self.local_sibling_sync(session_manager, ctx, &record)?,
+        };
         let snapshot = record.snapshot();
 
         self.groups.insert(group_id, record);
@@ -195,13 +199,17 @@ impl GroupManager {
             record.ensure_member(*recipient)?;
         }
 
-        self.fanout_payload(
-            session_manager,
-            ctx,
-            &record.group_id,
-            recipients,
-            &record.create_payload(),
-        )
+        Ok(GroupPreparedSend {
+            group_id: record.group_id.clone(),
+            remote: self.fanout_payload(
+                session_manager,
+                ctx,
+                &record.group_id,
+                recipients,
+                &record.create_payload(),
+            )?,
+            local_sibling: self.local_sibling_sync(session_manager, ctx, &record)?,
+        })
     }
 
     pub fn send_message<R>(
@@ -216,43 +224,28 @@ impl GroupManager {
     {
         let record = self.group_record(group_id)?.clone();
         record.ensure_member(self.local_owner_pubkey)?;
-        let recipients = record.remote_members(self.local_owner_pubkey);
-
         let payload = GroupPairwisePayloadV1::GroupMessage {
             group_id: record.group_id.clone(),
             revision: record.revision,
             body,
         };
 
-        let mut prepared = GroupPreparedSend {
-            group_id: record.group_id.clone(),
-            deliveries: Vec::new(),
-            invite_responses: Vec::new(),
-            relay_gaps: Vec::new(),
-        };
-        if session_manager.snapshot().users.into_iter().any(|user| {
-            user.owner_pubkey == self.local_owner_pubkey
-                && user.devices.iter().any(|device| {
-                    device.device_pubkey != session_manager.snapshot().local_device_pubkey
-                        && device.authorized
-                        && !device.is_stale
-                })
-        }) {
-            // Existing groups need an explicit state sync for newly linked sibling devices.
-            // This is sent only to local siblings, not to remote group members.
-            let bootstrapped = self.local_sibling_sync(session_manager, ctx, &record)?;
-            merge_group_prepared(&mut prepared, bootstrapped);
-        }
+        let mut local_sibling = self.local_sibling_sync(session_manager, ctx, &record)?;
+        let sibling_message =
+            self.local_sibling_payload(session_manager, ctx, &record.group_id, &payload)?;
+        merge_group_prepared_publish(&mut local_sibling, sibling_message);
 
-        let sent = self.fanout_payload(
-            session_manager,
-            ctx,
-            &record.group_id,
-            recipients,
-            &payload,
-        )?;
-        merge_group_prepared(&mut prepared, sent);
-        Ok(prepared)
+        Ok(GroupPreparedSend {
+            group_id: record.group_id.clone(),
+            remote: self.fanout_payload(
+                session_manager,
+                ctx,
+                &record.group_id,
+                record.remote_members(self.local_owner_pubkey),
+                &payload,
+            )?,
+            local_sibling,
+        })
     }
 
     pub fn update_name<R>(
@@ -276,13 +269,17 @@ impl GroupManager {
             name,
         };
 
-        let prepared = self.fanout_payload(
-            session_manager,
-            ctx,
-            &current.group_id,
-            next.remote_members(self.local_owner_pubkey),
-            &payload,
-        )?;
+        let prepared = GroupPreparedSend {
+            group_id: current.group_id.clone(),
+            remote: self.fanout_payload(
+                session_manager,
+                ctx,
+                &current.group_id,
+                next.remote_members(self.local_owner_pubkey),
+                &payload,
+            )?,
+            local_sibling: self.local_sibling_sync(session_manager, ctx, &next)?,
+        };
         self.groups.insert(current.group_id.clone(), next);
         Ok(prepared)
     }
@@ -307,13 +304,17 @@ impl GroupManager {
             name: current.name.clone(),
         };
 
-        self.fanout_payload(
-            session_manager,
-            ctx,
-            &current.group_id,
-            current.remote_members(self.local_owner_pubkey),
-            &payload,
-        )
+        Ok(GroupPreparedSend {
+            group_id: current.group_id.clone(),
+            remote: self.fanout_payload(
+                session_manager,
+                ctx,
+                &current.group_id,
+                current.remote_members(self.local_owner_pubkey),
+                &payload,
+            )?,
+            local_sibling: self.local_sibling_sync(session_manager, ctx, &current)?,
+        })
     }
 
     pub fn add_members<R>(
@@ -356,7 +357,7 @@ impl GroupManager {
             .filter(|owner| *owner != self.local_owner_pubkey)
             .collect();
 
-        let mut prepared = self.fanout_payload(
+        let mut remote = self.fanout_payload(
             session_manager,
             ctx,
             &current.group_id,
@@ -370,8 +371,13 @@ impl GroupManager {
             new_recipients,
             &bootstrap_payload,
         )?;
-        merge_group_prepared(&mut prepared, bootstrapped);
+        merge_group_prepared_publish(&mut remote, bootstrapped);
 
+        let prepared = GroupPreparedSend {
+            group_id: current.group_id.clone(),
+            remote,
+            local_sibling: self.local_sibling_sync(session_manager, ctx, &next)?,
+        };
         self.groups.insert(current.group_id.clone(), next);
         Ok(prepared)
     }
@@ -413,7 +419,7 @@ impl GroupManager {
             .filter(|owner| *owner != self.local_owner_pubkey)
             .collect();
 
-        let mut prepared = self.fanout_payload(
+        let mut remote = self.fanout_payload(
             session_manager,
             ctx,
             &current.group_id,
@@ -427,8 +433,12 @@ impl GroupManager {
             new_recipients,
             &bootstrap_payload,
         )?;
-        merge_group_prepared(&mut prepared, bootstrapped);
-        Ok(prepared)
+        merge_group_prepared_publish(&mut remote, bootstrapped);
+        Ok(GroupPreparedSend {
+            group_id: current.group_id.clone(),
+            remote,
+            local_sibling: self.local_sibling_sync(session_manager, ctx, &current)?,
+        })
     }
 
     pub fn remove_members<R>(
@@ -459,13 +469,17 @@ impl GroupManager {
             members: removals.iter().copied().collect(),
         };
 
-        let prepared = self.fanout_payload(
-            session_manager,
-            ctx,
-            &current.group_id,
-            current.remote_members(self.local_owner_pubkey),
-            &payload,
-        )?;
+        let prepared = GroupPreparedSend {
+            group_id: current.group_id.clone(),
+            remote: self.fanout_payload(
+                session_manager,
+                ctx,
+                &current.group_id,
+                current.remote_members(self.local_owner_pubkey),
+                &payload,
+            )?,
+            local_sibling: self.local_sibling_sync(session_manager, ctx, &next)?,
+        };
         self.groups.insert(current.group_id.clone(), next);
         Ok(prepared)
     }
@@ -510,13 +524,17 @@ impl GroupManager {
                 .filter(|owner| *owner != self.local_owner_pubkey),
         );
 
-        self.fanout_payload(
-            session_manager,
-            ctx,
-            &current.group_id,
-            recipients.into_iter().collect(),
-            &payload,
-        )
+        Ok(GroupPreparedSend {
+            group_id: current.group_id.clone(),
+            remote: self.fanout_payload(
+                session_manager,
+                ctx,
+                &current.group_id,
+                recipients.into_iter().collect(),
+                &payload,
+            )?,
+            local_sibling: self.local_sibling_sync(session_manager, ctx, &current)?,
+        })
     }
 
     pub fn add_admins<R>(
@@ -547,13 +565,17 @@ impl GroupManager {
             admins: additions.iter().copied().collect(),
         };
 
-        let prepared = self.fanout_payload(
-            session_manager,
-            ctx,
-            &current.group_id,
-            next.remote_members(self.local_owner_pubkey),
-            &payload,
-        )?;
+        let prepared = GroupPreparedSend {
+            group_id: current.group_id.clone(),
+            remote: self.fanout_payload(
+                session_manager,
+                ctx,
+                &current.group_id,
+                next.remote_members(self.local_owner_pubkey),
+                &payload,
+            )?,
+            local_sibling: self.local_sibling_sync(session_manager, ctx, &next)?,
+        };
         self.groups.insert(current.group_id.clone(), next);
         Ok(prepared)
     }
@@ -586,13 +608,17 @@ impl GroupManager {
             admins: removals.iter().copied().collect(),
         };
 
-        let prepared = self.fanout_payload(
-            session_manager,
-            ctx,
-            &current.group_id,
-            next.remote_members(self.local_owner_pubkey),
-            &payload,
-        )?;
+        let prepared = GroupPreparedSend {
+            group_id: current.group_id.clone(),
+            remote: self.fanout_payload(
+                session_manager,
+                ctx,
+                &current.group_id,
+                next.remote_members(self.local_owner_pubkey),
+                &payload,
+            )?,
+            local_sibling: self.local_sibling_sync(session_manager, ctx, &next)?,
+        };
         self.groups.insert(current.group_id.clone(), next);
         Ok(prepared)
     }
@@ -787,17 +813,62 @@ impl GroupManager {
         session_manager: &mut SessionManager,
         ctx: &mut ProtocolContext<'_, R>,
         record: &GroupRecord,
-    ) -> Result<GroupPreparedSend>
+    ) -> Result<GroupPreparedPublish>
     where
         R: RngCore + CryptoRng,
     {
+        if !session_manager.has_authorized_local_siblings() {
+            return Ok(GroupPreparedPublish {
+                deliveries: Vec::new(),
+                invite_responses: Vec::new(),
+                relay_gaps: Vec::new(),
+            });
+        }
         let payload = serde_json::to_vec(&GroupWireEnvelopeV1 {
             version: 1,
             payload: record.sync_payload(),
         })?;
+        self.local_sibling_payload_bytes(session_manager, ctx, payload)
+    }
+
+    fn local_sibling_payload<R>(
+        &mut self,
+        session_manager: &mut SessionManager,
+        ctx: &mut ProtocolContext<'_, R>,
+        _group_id: &str,
+        payload: &GroupPairwisePayloadV1,
+    ) -> Result<GroupPreparedPublish>
+    where
+        R: RngCore + CryptoRng,
+    {
+        if !session_manager.has_authorized_local_siblings() {
+            return Ok(GroupPreparedPublish {
+                deliveries: Vec::new(),
+                invite_responses: Vec::new(),
+                relay_gaps: Vec::new(),
+            });
+        }
+        self.local_sibling_payload_bytes(
+            session_manager,
+            ctx,
+            serde_json::to_vec(&GroupWireEnvelopeV1 {
+                version: 1,
+                payload: payload.clone(),
+            })?,
+        )
+    }
+
+    fn local_sibling_payload_bytes<R>(
+        &mut self,
+        session_manager: &mut SessionManager,
+        ctx: &mut ProtocolContext<'_, R>,
+        payload: Vec<u8>,
+    ) -> Result<GroupPreparedPublish>
+    where
+        R: RngCore + CryptoRng,
+    {
         let prepared = session_manager.prepare_local_sibling_send(ctx, payload)?;
-        Ok(GroupPreparedSend {
-            group_id: record.group_id.clone(),
+        Ok(GroupPreparedPublish {
             deliveries: prepared.deliveries,
             invite_responses: prepared.invite_responses,
             relay_gaps: prepared.relay_gaps,
@@ -808,15 +879,14 @@ impl GroupManager {
         &mut self,
         session_manager: &mut SessionManager,
         ctx: &mut ProtocolContext<'_, R>,
-        group_id: &str,
+        _group_id: &str,
         recipients: Vec<OwnerPubkey>,
         payload: &GroupPairwisePayloadV1,
-    ) -> Result<GroupPreparedSend>
+    ) -> Result<GroupPreparedPublish>
     where
         R: RngCore + CryptoRng,
     {
-        let mut prepared = GroupPreparedSend {
-            group_id: group_id.to_string(),
+        let mut prepared = GroupPreparedPublish {
             deliveries: Vec::new(),
             invite_responses: Vec::new(),
             relay_gaps: Vec::new(),
@@ -827,7 +897,7 @@ impl GroupManager {
         })?;
 
         for recipient in recipients {
-            let next = session_manager.prepare_send(ctx, recipient, payload_bytes.clone())?;
+            let next = session_manager.prepare_remote_send(ctx, recipient, payload_bytes.clone())?;
             prepared.deliveries.extend(next.deliveries);
             prepared.invite_responses.extend(next.invite_responses);
             prepared.relay_gaps.extend(next.relay_gaps);
@@ -1240,7 +1310,7 @@ fn validate_group_invariants(
     Ok(())
 }
 
-fn merge_group_prepared(into: &mut GroupPreparedSend, next: GroupPreparedSend) {
+fn merge_group_prepared_publish(into: &mut GroupPreparedPublish, next: GroupPreparedPublish) {
     into.deliveries.extend(next.deliveries);
     into.invite_responses.extend(next.invite_responses);
     into.relay_gaps.extend(next.relay_gaps);

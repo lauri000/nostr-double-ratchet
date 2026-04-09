@@ -273,46 +273,19 @@ impl SessionManager {
     where
         R: RngCore + CryptoRng,
     {
-        let mut relay_gaps = Vec::new();
-        let mut targets = BTreeSet::new();
+        self.prepare_send_inner(ctx, recipient_owner, payload, true)
+    }
 
-        self.collect_recipient_targets(recipient_owner, &mut targets, &mut relay_gaps);
-        self.collect_local_sibling_targets(&mut targets);
-
-        let mut deliveries = Vec::new();
-        let mut invite_responses = Vec::new();
-
-        for target in targets {
-            match self.prepare_device_delivery(
-                ctx,
-                target.owner_pubkey,
-                target.device_pubkey,
-                &payload,
-            )? {
-                Some((delivery, maybe_response)) => {
-                    deliveries.push(delivery);
-                    if let Some(response) = maybe_response {
-                        invite_responses.push(response);
-                    }
-                }
-                None => {
-                    relay_gaps.push(RelayGap::MissingDeviceInvite {
-                        owner_pubkey: target.owner_pubkey,
-                        device_pubkey: target.device_pubkey,
-                    });
-                }
-            }
-        }
-
-        relay_gaps.sort();
-
-        Ok(PreparedSend {
-            recipient_owner,
-            payload,
-            deliveries,
-            invite_responses,
-            relay_gaps,
-        })
+    pub(crate) fn prepare_remote_send<R>(
+        &mut self,
+        ctx: &mut ProtocolContext<'_, R>,
+        recipient_owner: OwnerPubkey,
+        payload: Vec<u8>,
+    ) -> Result<PreparedSend>
+    where
+        R: RngCore + CryptoRng,
+    {
+        self.prepare_send_inner(ctx, recipient_owner, payload, false)
     }
 
     pub fn prepare_local_sibling_send<R>(
@@ -361,6 +334,18 @@ impl SessionManager {
             invite_responses,
             relay_gaps,
         })
+    }
+
+    pub(crate) fn has_authorized_local_siblings(&self) -> bool {
+        let Some(user) = self.users.get(&self.local_owner_pubkey) else {
+            return false;
+        };
+        if user.roster.is_none() {
+            return false;
+        }
+        user.authorized_non_stale_devices()
+            .into_iter()
+            .any(|device_pubkey| device_pubkey != self.local_device_pubkey)
     }
 
     pub fn receive<R>(
@@ -538,6 +523,60 @@ impl SessionManager {
             },
             Some(invite_response),
         )))
+    }
+
+    fn prepare_send_inner<R>(
+        &mut self,
+        ctx: &mut ProtocolContext<'_, R>,
+        recipient_owner: OwnerPubkey,
+        payload: Vec<u8>,
+        include_local_siblings: bool,
+    ) -> Result<PreparedSend>
+    where
+        R: RngCore + CryptoRng,
+    {
+        let mut relay_gaps = Vec::new();
+        let mut targets = BTreeSet::new();
+
+        self.collect_recipient_targets(recipient_owner, &mut targets, &mut relay_gaps);
+        if include_local_siblings {
+            self.collect_local_sibling_targets(&mut targets);
+        }
+
+        let mut deliveries = Vec::new();
+        let mut invite_responses = Vec::new();
+
+        for target in targets {
+            match self.prepare_device_delivery(
+                ctx,
+                target.owner_pubkey,
+                target.device_pubkey,
+                &payload,
+            )? {
+                Some((delivery, maybe_response)) => {
+                    deliveries.push(delivery);
+                    if let Some(response) = maybe_response {
+                        invite_responses.push(response);
+                    }
+                }
+                None => {
+                    relay_gaps.push(RelayGap::MissingDeviceInvite {
+                        owner_pubkey: target.owner_pubkey,
+                        device_pubkey: target.device_pubkey,
+                    });
+                }
+            }
+        }
+
+        relay_gaps.sort();
+
+        Ok(PreparedSend {
+            recipient_owner,
+            payload,
+            deliveries,
+            invite_responses,
+            relay_gaps,
+        })
     }
 
     fn collect_recipient_targets(

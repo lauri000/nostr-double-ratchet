@@ -20,11 +20,17 @@ pub struct GroupManagerSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GroupPreparedSend {
-    pub group_id: String,
+pub struct GroupPreparedPublish {
     pub deliveries: Vec<Delivery>,
     pub invite_responses: Vec<InviteResponseEnvelope>,
     pub relay_gaps: Vec<RelayGap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupPreparedSend {
+    pub group_id: String,
+    pub remote: GroupPreparedPublish,
+    pub local_sibling: GroupPreparedPublish,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

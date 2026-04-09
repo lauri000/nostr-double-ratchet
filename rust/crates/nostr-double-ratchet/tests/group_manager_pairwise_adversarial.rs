@@ -270,6 +270,7 @@ fn removed_member_cannot_send_after_processing_removal() -> Result<()> {
     let mut observe_ctx = context(9, 1_900_001_042);
     for response in created
         .prepared
+        .remote
         .invite_responses
         .iter()
         .filter(|response| response.recipient == bob_recipient)
@@ -279,6 +280,7 @@ fn removed_member_cannot_send_after_processing_removal() -> Result<()> {
     let mut deliver_ctx = context(10, 1_900_001_043);
     for delivery in created
         .prepared
+        .remote
         .deliveries
         .iter()
         .filter(|delivery| delivery.device_pubkey == bob.device_pubkey)
@@ -302,6 +304,7 @@ fn removed_member_cannot_send_after_processing_removal() -> Result<()> {
     )?;
     let mut removal_deliver_ctx = context(12, 1_900_001_045);
     for delivery in removal
+        .remote
         .deliveries
         .iter()
         .filter(|delivery| delivery.device_pubkey == bob.device_pubkey)
