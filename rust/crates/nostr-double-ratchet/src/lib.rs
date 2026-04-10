@@ -14,8 +14,7 @@ mod utils;
 pub use error::{DomainError, Error, Result};
 pub use group::{
     GroupCreateResult, GroupIncomingEvent, GroupManagerSnapshot, GroupPreparedPublish,
-    GroupPreparedSend,
-    GroupReceivedMessage, GroupSnapshot,
+    GroupPreparedSend, GroupReceivedMessage, GroupSnapshot,
 };
 pub use group_manager::GroupManager;
 pub use ids::{DevicePubkey, OwnerPubkey, UnixSeconds};

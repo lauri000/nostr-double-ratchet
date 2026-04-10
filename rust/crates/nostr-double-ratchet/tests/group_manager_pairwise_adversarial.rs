@@ -24,7 +24,10 @@ fn create_remote_owned_group(
         }
     }))?;
     let event = groups.handle_incoming(remote_owner, &payload)?;
-    assert!(matches!(event, Some(GroupIncomingEvent::MetadataUpdated(_))));
+    assert!(matches!(
+        event,
+        Some(GroupIncomingEvent::MetadataUpdated(_))
+    ));
     Ok((groups, "group-1".to_string()))
 }
 
@@ -58,8 +61,12 @@ fn duplicate_and_invalid_membership_mutations_are_rejected() -> Result<()> {
     let mut groups = GroupManager::new(alice.owner_pubkey);
 
     let mut create_ctx = context(2, 1_900_001_020);
-    let created =
-        groups.create_group(&mut session_manager, &mut create_ctx, "Crew".to_string(), vec![bob.owner_pubkey])?;
+    let created = groups.create_group(
+        &mut session_manager,
+        &mut create_ctx,
+        "Crew".to_string(),
+        vec![bob.owner_pubkey],
+    )?;
 
     let mut add_ctx = context(3, 1_900_001_021);
     let duplicate_add = groups.add_members(
@@ -98,8 +105,12 @@ fn removing_last_admin_and_promoting_non_member_are_rejected() -> Result<()> {
     let mut groups = GroupManager::new(alice.owner_pubkey);
 
     let mut create_ctx = context(5, 1_900_001_030);
-    let created =
-        groups.create_group(&mut session_manager, &mut create_ctx, "Admins".to_string(), vec![bob.owner_pubkey])?;
+    let created = groups.create_group(
+        &mut session_manager,
+        &mut create_ctx,
+        "Admins".to_string(),
+        vec![bob.owner_pubkey],
+    )?;
 
     let mut demote_ctx = context(6, 1_900_001_031);
     let demote_last_admin = groups.remove_admins(
@@ -193,7 +204,9 @@ fn duplicate_create_is_idempotent_and_unknown_group_message_is_rejected() -> Res
         }
     }))?;
     let duplicate = groups.handle_incoming(bob.owner_pubkey, &duplicate_create)?;
-    assert!(matches!(duplicate, Some(GroupIncomingEvent::MetadataUpdated(snapshot)) if snapshot.group_id == "group-1"));
+    assert!(
+        matches!(duplicate, Some(GroupIncomingEvent::MetadataUpdated(snapshot)) if snapshot.group_id == "group-1")
+    );
 
     let unknown_message = serde_json::to_vec(&serde_json::json!({
         "version": 1,
@@ -233,8 +246,12 @@ fn duplicate_rename_is_idempotent() -> Result<()> {
     let first = groups.handle_incoming(bob.owner_pubkey, &rename)?;
     let second = groups.handle_incoming(bob.owner_pubkey, &rename)?;
 
-    assert!(matches!(first, Some(GroupIncomingEvent::MetadataUpdated(snapshot)) if snapshot.revision == 2 && snapshot.name == "Renamed"));
-    assert!(matches!(second, Some(GroupIncomingEvent::MetadataUpdated(snapshot)) if snapshot.revision == 2 && snapshot.name == "Renamed"));
+    assert!(
+        matches!(first, Some(GroupIncomingEvent::MetadataUpdated(snapshot)) if snapshot.revision == 2 && snapshot.name == "Renamed")
+    );
+    assert!(
+        matches!(second, Some(GroupIncomingEvent::MetadataUpdated(snapshot)) if snapshot.revision == 2 && snapshot.name == "Renamed")
+    );
     Ok(())
 }
 

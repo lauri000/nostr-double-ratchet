@@ -260,7 +260,13 @@ impl GroupManager {
     {
         let current = self.group_record(group_id)?.clone();
         let mut next = current.clone();
-        next.apply_rename(self.local_owner_pubkey, name.clone(), current.revision, current.revision + 1, ctx.now)?;
+        next.apply_rename(
+            self.local_owner_pubkey,
+            name.clone(),
+            current.revision,
+            current.revision + 1,
+            ctx.now,
+        )?;
 
         let payload = GroupPairwisePayloadV1::RenameGroup {
             group_id: current.group_id.clone(),
@@ -662,7 +668,10 @@ impl GroupManager {
                     if existing == &record {
                         GroupIncomingEvent::MetadataUpdated(existing.snapshot())
                     } else {
-                        return Err(group_error(format!("group `{}` already exists", record.group_id)));
+                        return Err(group_error(format!(
+                            "group `{}` already exists",
+                            record.group_id
+                        )));
                     }
                 } else {
                     if base_revision != 0 {
@@ -719,7 +728,13 @@ impl GroupManager {
                 if group.reflects_rename(&name, new_revision) {
                     GroupIncomingEvent::MetadataUpdated(group.snapshot())
                 } else {
-                    group.apply_rename(sender_owner, name, base_revision, new_revision, group.updated_at)?;
+                    group.apply_rename(
+                        sender_owner,
+                        name,
+                        base_revision,
+                        new_revision,
+                        group.updated_at,
+                    )?;
                     GroupIncomingEvent::MetadataUpdated(group.snapshot())
                 }
             }
@@ -734,7 +749,13 @@ impl GroupManager {
                 if group.reflects_added_members(&additions, new_revision) {
                     GroupIncomingEvent::MetadataUpdated(group.snapshot())
                 } else {
-                    group.apply_add_members(sender_owner, &additions, base_revision, new_revision, group.updated_at)?;
+                    group.apply_add_members(
+                        sender_owner,
+                        &additions,
+                        base_revision,
+                        new_revision,
+                        group.updated_at,
+                    )?;
                     GroupIncomingEvent::MetadataUpdated(group.snapshot())
                 }
             }
@@ -749,7 +770,13 @@ impl GroupManager {
                 if group.reflects_removed_members(&removals, new_revision) {
                     GroupIncomingEvent::MetadataUpdated(group.snapshot())
                 } else {
-                    group.apply_remove_members(sender_owner, &removals, base_revision, new_revision, group.updated_at)?;
+                    group.apply_remove_members(
+                        sender_owner,
+                        &removals,
+                        base_revision,
+                        new_revision,
+                        group.updated_at,
+                    )?;
                     GroupIncomingEvent::MetadataUpdated(group.snapshot())
                 }
             }
@@ -764,7 +791,13 @@ impl GroupManager {
                 if group.reflects_added_admins(&additions, new_revision) {
                     GroupIncomingEvent::MetadataUpdated(group.snapshot())
                 } else {
-                    group.apply_add_admins(sender_owner, &additions, base_revision, new_revision, group.updated_at)?;
+                    group.apply_add_admins(
+                        sender_owner,
+                        &additions,
+                        base_revision,
+                        new_revision,
+                        group.updated_at,
+                    )?;
                     GroupIncomingEvent::MetadataUpdated(group.snapshot())
                 }
             }
@@ -779,7 +812,13 @@ impl GroupManager {
                 if group.reflects_removed_admins(&removals, new_revision) {
                     GroupIncomingEvent::MetadataUpdated(group.snapshot())
                 } else {
-                    group.apply_remove_admins(sender_owner, &removals, base_revision, new_revision, group.updated_at)?;
+                    group.apply_remove_admins(
+                        sender_owner,
+                        &removals,
+                        base_revision,
+                        new_revision,
+                        group.updated_at,
+                    )?;
                     GroupIncomingEvent::MetadataUpdated(group.snapshot())
                 }
             }
@@ -897,7 +936,8 @@ impl GroupManager {
         })?;
 
         for recipient in recipients {
-            let next = session_manager.prepare_remote_send(ctx, recipient, payload_bytes.clone())?;
+            let next =
+                session_manager.prepare_remote_send(ctx, recipient, payload_bytes.clone())?;
             prepared.deliveries.extend(next.deliveries);
             prepared.invite_responses.extend(next.invite_responses);
             prepared.relay_gaps.extend(next.relay_gaps);
@@ -1113,11 +1153,7 @@ impl GroupRecord {
         self.revision >= new_revision && self.name == name
     }
 
-    fn reflects_added_members(
-        &self,
-        additions: &BTreeSet<OwnerPubkey>,
-        new_revision: u64,
-    ) -> bool {
+    fn reflects_added_members(&self, additions: &BTreeSet<OwnerPubkey>, new_revision: u64) -> bool {
         self.revision >= new_revision && additions.iter().all(|owner| self.members.contains(owner))
     }
 
@@ -1129,19 +1165,11 @@ impl GroupRecord {
         self.revision >= new_revision && removals.iter().all(|owner| !self.members.contains(owner))
     }
 
-    fn reflects_added_admins(
-        &self,
-        additions: &BTreeSet<OwnerPubkey>,
-        new_revision: u64,
-    ) -> bool {
+    fn reflects_added_admins(&self, additions: &BTreeSet<OwnerPubkey>, new_revision: u64) -> bool {
         self.revision >= new_revision && additions.iter().all(|owner| self.admins.contains(owner))
     }
 
-    fn reflects_removed_admins(
-        &self,
-        removals: &BTreeSet<OwnerPubkey>,
-        new_revision: u64,
-    ) -> bool {
+    fn reflects_removed_admins(&self, removals: &BTreeSet<OwnerPubkey>, new_revision: u64) -> bool {
         self.revision >= new_revision && removals.iter().all(|owner| !self.admins.contains(owner))
     }
 
@@ -1231,7 +1259,9 @@ impl GroupRecord {
         }
         for owner in additions {
             if !self.members.contains(owner) {
-                return Err(group_error(format!("owner {owner} must be a member before promotion")));
+                return Err(group_error(format!(
+                    "owner {owner} must be a member before promotion"
+                )));
             }
             if self.admins.contains(owner) {
                 return Err(group_error(format!("owner {owner} is already an admin")));
@@ -1283,10 +1313,7 @@ where
     hex::encode(bytes)
 }
 
-fn validate_unique_owners(
-    values: &[OwnerPubkey],
-    label: &str,
-) -> Result<BTreeSet<OwnerPubkey>> {
+fn validate_unique_owners(values: &[OwnerPubkey], label: &str) -> Result<BTreeSet<OwnerPubkey>> {
     let set: BTreeSet<_> = values.iter().copied().collect();
     if set.len() != values.len() {
         return Err(group_error(format!("duplicate {label} are not allowed")));

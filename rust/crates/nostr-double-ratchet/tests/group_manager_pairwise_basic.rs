@@ -1,8 +1,7 @@
 mod support;
 
 use nostr_double_ratchet::{
-    GroupIncomingEvent, GroupManager, GroupManagerSnapshot, GroupPreparedSend, OwnerPubkey,
-    Result,
+    GroupIncomingEvent, GroupManager, GroupManagerSnapshot, GroupPreparedSend, OwnerPubkey, Result,
 };
 use support::{
     context, manager_device, manager_observe_invite_response, manager_public_device_invite,
@@ -21,7 +20,10 @@ fn observe_matching_invite_responses(
         .expect("local invite must exist before filtering responses")
         .inviter_ephemeral_public_key;
     let mut ctx = context(seed, now_secs);
-    for response in responses.iter().filter(|response| response.recipient == recipient) {
+    for response in responses
+        .iter()
+        .filter(|response| response.recipient == recipient)
+    {
         manager_observe_invite_response(manager, &mut ctx, response)?;
     }
     Ok(())
@@ -61,8 +63,7 @@ fn deliver_group_events(
         .chain(prepared.local_sibling.deliveries.iter())
         .filter(|delivery| delivery.device_pubkey == target_device)
     {
-        if let Some(received) =
-            manager_receive_delivery(manager, &mut ctx, sender_owner, delivery)?
+        if let Some(received) = manager_receive_delivery(manager, &mut ctx, sender_owner, delivery)?
         {
             if let Some(event) = groups.handle_incoming(received.owner_pubkey, &received.payload)? {
                 events.push(event);
@@ -81,13 +82,20 @@ fn create_group_creates_local_state_and_snapshot_roundtrip() -> Result<()> {
     let mut groups = GroupManager::new(alice.owner_pubkey);
 
     let mut create_ctx = context(1, 1_900_000_000);
-    let created =
-        groups.create_group(&mut manager, &mut create_ctx, "Friends".to_string(), vec![bob.owner_pubkey])?;
+    let created = groups.create_group(
+        &mut manager,
+        &mut create_ctx,
+        "Friends".to_string(),
+        vec![bob.owner_pubkey],
+    )?;
 
     assert!(!created.group.group_id.is_empty());
     assert_eq!(created.group.name, "Friends");
     assert_eq!(created.group.created_by, alice.owner_pubkey);
-    assert_eq!(created.group.members, vec![alice.owner_pubkey, bob.owner_pubkey]);
+    assert_eq!(
+        created.group.members,
+        vec![alice.owner_pubkey, bob.owner_pubkey]
+    );
     assert_eq!(created.group.admins, vec![alice.owner_pubkey]);
     assert_eq!(created.group.revision, 1);
     assert_eq!(created.prepared.group_id, created.group.group_id);
@@ -102,7 +110,10 @@ fn create_group_creates_local_state_and_snapshot_roundtrip() -> Result<()> {
     let restored = GroupManager::from_snapshot(serde_json::from_str::<GroupManagerSnapshot>(
         &snapshot(&group_snapshot),
     )?)?;
-    assert_eq!(restored.group(&created.group.group_id), Some(created.group.clone()));
+    assert_eq!(
+        restored.group(&created.group.group_id),
+        Some(created.group.clone())
+    );
     assert_eq!(restored.groups(), vec![created.group]);
     Ok(())
 }
@@ -144,7 +155,10 @@ fn retry_create_group_reuses_existing_group_id_without_remutating_state() -> Res
 
     assert_eq!(alice_groups.groups().len(), 1);
     assert_eq!(
-        alice_groups.group(&created.group.group_id).expect("group exists").group_id,
+        alice_groups
+            .group(&created.group.group_id)
+            .expect("group exists")
+            .group_id,
         created.group.group_id
     );
     assert_eq!(retried.group_id, created.group.group_id);
@@ -160,7 +174,9 @@ fn retry_create_group_reuses_existing_group_id_without_remutating_state() -> Res
         21,
         1_900_001_104,
     )?;
-    assert!(matches!(events.as_slice(), [GroupIncomingEvent::MetadataUpdated(snapshot)] if snapshot.group_id == created.group.group_id));
+    assert!(
+        matches!(events.as_slice(), [GroupIncomingEvent::MetadataUpdated(snapshot)] if snapshot.group_id == created.group.group_id)
+    );
     Ok(())
 }
 
@@ -175,8 +191,12 @@ fn add_members_bootstraps_new_member_with_current_group_state() -> Result<()> {
     let mut bob_groups = GroupManager::new(bob.owner_pubkey);
 
     let mut create_ctx = context(2, 1_900_000_100);
-    let created =
-        alice_groups.create_group(&mut alice_manager, &mut create_ctx, "Crew".to_string(), vec![])?;
+    let created = alice_groups.create_group(
+        &mut alice_manager,
+        &mut create_ctx,
+        "Crew".to_string(),
+        vec![],
+    )?;
 
     bob_manager.observe_peer_roster(alice.owner_pubkey, roster_for(&[&alice], 10));
     alice_manager.observe_peer_roster(bob.owner_pubkey, roster_for(&[&bob], 11));
@@ -186,8 +206,12 @@ fn add_members_bootstraps_new_member_with_current_group_state() -> Result<()> {
     )?;
 
     let mut add_ctx = context(4, 1_900_000_102);
-    let prepared =
-        alice_groups.add_members(&mut alice_manager, &mut add_ctx, &created.group.group_id, vec![bob.owner_pubkey])?;
+    let prepared = alice_groups.add_members(
+        &mut alice_manager,
+        &mut add_ctx,
+        &created.group.group_id,
+        vec![bob.owner_pubkey],
+    )?;
 
     observe_matching_group_invite_responses(&mut bob_manager, &prepared, 5, 1_900_000_103)?;
     let events = deliver_group_events(
@@ -217,7 +241,10 @@ fn add_members_bootstraps_new_member_with_current_group_state() -> Result<()> {
     }
 
     assert_eq!(
-        bob_groups.group(&created.group.group_id).expect("group created on new member").revision,
+        bob_groups
+            .group(&created.group.group_id)
+            .expect("group created on new member")
+            .revision,
         2
     );
     Ok(())
@@ -234,8 +261,12 @@ fn retry_add_members_reuses_applied_group_state() -> Result<()> {
     let mut bob_groups = GroupManager::new(bob.owner_pubkey);
 
     let mut create_ctx = context(22, 1_900_001_200);
-    let created =
-        alice_groups.create_group(&mut alice_manager, &mut create_ctx, "RetryAdd".to_string(), vec![])?;
+    let created = alice_groups.create_group(
+        &mut alice_manager,
+        &mut create_ctx,
+        "RetryAdd".to_string(),
+        vec![],
+    )?;
 
     let mut add_ctx = context(24, 1_900_001_202);
     let initial = alice_groups.add_members(
@@ -268,7 +299,10 @@ fn retry_add_members_reuses_applied_group_state() -> Result<()> {
     )?;
 
     assert_eq!(
-        alice_groups.group(&created.group.group_id).expect("group exists").revision,
+        alice_groups
+            .group(&created.group.group_id)
+            .expect("group exists")
+            .revision,
         2
     );
     assert_eq!(retried.remote.deliveries.len(), 1);
@@ -283,7 +317,9 @@ fn retry_add_members_reuses_applied_group_state() -> Result<()> {
         27,
         1_900_001_205,
     )?;
-    assert!(matches!(events.as_slice(), [GroupIncomingEvent::MetadataUpdated(snapshot)] if snapshot.revision == 2));
+    assert!(
+        matches!(events.as_slice(), [GroupIncomingEvent::MetadataUpdated(snapshot)] if snapshot.revision == 2)
+    );
     Ok(())
 }
 
@@ -322,7 +358,12 @@ fn create_and_send_message_fan_out_to_remote_member_and_local_sibling() -> Resul
         vec![bob.owner_pubkey],
     )?;
 
-    observe_matching_group_invite_responses(&mut alice2_manager, &created.prepared, 8, 1_900_000_203)?;
+    observe_matching_group_invite_responses(
+        &mut alice2_manager,
+        &created.prepared,
+        8,
+        1_900_000_203,
+    )?;
     observe_matching_group_invite_responses(&mut bob_manager, &created.prepared, 9, 1_900_000_204)?;
 
     let alice2_events = deliver_group_events(
@@ -343,8 +384,14 @@ fn create_and_send_message_fan_out_to_remote_member_and_local_sibling() -> Resul
         11,
         1_900_000_206,
     )?;
-    assert!(matches!(alice2_events.as_slice(), [GroupIncomingEvent::MetadataUpdated(_)]));
-    assert!(matches!(bob_events.as_slice(), [GroupIncomingEvent::MetadataUpdated(_)]));
+    assert!(matches!(
+        alice2_events.as_slice(),
+        [GroupIncomingEvent::MetadataUpdated(_)]
+    ));
+    assert!(matches!(
+        bob_events.as_slice(),
+        [GroupIncomingEvent::MetadataUpdated(_)]
+    ));
 
     let mut send_ctx = context(12, 1_900_000_207);
     let sent = alice1_groups.send_message(
@@ -395,11 +442,17 @@ fn create_and_send_message_fan_out_to_remote_member_and_local_sibling() -> Resul
     }
 
     assert_eq!(
-        alice2_groups.group(&created.group.group_id).expect("local sibling has group").revision,
+        alice2_groups
+            .group(&created.group.group_id)
+            .expect("local sibling has group")
+            .revision,
         1
     );
     assert_eq!(
-        bob_groups.group(&created.group.group_id).expect("remote member has group").revision,
+        bob_groups
+            .group(&created.group.group_id)
+            .expect("remote member has group")
+            .revision,
         1
     );
     Ok(())
@@ -498,8 +551,12 @@ fn send_message_merges_relay_gaps_from_members_without_transport_state() -> Resu
 
     manager.observe_peer_roster(bob.owner_pubkey, roster_for(&[&bob], 31));
     let mut send_ctx = context(16, 1_900_000_301);
-    let prepared =
-        groups.send_message(&mut manager, &mut send_ctx, &created.group.group_id, b"gap".to_vec())?;
+    let prepared = groups.send_message(
+        &mut manager,
+        &mut send_ctx,
+        &created.group.group_id,
+        b"gap".to_vec(),
+    )?;
 
     let expected = vec![
         nostr_double_ratchet::RelayGap::MissingRoster {

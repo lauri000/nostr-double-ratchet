@@ -429,8 +429,10 @@ fn verified_roster_migrates_ownerless_provisional_invite_record() -> Result<()> 
     )?;
 
     let provisional_before = alice_manager.snapshot();
-    let provisional_user =
-        manager_user_snapshot(&provisional_before, provisional_owner_pubkey(bob.device_pubkey));
+    let provisional_user = manager_user_snapshot(
+        &provisional_before,
+        provisional_owner_pubkey(bob.device_pubkey),
+    );
     let provisional_device = manager_device_snapshot(provisional_user, bob.device_pubkey);
     assert!(provisional_device.public_invite.is_some());
 
