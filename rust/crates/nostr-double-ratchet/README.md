@@ -125,3 +125,5 @@ cargo test -p nostr-double-ratchet --manifest-path rust/Cargo.toml
 See [./TUTORIAL.md](./TUTORIAL.md) for the user-facing integration guide.
 See [./ARCHITECTURE.md](./ARCHITECTURE.md) for the current owner/device architecture, invite
 semantics, and recommended integration flow.
+See [./SOURCES.md](./SOURCES.md) for the compact source index behind the current group-architecture
+comparisons and tradeoff discussion.
