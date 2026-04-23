@@ -1,9 +1,16 @@
 use crate::{Delivery, InviteResponseEnvelope, OwnerPubkey, RelayGap, UnixSeconds};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupProtocol {
+    PairwiseFanoutV1,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GroupSnapshot {
     pub group_id: String,
+    pub protocol: GroupProtocol,
     pub name: String,
     pub created_by: OwnerPubkey,
     pub members: Vec<OwnerPubkey>,

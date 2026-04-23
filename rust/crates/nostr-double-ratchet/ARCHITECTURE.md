@@ -163,6 +163,9 @@ Current v1 group rules:
 - group control is revision-based
 - admins are enforced in the core crate
 - v1 uses pairwise fanout, not a separate group ratchet or epoch key
+- `GroupSnapshot::protocol` selects the group semantics, currently `pairwise_fanout_v1`
+- `wire_format_version` is the inner group payload schema version carried inside pairwise payload
+  bytes
 
 ## How To Use It
 

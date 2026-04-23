@@ -1,7 +1,7 @@
 use crate::{
     DomainError, GroupCreateResult, GroupIncomingEvent, GroupManagerSnapshot, GroupPreparedPublish,
-    GroupPreparedSend, GroupReceivedMessage, GroupSnapshot, OwnerPubkey, ProtocolContext, Result,
-    SessionManager, UnixSeconds,
+    GroupPreparedSend, GroupProtocol, GroupReceivedMessage, GroupSnapshot, OwnerPubkey,
+    ProtocolContext, Result, SessionManager, UnixSeconds,
 };
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ pub struct GroupManager {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GroupRecord {
     group_id: String,
+    protocol: GroupProtocol,
     name: String,
     created_by: OwnerPubkey,
     members: BTreeSet<OwnerPubkey>,
@@ -27,15 +28,18 @@ struct GroupRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GroupWireEnvelopeV1 {
-    version: u8,
+    wire_format_version: u8,
     payload: GroupPairwisePayloadV1,
 }
+
+const GROUP_WIRE_FORMAT_VERSION_V1: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum GroupPairwisePayloadV1 {
     CreateGroup {
         group_id: String,
+        protocol: GroupProtocol,
         base_revision: u64,
         new_revision: u64,
         name: String,
@@ -47,6 +51,7 @@ pub(crate) enum GroupPairwisePayloadV1 {
     },
     SyncGroup {
         group_id: String,
+        protocol: GroupProtocol,
         revision: u64,
         name: String,
         created_by: OwnerPubkey,
@@ -153,6 +158,7 @@ impl GroupManager {
 
         let record = GroupRecord {
             group_id: group_id.clone(),
+            protocol: GroupProtocol::PairwiseFanoutV1,
             name,
             created_by: self.local_owner_pubkey,
             members,
@@ -637,13 +643,14 @@ impl GroupManager {
         let Ok(envelope) = serde_json::from_slice::<GroupWireEnvelopeV1>(payload) else {
             return Ok(None);
         };
-        if envelope.version != 1 {
+        if envelope.wire_format_version != GROUP_WIRE_FORMAT_VERSION_V1 {
             return Ok(None);
         }
 
         let event = match envelope.payload {
             GroupPairwisePayloadV1::CreateGroup {
                 group_id,
+                protocol,
                 base_revision,
                 new_revision,
                 name,
@@ -655,6 +662,7 @@ impl GroupManager {
             } => {
                 let record = GroupRecord::from_create_payload(
                     group_id,
+                    protocol,
                     name,
                     created_by,
                     members,
@@ -665,6 +673,12 @@ impl GroupManager {
                     sender_owner,
                 )?;
                 if let Some(existing) = self.groups.get(&record.group_id) {
+                    if existing.protocol != record.protocol {
+                        return Err(group_error(format!(
+                            "group `{}` protocol mismatch: expected {:?}, got {:?}",
+                            record.group_id, existing.protocol, record.protocol
+                        )));
+                    }
                     if existing == &record {
                         GroupIncomingEvent::MetadataUpdated(existing.snapshot())
                     } else {
@@ -684,6 +698,7 @@ impl GroupManager {
             }
             GroupPairwisePayloadV1::SyncGroup {
                 group_id,
+                protocol,
                 revision,
                 name,
                 created_by,
@@ -694,6 +709,7 @@ impl GroupManager {
             } => {
                 let record = GroupRecord::from_sync_payload(
                     group_id,
+                    protocol,
                     name,
                     created_by,
                     members,
@@ -705,6 +721,12 @@ impl GroupManager {
                     self.local_owner_pubkey,
                 )?;
                 if let Some(existing) = self.groups.get(&record.group_id) {
+                    if existing.protocol != record.protocol {
+                        return Err(group_error(format!(
+                            "group `{}` protocol mismatch: expected {:?}, got {:?}",
+                            record.group_id, existing.protocol, record.protocol
+                        )));
+                    }
                     if existing == &record || existing.revision > record.revision {
                         GroupIncomingEvent::MetadataUpdated(existing.snapshot())
                     } else {
@@ -864,7 +886,7 @@ impl GroupManager {
             });
         }
         let payload = serde_json::to_vec(&GroupWireEnvelopeV1 {
-            version: 1,
+            wire_format_version: GROUP_WIRE_FORMAT_VERSION_V1,
             payload: record.sync_payload(),
         })?;
         self.local_sibling_payload_bytes(session_manager, ctx, payload)
@@ -891,7 +913,7 @@ impl GroupManager {
             session_manager,
             ctx,
             serde_json::to_vec(&GroupWireEnvelopeV1 {
-                version: 1,
+                wire_format_version: GROUP_WIRE_FORMAT_VERSION_V1,
                 payload: payload.clone(),
             })?,
         )
@@ -931,7 +953,7 @@ impl GroupManager {
             relay_gaps: Vec::new(),
         };
         let payload_bytes = serde_json::to_vec(&GroupWireEnvelopeV1 {
-            version: 1,
+            wire_format_version: GROUP_WIRE_FORMAT_VERSION_V1,
             payload: payload.clone(),
         })?;
 
@@ -969,6 +991,7 @@ impl GroupRecord {
 
         Ok(Self {
             group_id: snapshot.group_id,
+            protocol: snapshot.protocol,
             name: snapshot.name,
             created_by: snapshot.created_by,
             members,
@@ -982,6 +1005,7 @@ impl GroupRecord {
     #[allow(clippy::too_many_arguments)]
     fn from_create_payload(
         group_id: String,
+        protocol: GroupProtocol,
         name: String,
         created_by: OwnerPubkey,
         members: Vec<OwnerPubkey>,
@@ -1006,6 +1030,7 @@ impl GroupRecord {
 
         Ok(Self {
             group_id,
+            protocol,
             name,
             created_by,
             members: member_set,
@@ -1019,6 +1044,7 @@ impl GroupRecord {
     #[allow(clippy::too_many_arguments)]
     fn from_sync_payload(
         group_id: String,
+        protocol: GroupProtocol,
         name: String,
         created_by: OwnerPubkey,
         members: Vec<OwnerPubkey>,
@@ -1044,6 +1070,7 @@ impl GroupRecord {
 
         Ok(Self {
             group_id,
+            protocol,
             name,
             created_by,
             members: member_set,
@@ -1057,6 +1084,7 @@ impl GroupRecord {
     fn snapshot(&self) -> GroupSnapshot {
         GroupSnapshot {
             group_id: self.group_id.clone(),
+            protocol: self.protocol,
             name: self.name.clone(),
             created_by: self.created_by,
             members: self.members.iter().copied().collect(),
@@ -1070,6 +1098,7 @@ impl GroupRecord {
     fn create_payload(&self) -> GroupPairwisePayloadV1 {
         GroupPairwisePayloadV1::CreateGroup {
             group_id: self.group_id.clone(),
+            protocol: self.protocol,
             base_revision: 0,
             new_revision: self.revision,
             name: self.name.clone(),
@@ -1084,6 +1113,7 @@ impl GroupRecord {
     fn sync_payload(&self) -> GroupPairwisePayloadV1 {
         GroupPairwisePayloadV1::SyncGroup {
             group_id: self.group_id.clone(),
+            protocol: self.protocol,
             revision: self.revision,
             name: self.name.clone(),
             created_by: self.created_by,

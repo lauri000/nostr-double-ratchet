@@ -1,7 +1,8 @@
 mod support;
 
 use nostr_double_ratchet::{
-    GroupIncomingEvent, GroupManager, GroupManagerSnapshot, GroupPreparedSend, OwnerPubkey, Result,
+    GroupIncomingEvent, GroupManager, GroupManagerSnapshot, GroupPreparedSend, GroupProtocol,
+    OwnerPubkey, Result,
 };
 use support::{
     context, manager_device, manager_observe_invite_response, manager_public_device_invite,
@@ -90,6 +91,7 @@ fn create_group_creates_local_state_and_snapshot_roundtrip() -> Result<()> {
     )?;
 
     assert!(!created.group.group_id.is_empty());
+    assert_eq!(created.group.protocol, GroupProtocol::PairwiseFanoutV1);
     assert_eq!(created.group.name, "Friends");
     assert_eq!(created.group.created_by, alice.owner_pubkey);
     assert_eq!(
@@ -228,6 +230,7 @@ fn add_members_bootstraps_new_member_with_current_group_state() -> Result<()> {
     match &events[0] {
         GroupIncomingEvent::MetadataUpdated(snapshot) => {
             assert_eq!(snapshot.group_id, created.group.group_id);
+            assert_eq!(snapshot.protocol, GroupProtocol::PairwiseFanoutV1);
             assert_eq!(snapshot.name, "Crew");
             assert_eq!(snapshot.revision, 2);
             let members: std::collections::BTreeSet<_> = snapshot.members.iter().copied().collect();
@@ -318,7 +321,7 @@ fn retry_add_members_reuses_applied_group_state() -> Result<()> {
         1_900_001_205,
     )?;
     assert!(
-        matches!(events.as_slice(), [GroupIncomingEvent::MetadataUpdated(snapshot)] if snapshot.revision == 2)
+        matches!(events.as_slice(), [GroupIncomingEvent::MetadataUpdated(snapshot)] if snapshot.revision == 2 && snapshot.protocol == GroupProtocol::PairwiseFanoutV1)
     );
     Ok(())
 }
@@ -426,6 +429,7 @@ fn create_and_send_message_fan_out_to_remote_member_and_local_sibling() -> Resul
         alice2_messages.as_slice(),
         [GroupIncomingEvent::MetadataUpdated(snapshot), GroupIncomingEvent::Message(message)]
             if snapshot.group_id == created.group.group_id
+                && snapshot.protocol == GroupProtocol::PairwiseFanoutV1
                 && message.group_id == created.group.group_id
                 && message.sender_owner == alice1.owner_pubkey
                 && message.body == b"hello-group".to_vec()
@@ -518,6 +522,7 @@ fn send_message_bootstraps_existing_group_to_new_local_sibling() -> Result<()> {
         alice2_events.as_slice(),
         [GroupIncomingEvent::MetadataUpdated(snapshot), GroupIncomingEvent::Message(message)]
             if snapshot.group_id == created.group.group_id
+                && snapshot.protocol == GroupProtocol::PairwiseFanoutV1
                 && message.group_id == created.group.group_id
                 && message.body == b"hello-late-sibling".to_vec()
     ));
