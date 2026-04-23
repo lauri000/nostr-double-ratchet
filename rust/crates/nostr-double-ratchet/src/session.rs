@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct Header {
     pub number: u32,
     pub previous_chain_length: u32,
@@ -589,6 +590,39 @@ mod tests {
         let rng = Box::new(StdRng::seed_from_u64(seed));
         let rng = Box::leak(rng);
         ProtocolContext::new(UnixSeconds(1_700_000_000), rng)
+    }
+
+    #[test]
+    fn header_json_uses_camel_case_wire_fields() {
+        let header = Header {
+            number: 3,
+            previous_chain_length: 2,
+            next_public_key: DevicePubkey::from_bytes([9u8; 32]),
+        };
+
+        let json = serde_json::to_value(&header).unwrap();
+        assert_eq!(json["number"], serde_json::json!(3));
+        assert_eq!(json["previousChainLength"], serde_json::json!(2));
+        assert_eq!(
+            json["nextPublicKey"],
+            serde_json::json!(header.next_public_key.to_string())
+        );
+        assert!(json.get("previous_chain_length").is_none());
+        assert!(json.get("next_public_key").is_none());
+
+        let decoded: Header = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, header);
+    }
+
+    #[test]
+    fn header_json_rejects_snake_case_wire_fields() {
+        let old_header = serde_json::json!({
+            "number": 3,
+            "previous_chain_length": 2,
+            "next_public_key": DevicePubkey::from_bytes([9u8; 32]).to_string(),
+        });
+
+        assert!(serde_json::from_value::<Header>(old_header).is_err());
     }
 
     #[test]

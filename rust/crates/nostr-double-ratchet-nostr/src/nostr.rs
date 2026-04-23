@@ -10,7 +10,7 @@ pub const INVITE_EVENT_KIND: u32 = 30078;
 pub const INVITE_RESPONSE_KIND: u32 = 1059;
 pub const ROSTER_EVENT_KIND: u32 = 30078;
 
-const ROSTER_D_TAG: &str = "double-ratchet/roster";
+const ROSTER_D_TAG: &str = "double-ratchet/app-keys";
 const ROSTER_VERSION: &str = "1";
 const INVITE_LIST_LABEL: &str = "double-ratchet/invites";
 
@@ -93,7 +93,7 @@ pub fn parse_message_event(event: &Event) -> Result<MessageEnvelope> {
 pub fn invite_url(invite: &Invite, root: &str) -> Result<String> {
     let mut data = serde_json::Map::new();
     data.insert(
-        "inviterDevice".to_string(),
+        "inviter".to_string(),
         serde_json::Value::String(invite.inviter_device_pubkey.to_string()),
     );
     data.insert(
@@ -130,9 +130,9 @@ pub fn parse_invite_url(url: &str) -> Result<Invite> {
     let data: serde_json::Value = serde_json::from_str(&decoded)?;
 
     let inviter_device_pubkey = parse_device_pubkey(
-        data.get("inviterDevice")
+        data.get("inviter")
             .and_then(|value| value.as_str())
-            .ok_or_else(|| Error::InvalidEvent("missing inviterDevice".to_string()))?,
+            .ok_or_else(|| Error::InvalidEvent("missing inviter".to_string()))?,
     )?;
     let inviter_ephemeral_public_key = parse_device_pubkey(
         data["ephemeralKey"]
@@ -413,6 +413,15 @@ mod tests {
         };
 
         let url = invite_url(&invite, "https://chat.iris.to").unwrap();
+        let encoded = url.split('#').nth(1).unwrap();
+        let decoded = urlencoding::decode(encoded).unwrap();
+        let data: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(
+            data["inviter"].as_str().unwrap(),
+            invite.inviter_device_pubkey.to_string()
+        );
+        assert!(data.get("inviterDevice").is_none());
+
         let parsed_from_url = parse_invite_url(&url).unwrap();
         assert_eq!(
             parsed_from_url.inviter_device_pubkey,
@@ -439,6 +448,22 @@ mod tests {
             parsed_from_event.inviter_owner_pubkey,
             invite.inviter_owner_pubkey
         );
+    }
+
+    #[test]
+    fn invite_url_rejects_inviter_device_wire_name() {
+        let data = serde_json::json!({
+            "inviterDevice": DevicePubkey::from_bytes([3u8; 32]).to_string(),
+            "ephemeralKey": DevicePubkey::from_bytes([9u8; 32]).to_string(),
+            "sharedSecret": hex::encode([7u8; 32]),
+            "createdAt": 22,
+        });
+        let url = format!(
+            "https://chat.iris.to#{}",
+            urlencoding::encode(&data.to_string())
+        );
+
+        assert!(parse_invite_url(&url).is_err());
     }
 
     #[test]
@@ -518,11 +543,25 @@ mod tests {
         );
 
         let unsigned = roster_unsigned_event(owner, &roster).unwrap();
+        assert!(unsigned.tags.iter().any(|tag| {
+            let values = tag.as_slice();
+            values.first().map(|value| value.as_str()) == Some("d")
+                && values.get(1).map(|value| value.as_str()) == Some("double-ratchet/app-keys")
+        }));
         let keys = Keys::new(secret_key_from_bytes(&owner_secret).unwrap());
         let signed = unsigned.sign_with_keys(&keys).unwrap();
 
         let decoded = parse_roster_event(&signed).unwrap();
         assert_eq!(decoded.owner_pubkey, owner);
         assert_eq!(decoded.roster, roster);
+
+        let legacy_roster_unsigned = EventBuilder::new(Kind::from(ROSTER_EVENT_KIND as u16), "")
+            .tag(tag(["d", "double-ratchet/roster"]).unwrap())
+            .tag(tag(["version", ROSTER_VERSION]).unwrap())
+            .tag(tag(["device", &device_pubkey.to_string(), "100"]).unwrap())
+            .custom_created_at(Timestamp::from(roster.created_at.get()))
+            .build(owner_public_key(owner).unwrap());
+        let legacy_roster_signed = legacy_roster_unsigned.sign_with_keys(&keys).unwrap();
+        assert!(parse_roster_event(&legacy_roster_signed).is_err());
     }
 }
