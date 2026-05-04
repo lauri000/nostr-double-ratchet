@@ -708,6 +708,78 @@ mod tests {
     }
 
     #[test]
+    fn sender_key_distribution_rejects_misleading_group_or_key_tags() {
+        let codec = JsonGroupPayloadCodecV1;
+        let event = EventBuilder::new(
+            Kind::from(GROUP_SENDER_KEY_DISTRIBUTION_KIND as u16),
+            serde_json::json!({
+                "groupId": "group-1",
+                "keyId": 7,
+                "chainKey": hex::encode([4; 32]),
+                "iteration": 0,
+                "createdAt": 11,
+                "senderEventPubkey": device(3).to_string(),
+            })
+            .to_string(),
+        )
+        .tags(vec![
+            tag([GROUP_LABEL_TAG, "other-group"]).unwrap(),
+            tag([KEY_TAG, "7"]).unwrap(),
+            tag([MS_TAG, "12000"]).unwrap(),
+        ])
+        .custom_created_at(Timestamp::from(12))
+        .build(device(9).to_nostr().unwrap());
+        let encoded = serde_json::to_vec(&event).unwrap();
+        assert!(codec.decode_pairwise_command(&encoded).is_err());
+
+        let event = EventBuilder::new(
+            Kind::from(GROUP_SENDER_KEY_DISTRIBUTION_KIND as u16),
+            serde_json::json!({
+                "groupId": "group-1",
+                "keyId": 7,
+                "chainKey": hex::encode([4; 32]),
+                "iteration": 0,
+                "createdAt": 11,
+                "senderEventPubkey": device(3).to_string(),
+            })
+            .to_string(),
+        )
+        .tags(vec![
+            tag([GROUP_LABEL_TAG, "group-1"]).unwrap(),
+            tag([KEY_TAG, "8"]).unwrap(),
+            tag([MS_TAG, "12000"]).unwrap(),
+        ])
+        .custom_created_at(Timestamp::from(12))
+        .build(device(9).to_nostr().unwrap());
+        let encoded = serde_json::to_vec(&event).unwrap();
+        assert!(codec.decode_pairwise_command(&encoded).is_err());
+    }
+
+    #[test]
+    fn sender_key_distribution_rejects_invalid_chain_key_length() {
+        let codec = JsonGroupPayloadCodecV1;
+        let event = EventBuilder::new(
+            Kind::from(GROUP_SENDER_KEY_DISTRIBUTION_KIND as u16),
+            serde_json::json!({
+                "groupId": "group-1",
+                "keyId": 7,
+                "chainKey": "aa",
+                "iteration": 0,
+                "createdAt": 11,
+                "senderEventPubkey": device(3).to_string(),
+            })
+            .to_string(),
+        )
+        .tags(vec![tag([GROUP_LABEL_TAG, "group-1"]).unwrap()])
+        .custom_created_at(Timestamp::from(12))
+        .build(device(9).to_nostr().unwrap());
+
+        assert!(codec
+            .decode_pairwise_command(&serde_json::to_vec(&event).unwrap())
+            .is_err());
+    }
+
+    #[test]
     fn current_sender_key_distribution_envelope_is_not_consumed() {
         let codec = JsonGroupPayloadCodecV1;
         let distribution = SenderKeyDistribution {

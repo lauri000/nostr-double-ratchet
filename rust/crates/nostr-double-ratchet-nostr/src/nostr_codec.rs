@@ -520,6 +520,25 @@ mod tests {
     }
 
     #[test]
+    fn message_event_requires_sender_to_match_signer_secret() {
+        let signer_secret = [21u8; 32];
+        let forged_sender = DevicePubkey::from_bytes([44; 32]);
+
+        let result = message_event(&MessageEnvelope {
+            sender: forged_sender,
+            signer_secret_key: signer_secret,
+            created_at: UnixSeconds(10),
+            encrypted_header: "header".to_string(),
+            ciphertext: "ciphertext".to_string(),
+        });
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidEvent(message)) if message.contains("sender does not match")
+        ));
+    }
+
+    #[test]
     fn group_sender_key_message_event_roundtrip_uses_old_message_kind() {
         let signer_secret = [22u8; 32];
         let sender_event_pubkey = DevicePubkey::from_bytes(
@@ -546,6 +565,48 @@ mod tests {
         assert_eq!(parsed.key_id, 7);
         assert_eq!(parsed.message_number, 11);
         assert_eq!(parsed.ciphertext, b"ciphertext");
+    }
+
+    #[test]
+    fn group_sender_key_outer_rejects_pairwise_header_and_malformed_payload() {
+        let keys = Keys::generate();
+        let pairwise_shaped = EventBuilder::new(Kind::from(MESSAGE_EVENT_KIND as u16), "AAAA")
+            .tag(tag(["header", "encrypted-header"]).unwrap())
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(matches!(
+            parse_group_sender_key_message_event(&pairwise_shaped),
+            Err(Error::InvalidEvent(message)) if message.contains("pairwise")
+        ));
+
+        let malformed = EventBuilder::new(Kind::from(MESSAGE_EVENT_KIND as u16), "short")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(matches!(
+            parse_group_sender_key_message_event(&malformed),
+            Err(Error::InvalidEvent(_))
+        ));
+    }
+
+    #[test]
+    fn group_sender_key_outer_requires_sender_event_signer_secret() {
+        let signer_secret = [22u8; 32];
+        let forged_sender_event_pubkey = DevicePubkey::from_bytes([55; 32]);
+
+        let result = group_sender_key_message_event(&GroupSenderKeyMessageEnvelope {
+            group_id: "group-1".to_string(),
+            sender_event_pubkey: forged_sender_event_pubkey,
+            signer_secret_key: signer_secret,
+            key_id: 1,
+            message_number: 1,
+            created_at: UnixSeconds(12),
+            ciphertext: b"ciphertext".to_vec(),
+        });
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidEvent(message)) if message.contains("sender-event pubkey")
+        ));
     }
 
     #[test]

@@ -194,6 +194,8 @@ struct StoredRuntimeState {
     pending_group_pairwise_payloads: Vec<PendingGroupPairwisePayload>,
     #[serde(default)]
     pending_group_fanouts: Vec<PendingGroupFanout>,
+    #[serde(default)]
+    pending_decrypted_deliveries: Vec<PendingDecryptedDelivery>,
     pending_outbound: Vec<PendingOutbound>,
     processed_invite_response_ids: Vec<String>,
     latest_app_keys_created_at: HashMap<String, u64>,
@@ -216,6 +218,16 @@ struct PendingPreparedPublish {
     event: Event,
     inner_event_id: Option<String>,
     target_device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingDecryptedDelivery {
+    sender_owner: OwnerPubkey,
+    sender_device: Option<DevicePubkey>,
+    conversation_owner: Option<OwnerPubkey>,
+    content: String,
+    event_id: Option<String>,
+    created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +262,7 @@ struct RuntimeState {
     pending_group_sender_key_messages: Vec<nostr_codec::ParsedGroupSenderKeyMessageEvent>,
     pending_group_pairwise_payloads: Vec<PendingGroupPairwisePayload>,
     pending_group_fanouts: Vec<PendingGroupFanout>,
+    pending_decrypted_deliveries: Vec<PendingDecryptedDelivery>,
     pending_outbound: Vec<PendingOutbound>,
     processed_invite_response_ids: HashSet<String>,
     latest_app_keys_created_at: HashMap<PublicKey, u64>,
@@ -309,6 +322,7 @@ impl NdrRuntime {
                 pending_group_sender_key_messages: Vec::new(),
                 pending_group_pairwise_payloads: Vec::new(),
                 pending_group_fanouts: Vec::new(),
+                pending_decrypted_deliveries: Vec::new(),
                 pending_outbound: Vec::new(),
                 processed_invite_response_ids: HashSet::new(),
                 latest_app_keys_created_at: HashMap::new(),
@@ -356,6 +370,7 @@ impl NdrRuntime {
             effects.push(self.publish_local_invite_effect(&invite)?);
         }
         self.persist_state_effect(&mut effects)?;
+        effects.extend(self.replay_pending_decrypted_deliveries());
         effects.extend(self.replay_pending_prepared_publishes());
         effects.extend(self.refresh_protocol_subscriptions()?);
         effects.extend(self.sync_direct_message_subscriptions()?);
@@ -377,7 +392,8 @@ impl NdrRuntime {
         ) {
             *self.state.lock().unwrap() = loaded;
         }
-        let mut effects = self.replay_pending_prepared_publishes();
+        let mut effects = self.replay_pending_decrypted_deliveries();
+        effects.extend(self.replay_pending_prepared_publishes());
         effects.extend(self.refresh_protocol_subscriptions()?);
         effects.extend(self.sync_direct_message_subscriptions()?);
         Ok(effects)
@@ -398,6 +414,21 @@ impl NdrRuntime {
             .pending_prepared_publishes
             .retain(|pending| pending.event.id.to_string() != event_id);
         let changed = state.pending_prepared_publishes.len() != before;
+        drop(state);
+        let mut effects = Vec::new();
+        if changed {
+            self.persist_state_effect(&mut effects)?;
+        }
+        Ok(effects)
+    }
+
+    pub fn ack_decrypted_delivery(&self, event_id: &str) -> Result<Vec<RuntimeEffect>> {
+        let mut state = self.state.lock().unwrap();
+        let before = state.pending_decrypted_deliveries.len();
+        state
+            .pending_decrypted_deliveries
+            .retain(|pending| pending.event_id.as_deref() != Some(event_id));
+        let changed = state.pending_decrypted_deliveries.len() != before;
         drop(state);
         let mut effects = Vec::new();
         if changed {
@@ -855,6 +886,11 @@ impl NdrRuntime {
     pub fn process_received_event(&self, event: Event) -> Result<Vec<RuntimeEffect>> {
         let kind = event.kind.as_u16() as u32;
         let event_id = event.id.to_string();
+        if kind == MESSAGE_EVENT_KIND {
+            if let Some(effect) = self.pending_decrypted_delivery_effect_by_event_id(&event_id) {
+                return Ok(vec![effect]);
+            }
+        }
         let mut effects = match kind {
             APP_KEYS_EVENT_KIND if crate::is_app_keys_event(&event) => AppKeys::from_event(&event)
                 .map_err(Into::into)
@@ -1496,21 +1532,18 @@ impl NdrRuntime {
         let Some(received) = received else {
             return Ok(Vec::new());
         };
-        let mut effects = Vec::new();
-        self.persist_state_effect(&mut effects)?;
-        let sender = public_owner(received.owner_pubkey);
         let (conversation_owner, payload) = decode_local_sibling_payload(&received.payload)
             .map(|(owner, payload)| (Some(owner), payload))
             .unwrap_or((None, received.payload));
         let content = String::from_utf8(payload).map_err(|e| Error::Decryption(e.to_string()))?;
-        effects.push(RuntimeEffect::EmitDecrypted {
-            sender,
-            sender_device: Some(public_device(received.device_pubkey)),
-            conversation_owner,
+        self.stage_pending_decrypted_delivery(PendingDecryptedDelivery {
+            sender_owner: received.owner_pubkey,
+            sender_device: Some(received.device_pubkey),
+            conversation_owner: conversation_owner.map(owner),
             content,
             event_id,
-        });
-        Ok(effects)
+            created_at_ms: current_unix_millis(),
+        })
     }
 
     fn prepare_and_publish(
@@ -1759,6 +1792,61 @@ impl NdrRuntime {
             effects.push(Self::prepared_publish_effect(&next));
         }
         Ok(effects)
+    }
+
+    fn stage_pending_decrypted_delivery(
+        &self,
+        pending: PendingDecryptedDelivery,
+    ) -> Result<Vec<RuntimeEffect>> {
+        {
+            let mut state = self.state.lock().unwrap();
+            let already_pending = pending.event_id.as_ref().is_some_and(|event_id| {
+                state
+                    .pending_decrypted_deliveries
+                    .iter()
+                    .any(|existing| existing.event_id.as_ref() == Some(event_id))
+            });
+            if !already_pending {
+                state.pending_decrypted_deliveries.push(pending.clone());
+            }
+        }
+        let mut effects = Vec::new();
+        self.persist_state_effect(&mut effects)?;
+        effects.push(Self::decrypted_delivery_effect(&pending));
+        Ok(effects)
+    }
+
+    fn pending_decrypted_delivery_effect_by_event_id(
+        &self,
+        event_id: &str,
+    ) -> Option<RuntimeEffect> {
+        self.state
+            .lock()
+            .unwrap()
+            .pending_decrypted_deliveries
+            .iter()
+            .find(|pending| pending.event_id.as_deref() == Some(event_id))
+            .map(Self::decrypted_delivery_effect)
+    }
+
+    fn replay_pending_decrypted_deliveries(&self) -> Vec<RuntimeEffect> {
+        self.state
+            .lock()
+            .unwrap()
+            .pending_decrypted_deliveries
+            .iter()
+            .map(Self::decrypted_delivery_effect)
+            .collect()
+    }
+
+    fn decrypted_delivery_effect(pending: &PendingDecryptedDelivery) -> RuntimeEffect {
+        RuntimeEffect::EmitDecrypted {
+            sender: public_owner(pending.sender_owner),
+            sender_device: pending.sender_device.map(public_device),
+            conversation_owner: pending.conversation_owner.map(public_owner),
+            content: pending.content.clone(),
+            event_id: pending.event_id.clone(),
+        }
     }
 
     fn replay_pending_prepared_publishes(&self) -> Vec<RuntimeEffect> {
@@ -2035,6 +2123,7 @@ impl NdrRuntime {
             pending_group_sender_key_messages: state.pending_group_sender_key_messages.clone(),
             pending_group_pairwise_payloads: state.pending_group_pairwise_payloads.clone(),
             pending_group_fanouts: state.pending_group_fanouts.clone(),
+            pending_decrypted_deliveries: state.pending_decrypted_deliveries.clone(),
             pending_outbound: state.pending_outbound.clone(),
             processed_invite_response_ids: state
                 .processed_invite_response_ids
@@ -2079,6 +2168,7 @@ impl RuntimeState {
             pending_group_sender_key_messages: stored.pending_group_sender_key_messages,
             pending_group_pairwise_payloads: stored.pending_group_pairwise_payloads,
             pending_group_fanouts: stored.pending_group_fanouts,
+            pending_decrypted_deliveries: stored.pending_decrypted_deliveries,
             pending_outbound: stored.pending_outbound,
             processed_invite_response_ids: stored
                 .processed_invite_response_ids
@@ -2099,6 +2189,7 @@ impl RuntimeState {
                 pending_group_sender_key_messages: Vec::new(),
                 pending_group_pairwise_payloads: Vec::new(),
                 pending_group_fanouts: Vec::new(),
+                pending_decrypted_deliveries: Vec::new(),
                 pending_outbound: Vec::new(),
                 processed_invite_response_ids: HashSet::new(),
                 latest_app_keys_created_at: HashMap::new(),

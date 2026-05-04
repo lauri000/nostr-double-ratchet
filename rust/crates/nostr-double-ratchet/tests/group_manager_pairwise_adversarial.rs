@@ -221,6 +221,35 @@ fn incoming_control_from_non_admin_and_wrong_revision_message_are_rejected() -> 
 }
 
 #[test]
+fn non_admin_metadata_snapshot_cannot_self_grant_admin_power() -> Result<()> {
+    let alice = manager_device(21, 211);
+    let bob = manager_device(22, 221);
+    let carol = manager_device(23, 231);
+    let (mut groups, group_id) = create_remote_owned_group(alice.owner_pubkey, bob.owner_pubkey)?;
+    let before = serde_json::to_string(&groups.snapshot())?;
+
+    let self_grant = metadata_payload(metadata_snapshot(
+        &group_id,
+        GroupProtocol::pairwise_fanout_v1(),
+        "Hijacked",
+        bob.owner_pubkey,
+        vec![bob.owner_pubkey, alice.owner_pubkey, carol.owner_pubkey],
+        vec![bob.owner_pubkey, carol.owner_pubkey],
+        2,
+        1_900_001_002,
+    ))?;
+    let result = groups.handle_incoming(carol.owner_pubkey, &self_grant);
+
+    assert!(matches!(
+        result,
+        Err(Error::Domain(DomainError::InvalidGroupOperation(message)))
+            if message.contains("admin")
+    ));
+    assert_eq!(serde_json::to_string(&groups.snapshot())?, before);
+    Ok(())
+}
+
+#[test]
 fn duplicate_create_is_idempotent_and_unknown_group_message_is_rejected() -> Result<()> {
     let alice = manager_device(11, 111);
     let bob = manager_device(12, 121);
