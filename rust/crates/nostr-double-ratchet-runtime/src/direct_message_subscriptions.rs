@@ -1,7 +1,5 @@
-use crate::{
-    pubsub::build_filter, utils::pubkey_from_hex, SessionManagerEvent, MESSAGE_EVENT_KIND,
-};
-use nostr::{Filter, PublicKey};
+use crate::{runtime::RuntimeEffect, utils::pubkey_from_hex, MESSAGE_EVENT_KIND};
+use nostr::{Filter, Kind, PublicKey};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -19,12 +17,27 @@ impl DirectMessageSubscriptionTracker {
         Self::default()
     }
 
-    pub fn apply_session_event(&mut self, event: &SessionManagerEvent) -> Vec<PublicKey> {
+    pub fn apply_runtime_effect(&mut self, event: &RuntimeEffect) -> Vec<PublicKey> {
         match event {
-            SessionManagerEvent::Subscribe { subid, filter_json } => {
-                self.register_subscription(subid, filter_json)
+            RuntimeEffect::Subscribe { subid, filters } => {
+                let mut added = Vec::new();
+                let multiple = filters.len() > 1;
+                for (index, filter) in filters.iter().enumerate() {
+                    let indexed_subid = if multiple {
+                        format!("{subid}-{index}")
+                    } else {
+                        subid.clone()
+                    };
+                    added.extend(self.register_subscription(
+                        indexed_subid,
+                        serde_json::to_string(filter).unwrap_or_default(),
+                    ));
+                }
+                added.sort_by_key(|pubkey| pubkey.to_hex());
+                added.dedup();
+                added
             }
-            SessionManagerEvent::Unsubscribe(subid) => {
+            RuntimeEffect::Unsubscribe(subid) => {
                 self.unregister_subscription(subid);
                 Vec::new()
             }
@@ -107,12 +120,11 @@ pub fn build_direct_message_backfill_filter(
         }
     }
 
-    build_filter()
-        .kinds(vec![MESSAGE_EVENT_KIND as u64])
+    Filter::new()
+        .kind(Kind::from(MESSAGE_EVENT_KIND as u16))
         .authors(unique_authors)
-        .since(since_seconds)
+        .since(since_seconds.into())
         .limit(limit)
-        .build()
 }
 
 pub fn direct_message_subscription_authors(

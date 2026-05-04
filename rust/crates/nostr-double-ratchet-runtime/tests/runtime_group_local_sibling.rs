@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use nostr::{Event, Keys, PublicKey};
 use nostr_double_ratchet_runtime::{
     AuthorizedDevice, DevicePubkey, DeviceRoster, GroupIncomingEvent, Invite, NdrRuntime,
-    OwnerPubkey, SessionManagerEvent, UnixSeconds, MESSAGE_EVENT_KIND,
+    OwnerPubkey, RuntimeEffect, UnixSeconds, MESSAGE_EVENT_KIND,
 };
 
 #[derive(Clone)]
@@ -24,8 +24,7 @@ fn runtime(owner: &Keys, device: &Keys) -> NdrRuntime {
         None,
         Some(invite),
     );
-    runtime.init().expect("runtime init");
-    let _ = runtime.drain_events();
+    let _ = runtime.init().expect("runtime init");
     runtime
 }
 
@@ -47,22 +46,21 @@ fn roster(devices: &[&Keys], created_at: u64) -> DeviceRoster {
     )
 }
 
-fn drain_published(runtime: &NdrRuntime, signer: &Keys) -> Vec<Published> {
-    runtime
-        .drain_events()
+fn published_from_effects(effects: Vec<RuntimeEffect>, signer: &Keys) -> Vec<Published> {
+    effects
         .into_iter()
         .filter_map(|event| match event {
-            SessionManagerEvent::Publish(unsigned) if unsigned.pubkey == signer.public_key() => {
+            RuntimeEffect::PublishUnsigned(unsigned) if unsigned.pubkey == signer.public_key() => {
                 unsigned.sign_with_keys(signer).ok().map(|event| Published {
                     event,
                     target_device_id: None,
                 })
             }
-            SessionManagerEvent::PublishSigned(event) => Some(Published {
+            RuntimeEffect::PublishSigned(event) => Some(Published {
                 event,
                 target_device_id: None,
             }),
-            SessionManagerEvent::PublishSignedForInnerEvent {
+            RuntimeEffect::PublishSignedForInnerEvent {
                 event,
                 target_device_id,
                 ..
@@ -76,22 +74,26 @@ fn drain_published(runtime: &NdrRuntime, signer: &Keys) -> Vec<Published> {
 }
 
 fn deliver(events: &[Published], to: &NdrRuntime) -> Vec<GroupIncomingEvent> {
-    for published in events {
-        to.process_received_event(published.event.clone());
-    }
-
     let mut group_events = Vec::new();
-    for event in to.drain_events() {
-        if let SessionManagerEvent::DecryptedMessage {
-            sender,
-            sender_device,
-            content,
-            ..
-        } = event
-        {
-            let outcome =
-                to.group_handle_incoming_payload_outcome(content.as_bytes(), sender, sender_device);
-            group_events.extend(outcome.events);
+    for published in events {
+        let Ok(effects) = to.process_received_event(published.event.clone()) else {
+            continue;
+        };
+        for event in effects {
+            if let RuntimeEffect::EmitDecrypted {
+                sender,
+                sender_device,
+                content,
+                ..
+            } = event
+            {
+                let outcome = to.group_handle_incoming_payload_outcome(
+                    content.as_bytes(),
+                    sender,
+                    sender_device,
+                );
+                group_events.extend(outcome.events);
+            }
         }
     }
     group_events
@@ -112,7 +114,7 @@ fn sender_key_group_create_syncs_to_linked_runtime_device() {
     let bob = runtime(&bob_owner, &bob_device);
     let charlie = runtime(&charlie_owner, &charlie_device);
 
-    alice_primary.with_group_context(|core, _, _| {
+    alice_primary.with_group_context(|core, _| {
         core.apply_local_roster(roster(
             &[&alice_primary_device, &alice_linked_device],
             3_000_000_010,
@@ -141,7 +143,7 @@ fn sender_key_group_create_syncs_to_linked_runtime_device() {
         )
         .expect("observe charlie invite");
     });
-    alice_linked.with_group_context(|core, _, _| {
+    alice_linked.with_group_context(|core, _| {
         core.apply_local_roster(roster(
             &[&alice_primary_device, &alice_linked_device],
             3_000_000_010,
@@ -159,17 +161,17 @@ fn sender_key_group_create_syncs_to_linked_runtime_device() {
             .collect::<Vec<_>>()
     );
 
-    alice_primary
+    let seed_bob = alice_primary
         .send_text(bob_owner.public_key(), "seed bob".to_string(), None)
         .expect("seed bob");
-    let seed_bob = drain_published(&alice_primary, &alice_primary_device);
+    let seed_bob = published_from_effects(seed_bob.effects, &alice_primary_device);
     deliver(&seed_bob, &bob);
     deliver(&seed_bob, &alice_linked);
 
-    alice_primary
+    let seed_charlie = alice_primary
         .send_text(charlie_owner.public_key(), "seed charlie".to_string(), None)
         .expect("seed charlie");
-    let seed_charlie = drain_published(&alice_primary, &alice_primary_device);
+    let seed_charlie = published_from_effects(seed_charlie.effects, &alice_primary_device);
     deliver(&seed_charlie, &charlie);
     deliver(&seed_charlie, &alice_linked);
 
@@ -183,7 +185,7 @@ fn sender_key_group_create_syncs_to_linked_runtime_device() {
             .map(PublicKey::to_hex)
             .collect::<Vec<_>>()
     );
-    let linked_session_count = alice_primary.with_group_context(|core, _, _| {
+    let linked_session_count = alice_primary.with_group_context(|core, _| {
         core.snapshot()
             .users
             .into_iter()
@@ -210,7 +212,7 @@ fn sender_key_group_create_syncs_to_linked_runtime_device() {
             vec![bob_owner.public_key(), charlie_owner.public_key()],
         )
         .expect("create group");
-    let group_events = drain_published(&alice_primary, &alice_primary_device);
+    let group_events = published_from_effects(created.effects.clone(), &alice_primary_device);
     let linked_subscribed_authors = alice_linked
         .get_all_message_push_author_pubkeys()
         .into_iter()
@@ -256,14 +258,14 @@ fn sender_key_group_create_syncs_to_linked_runtime_device() {
     assert!(
         linked_events
             .iter()
-            .any(|event| matches!(event, GroupIncomingEvent::MetadataUpdated(snapshot) if snapshot.group_id == created.group.group_id)),
+            .any(|event| matches!(event, GroupIncomingEvent::MetadataUpdated(snapshot) if snapshot.group_id == created.outcome.group.group_id)),
         "linked device should observe group metadata"
     );
     assert!(
         alice_linked
             .group_snapshots()
             .iter()
-            .any(|snapshot| snapshot.group_id == created.group.group_id),
+            .any(|snapshot| snapshot.group_id == created.outcome.group.group_id),
         "linked runtime should retain the group snapshot"
     );
 }
