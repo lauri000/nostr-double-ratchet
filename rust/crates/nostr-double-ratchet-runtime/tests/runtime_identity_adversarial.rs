@@ -308,6 +308,45 @@ fn malformed_outer_message_event_fails_closed_without_state_effects() {
 }
 
 #[test]
+fn repeated_gap_retry_for_same_inner_event_keeps_one_pending_intent() {
+    let alice_owner = Keys::generate();
+    let alice_device = Keys::generate();
+    let bob_owner = Keys::generate();
+    let alice = runtime(
+        &alice_device,
+        alice_owner.public_key(),
+        Arc::new(InMemoryStorage::new()) as Arc<dyn StorageAdapter>,
+    );
+
+    let mut inner = EventBuilder::new(Kind::from(14), "queued once")
+        .custom_created_at(Timestamp::from(1_900_100_200))
+        .build(alice_owner.public_key());
+    inner.ensure_id();
+    let inner_id = inner.id.as_ref().expect("inner id").to_string();
+
+    let first = alice
+        .send_event(bob_owner.public_key(), inner.clone())
+        .expect("first gap send");
+    assert!(published_events(&first.effects).is_empty());
+    apply_persist_effects(&alice, &first.effects);
+
+    let second = alice
+        .send_event(bob_owner.public_key(), inner)
+        .expect("same logical send retried while still missing protocol data");
+    assert!(published_events(&second.effects).is_empty());
+    apply_persist_effects(&alice, &second.effects);
+
+    let queued = alice
+        .queued_message_diagnostics(Some(&inner_id))
+        .expect("queued diagnostics");
+    assert_eq!(
+        queued.len(),
+        1,
+        "retries for the same inner event must not duplicate pending outbound work"
+    );
+}
+
+#[test]
 fn delayed_app_keys_and_invite_gap_survives_restart_and_drains_once() {
     let alice_owner = Keys::generate();
     let alice_device = Keys::generate();

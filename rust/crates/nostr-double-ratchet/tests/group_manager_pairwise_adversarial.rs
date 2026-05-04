@@ -255,22 +255,16 @@ fn duplicate_create_is_idempotent_and_unknown_group_message_is_rejected() -> Res
     let bob = manager_device(12, 121);
     let (mut groups, _group_id) = create_remote_owned_group(alice.owner_pubkey, bob.owner_pubkey)?;
 
-    let duplicate_create = serde_json::to_vec(&serde_json::json!({
-        "wire_format_version": 1,
-        "payload": {
-            "kind": "create_group",
-            "group_id": "group-1",
-            "protocol": "pairwise_fanout_v1",
-            "base_revision": 0,
-            "new_revision": 1,
-            "name": "Remote",
-            "created_by": bob.owner_pubkey,
-            "members": [bob.owner_pubkey, alice.owner_pubkey],
-            "admins": [bob.owner_pubkey],
-            "created_at": 1_900_001_000u64,
-            "updated_at": 1_900_001_000u64
-        }
-    }))?;
+    let duplicate_create = metadata_payload(metadata_snapshot(
+        "group-1",
+        GroupProtocol::pairwise_fanout_v1(),
+        "Remote",
+        bob.owner_pubkey,
+        vec![bob.owner_pubkey, alice.owner_pubkey],
+        vec![bob.owner_pubkey],
+        1,
+        1_900_001_000,
+    ))?;
     let duplicate = groups.handle_incoming(bob.owner_pubkey, &duplicate_create)?;
     assert!(
         matches!(duplicate, Some(GroupIncomingEvent::MetadataUpdated(snapshot)) if snapshot.group_id == "group-1")

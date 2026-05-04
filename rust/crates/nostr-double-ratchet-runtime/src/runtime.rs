@@ -213,6 +213,26 @@ struct PendingOutbound {
     reason: QueuedMessageStage,
 }
 
+fn same_pending_outbound(
+    pending: &PendingOutbound,
+    recipient_owner: OwnerPubkey,
+    inner_event_id: Option<&str>,
+    remote_payload: &[u8],
+    local_sibling_payload: Option<&[u8]>,
+) -> bool {
+    if pending.recipient_owner != recipient_owner {
+        return false;
+    }
+    match (pending.inner_event_id.as_deref(), inner_event_id) {
+        (Some(existing), Some(next)) => existing == next,
+        (None, None) => {
+            pending.remote_payload == remote_payload
+                && pending.local_sibling_payload.as_deref() == local_sibling_payload
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingPreparedPublish {
     event: Event,
@@ -1591,18 +1611,29 @@ impl NdrRuntime {
             } else {
                 QueuedMessageStage::Device
             };
-            self.state
-                .lock()
-                .unwrap()
-                .pending_outbound
-                .push(PendingOutbound {
-                    recipient_owner,
-                    remote_payload,
-                    local_sibling_payload,
-                    inner_event_id,
-                    created_at_ms: current_unix_millis(),
-                    reason,
-                });
+            {
+                let mut state = self.state.lock().unwrap();
+                if let Some(existing) = state.pending_outbound.iter_mut().find(|pending| {
+                    same_pending_outbound(
+                        pending,
+                        recipient_owner,
+                        inner_event_id.as_deref(),
+                        &remote_payload,
+                        local_sibling_payload.as_deref(),
+                    )
+                }) {
+                    existing.reason = reason;
+                } else {
+                    state.pending_outbound.push(PendingOutbound {
+                        recipient_owner,
+                        remote_payload,
+                        local_sibling_payload,
+                        inner_event_id,
+                        created_at_ms: current_unix_millis(),
+                        reason,
+                    });
+                }
+            }
             let mut effects = Vec::new();
             self.persist_state_effect(&mut effects)?;
             effects.extend(self.refresh_protocol_subscriptions()?);
