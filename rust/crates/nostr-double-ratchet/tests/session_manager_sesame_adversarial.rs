@@ -47,6 +47,59 @@ fn missing_device_invite_surfaces_gap_not_hidden_failure() -> Result<()> {
 }
 
 #[test]
+fn explicit_target_retry_delivers_only_previously_missing_device() -> Result<()> {
+    let alice = manager_device(53, 231);
+    let bob_phone = manager_device(54, 241);
+    let bob_laptop = manager_device(54, 242);
+    let mut alice_manager = session_manager(&alice);
+    let mut bob_phone_manager = session_manager(&bob_phone);
+    let mut bob_laptop_manager = session_manager(&bob_laptop);
+
+    alice_manager.observe_peer_roster(
+        bob_phone.owner_pubkey,
+        roster_for(&[&bob_phone, &bob_laptop], 10),
+    );
+    alice_manager.observe_device_invite(
+        bob_phone.owner_pubkey,
+        manager_public_device_invite(&mut bob_phone_manager, &bob_phone, 10, 1_810_000_050)?,
+    )?;
+
+    let mut initial_ctx = context(11, 1_810_000_051);
+    let initial = alice_manager.prepare_remote_send(
+        &mut initial_ctx,
+        bob_phone.owner_pubkey,
+        b"partial".to_vec(),
+    )?;
+    assert_eq!(initial.deliveries.len(), 1);
+    assert_eq!(initial.deliveries[0].device_pubkey, bob_phone.device_pubkey);
+    assert_eq!(
+        initial.relay_gaps,
+        vec![RelayGap::MissingDeviceInvite {
+            owner_pubkey: bob_laptop.owner_pubkey,
+            device_pubkey: bob_laptop.device_pubkey,
+        }]
+    );
+
+    alice_manager.observe_device_invite(
+        bob_laptop.owner_pubkey,
+        manager_public_device_invite(&mut bob_laptop_manager, &bob_laptop, 12, 1_810_000_052)?,
+    )?;
+    let mut retry_ctx = context(13, 1_810_000_053);
+    let retry = alice_manager.prepare_remote_send_to_devices(
+        &mut retry_ctx,
+        bob_laptop.owner_pubkey,
+        [bob_laptop.device_pubkey],
+        b"partial".to_vec(),
+    )?;
+
+    assert_eq!(retry.relay_gaps, Vec::new());
+    assert_eq!(retry.deliveries.len(), 1);
+    assert_eq!(retry.deliveries[0].device_pubkey, bob_laptop.device_pubkey);
+    assert_ne!(retry.deliveries[0].device_pubkey, bob_phone.device_pubkey);
+    Ok(())
+}
+
+#[test]
 fn restore_rejects_mismatched_local_secret_key() -> Result<()> {
     let alice = manager_device(25, 251);
     let wrong = manager_device(26, 161);

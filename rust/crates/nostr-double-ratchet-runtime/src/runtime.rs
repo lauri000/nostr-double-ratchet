@@ -1009,6 +1009,14 @@ impl NdrRuntime {
         self.state.lock().unwrap().core.snapshot().local_invite
     }
 
+    pub fn session_manager_snapshot(&self) -> SessionManagerSnapshot {
+        self.state.lock().unwrap().core.snapshot()
+    }
+
+    pub fn group_manager_snapshot(&self) -> GroupManagerSnapshot {
+        self.state.lock().unwrap().group_manager.snapshot()
+    }
+
     pub fn get_owner_pubkey(&self) -> PublicKey {
         self.owner_public_key
     }
