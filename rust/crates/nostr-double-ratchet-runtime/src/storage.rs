@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 
 pub trait StorageAdapter: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<String>>;
+    /// Writes must be durable before returning `Ok(())`. Runtime methods may
+    /// emit publish/decrypt effects immediately after persisting protocol state.
     fn put(&self, key: &str, value: String) -> Result<()>;
     fn del(&self, key: &str) -> Result<()>;
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
