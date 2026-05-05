@@ -14,7 +14,6 @@ dist-ssr
 docs/*
 !docs/
 !docs/EXPERIMENTAL_INSPIRED_ARCHITECTURE.md
-!docs/TESTABILITY_IMPROVEMENTS.md
 
 # Editor directories and files
 .vscode/*
