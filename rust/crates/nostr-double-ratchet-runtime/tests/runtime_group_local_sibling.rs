@@ -74,8 +74,23 @@ fn published_from_effects(effects: Vec<RuntimeEffect>, signer: &Keys) -> Vec<Pub
 }
 
 fn deliver(events: &[Published], to: &NdrRuntime) -> Vec<GroupIncomingEvent> {
+    deliver_with_outcome_effects(events, to).0
+}
+
+fn deliver_with_outcome_effects(
+    events: &[Published],
+    to: &NdrRuntime,
+) -> (Vec<GroupIncomingEvent>, Vec<RuntimeEffect>) {
     let mut group_events = Vec::new();
+    let mut group_effects = Vec::new();
     for published in events {
+        let outer = to.group_handle_outer_event(&published.event);
+        if !outer.events.is_empty() || !outer.effects.is_empty() {
+            group_events.extend(outer.events);
+            group_effects.extend(outer.effects);
+            continue;
+        }
+
         let Ok(effects) = to.process_received_event(published.event.clone()) else {
             continue;
         };
@@ -93,10 +108,11 @@ fn deliver(events: &[Published], to: &NdrRuntime) -> Vec<GroupIncomingEvent> {
                     sender_device,
                 );
                 group_events.extend(outcome.events);
+                group_effects.extend(outcome.effects);
             }
         }
     }
-    group_events
+    (group_events, group_effects)
 }
 
 #[test]
@@ -267,5 +283,275 @@ fn sender_key_group_create_syncs_to_linked_runtime_device() {
             .iter()
             .any(|snapshot| snapshot.group_id == created.outcome.group.group_id),
         "linked runtime should retain the group snapshot"
+    );
+}
+
+#[test]
+fn sender_key_existing_member_fanouts_key_to_member_added_after_first_send() {
+    let alice_owner = Keys::generate();
+    let alice_device = Keys::generate();
+    let bob_owner = Keys::generate();
+    let bob_device = Keys::generate();
+    let carol_owner = Keys::generate();
+    let carol_device = Keys::generate();
+
+    let alice = runtime(&alice_owner, &alice_device);
+    let bob = runtime(&bob_owner, &bob_device);
+    let carol = runtime(&carol_owner, &carol_device);
+
+    alice.with_group_context(|core, _| {
+        core.observe_peer_roster(
+            owner(bob_owner.public_key()),
+            roster(&[&bob_device], 3_100_000_010),
+        );
+        core.observe_device_invite(
+            owner(bob_owner.public_key()),
+            bob.local_invite().expect("bob invite"),
+        )
+        .expect("observe bob invite");
+        core.observe_peer_roster(
+            owner(carol_owner.public_key()),
+            roster(&[&carol_device], 3_100_000_011),
+        );
+        core.observe_device_invite(
+            owner(carol_owner.public_key()),
+            carol.local_invite().expect("carol invite"),
+        )
+        .expect("observe carol invite");
+    });
+    bob.with_group_context(|core, _| {
+        core.observe_peer_roster(
+            owner(alice_owner.public_key()),
+            roster(&[&alice_device], 3_100_000_012),
+        );
+        core.observe_device_invite(
+            owner(alice_owner.public_key()),
+            alice.local_invite().expect("alice invite"),
+        )
+        .expect("observe alice invite");
+        core.observe_peer_roster(
+            owner(carol_owner.public_key()),
+            roster(&[&carol_device], 3_100_000_013),
+        );
+        core.observe_device_invite(
+            owner(carol_owner.public_key()),
+            carol.local_invite().expect("carol invite"),
+        )
+        .expect("observe carol invite");
+    });
+    carol.with_group_context(|core, _| {
+        core.observe_peer_roster(
+            owner(alice_owner.public_key()),
+            roster(&[&alice_device], 3_100_000_014),
+        );
+        core.observe_device_invite(
+            owner(alice_owner.public_key()),
+            alice.local_invite().expect("alice invite"),
+        )
+        .expect("observe alice invite");
+        core.observe_peer_roster(
+            owner(bob_owner.public_key()),
+            roster(&[&bob_device], 3_100_000_015),
+        );
+        core.observe_device_invite(
+            owner(bob_owner.public_key()),
+            bob.local_invite().expect("bob invite"),
+        )
+        .expect("observe bob invite");
+    });
+
+    let alice_seed_carol = alice
+        .send_text(
+            carol_owner.public_key(),
+            "seed carol from alice".to_string(),
+            None,
+        )
+        .expect("alice seeds carol");
+    let alice_seed_carol = published_from_effects(alice_seed_carol.effects, &alice_device);
+    deliver(&alice_seed_carol, &carol);
+
+    let bob_seed_carol = bob
+        .send_text(
+            carol_owner.public_key(),
+            "seed carol from bob".to_string(),
+            None,
+        )
+        .expect("bob seeds carol");
+    let bob_seed_carol = published_from_effects(bob_seed_carol.effects, &bob_device);
+    deliver(&bob_seed_carol, &carol);
+
+    let created = alice
+        .create_group("Alice Bob".to_string(), vec![bob_owner.public_key()])
+        .expect("create group");
+    let group_id = created.outcome.group.group_id.clone();
+    let create_events = published_from_effects(created.effects, &alice_device);
+    let _ = deliver(&create_events, &bob);
+
+    let bob_first = bob
+        .send_group_message(&group_id, b"bob before carol".to_vec(), None)
+        .expect("bob first group send");
+    assert!(
+        published_from_effects(bob_first.effects, &bob_device)
+            .iter()
+            .any(|published| published.event.pubkey != bob_device.public_key()),
+        "bob's first group send should create a sender-key outer event"
+    );
+
+    let added = alice
+        .add_group_members(&group_id, vec![carol_owner.public_key()])
+        .expect("add carol");
+    let add_events = published_from_effects(added.effects.clone(), &alice_device);
+    let carol_add_events = deliver(&add_events, &carol);
+    assert!(
+        carol_add_events
+            .iter()
+            .any(|event| matches!(event, GroupIncomingEvent::MetadataUpdated(snapshot) if snapshot.group_id == group_id)),
+        "new member should receive added group metadata from admin"
+    );
+    let (_, bob_reaction_effects) = deliver_with_outcome_effects(&add_events, &bob);
+    let bob_reaction_events = published_from_effects(bob_reaction_effects, &bob_device);
+    assert!(
+        !bob_reaction_events.is_empty(),
+        "existing sender-key member should publish its current sender-key distribution to a newly added member"
+    );
+    let carol_distribution_events = deliver(&bob_reaction_events, &carol);
+    assert!(
+        carol_distribution_events
+            .iter()
+            .any(|event| matches!(event, GroupIncomingEvent::MetadataUpdated(snapshot) if snapshot.group_id == group_id)),
+        "new member should install existing member's sender-key distribution"
+    );
+
+    let bob_after_add = bob
+        .send_group_message(&group_id, b"bob after carol".to_vec(), None)
+        .expect("bob sends after carol is added");
+    let bob_after_add_events = published_from_effects(bob_after_add.effects, &bob_device);
+    let carol_events = deliver(&bob_after_add_events, &carol);
+
+    assert!(
+        carol_events.iter().any(|event| matches!(
+            event,
+            GroupIncomingEvent::Message(message)
+                if message.group_id == group_id
+                    && message.sender_owner == owner(bob_owner.public_key())
+                    && message.body == b"bob after carol".to_vec()
+        )),
+        "new member must decrypt later messages from an existing member that already had a sender key"
+    );
+}
+
+#[test]
+fn group_member_removal_reaches_existing_member_on_subscribed_pairwise_author() {
+    let alice_owner = Keys::generate();
+    let alice_device = Keys::generate();
+    let bob_owner = Keys::generate();
+    let bob_device = Keys::generate();
+    let charlie_owner = Keys::generate();
+    let charlie_device = Keys::generate();
+
+    let alice = runtime(&alice_owner, &alice_device);
+    let bob = runtime(&bob_owner, &bob_device);
+    let charlie = runtime(&charlie_owner, &charlie_device);
+
+    alice.with_group_context(|core, _| {
+        core.observe_peer_roster(
+            owner(bob_owner.public_key()),
+            roster(&[&bob_device], 3_200_000_010),
+        );
+        core.observe_device_invite(
+            owner(bob_owner.public_key()),
+            bob.local_invite().expect("bob invite"),
+        )
+        .expect("observe bob invite");
+        core.observe_peer_roster(
+            owner(charlie_owner.public_key()),
+            roster(&[&charlie_device], 3_200_000_011),
+        );
+        core.observe_device_invite(
+            owner(charlie_owner.public_key()),
+            charlie.local_invite().expect("charlie invite"),
+        )
+        .expect("observe charlie invite");
+    });
+    bob.with_group_context(|core, _| {
+        core.observe_peer_roster(
+            owner(alice_owner.public_key()),
+            roster(&[&alice_device], 3_200_000_012),
+        );
+        core.observe_device_invite(
+            owner(alice_owner.public_key()),
+            alice.local_invite().expect("alice invite"),
+        )
+        .expect("observe alice invite");
+    });
+    charlie.with_group_context(|core, _| {
+        core.observe_peer_roster(
+            owner(alice_owner.public_key()),
+            roster(&[&alice_device], 3_200_000_013),
+        );
+        core.observe_device_invite(
+            owner(alice_owner.public_key()),
+            alice.local_invite().expect("alice invite"),
+        )
+        .expect("observe alice invite");
+    });
+
+    let created = alice
+        .create_group(
+            "Alice Bob Charlie".to_string(),
+            vec![bob_owner.public_key(), charlie_owner.public_key()],
+        )
+        .expect("create group");
+    let group_id = created.outcome.group.group_id.clone();
+    let create_events = published_from_effects(created.effects, &alice_device);
+    let _ = deliver(&create_events, &bob);
+    let _ = deliver(&create_events, &charlie);
+
+    let removal = alice
+        .remove_group_member(&group_id, charlie_owner.public_key())
+        .expect("remove charlie");
+    assert_eq!(removal.snapshot.members.len(), 2);
+
+    let removal_events = published_from_effects(removal.effects, &alice_device);
+    let bob_device_hex = bob_device.public_key().to_hex();
+    let bob_subscribed_authors = bob
+        .get_all_message_push_author_pubkeys()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let bob_visible_removal_events = removal_events
+        .iter()
+        .filter(|published| {
+            published.target_device_id.as_deref() == Some(&bob_device_hex)
+                && bob_subscribed_authors.contains(&published.event.pubkey)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        !bob_visible_removal_events.is_empty(),
+        "removal metadata for Bob must be signed by a message author Bob already subscribes to; subscribed={:?} event_authors={:?} targets={:?}",
+        bob_subscribed_authors
+            .iter()
+            .map(PublicKey::to_hex)
+            .collect::<Vec<_>>(),
+        removal_events
+            .iter()
+            .map(|published| published.event.pubkey.to_hex())
+            .collect::<Vec<_>>(),
+        removal_events
+            .iter()
+            .map(|published| published.target_device_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let bob_events = deliver(&bob_visible_removal_events, &bob);
+    assert!(
+        bob_events.iter().any(|event| matches!(
+            event,
+            GroupIncomingEvent::MetadataUpdated(snapshot)
+                if snapshot.group_id == group_id
+                    && snapshot.members.len() == 2
+                    && !snapshot.members.contains(&owner(charlie_owner.public_key()))
+        )),
+        "Bob must apply Charlie's removal from Alice's metadata snapshot"
     );
 }

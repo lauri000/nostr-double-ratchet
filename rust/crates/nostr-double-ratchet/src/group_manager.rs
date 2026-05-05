@@ -291,6 +291,68 @@ where
         })
     }
 
+    pub fn distribute_existing_sender_key_to_members<R>(
+        &mut self,
+        session_manager: &mut SessionManager,
+        ctx: &mut ProtocolContext<'_, R>,
+        group_id: &str,
+        recipients: Vec<OwnerPubkey>,
+    ) -> Result<Option<GroupPreparedSend>>
+    where
+        R: RngCore + CryptoRng,
+    {
+        let record = self.group_record(group_id)?.clone();
+        if !record.protocol.is_sender_key_v1() || !record.members.contains(&self.local_owner_pubkey)
+        {
+            return Ok(None);
+        }
+
+        let local_device = session_manager.local_device_pubkey();
+        let id = SenderKeyRecordId::new(
+            record.group_id.clone(),
+            self.local_owner_pubkey,
+            local_device,
+        );
+        let Some(distribution) = self.sender_keys.get(&id).and_then(|sender_record| {
+            let key_id = sender_record.latest_key_id?;
+            let state = sender_record.states.get(&key_id)?;
+            Some(SenderKeyDistribution {
+                group_id: record.group_id.clone(),
+                key_id,
+                sender_event_pubkey: sender_record.sender_event_pubkey,
+                chain_key: state.chain_key(),
+                iteration: state.iteration(),
+                created_at: ctx.now,
+            })
+        }) else {
+            return Ok(None);
+        };
+
+        let recipients = recipients
+            .into_iter()
+            .filter(|recipient| {
+                *recipient != self.local_owner_pubkey && record.members.contains(recipient)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        Ok(Some(GroupPreparedSend {
+            group_id: record.group_id.clone(),
+            remote: self.fanout_sender_key_distribution(
+                session_manager,
+                ctx,
+                recipients,
+                &distribution,
+            )?,
+            local_sibling: self.local_sibling_sender_key_distribution(
+                session_manager,
+                ctx,
+                &distribution,
+            )?,
+        }))
+    }
+
     pub fn update_name<R>(
         &mut self,
         session_manager: &mut SessionManager,

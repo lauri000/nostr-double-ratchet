@@ -3,7 +3,7 @@ use std::sync::Arc;
 use nostr::{Event, Keys};
 use nostr_double_ratchet_runtime::{
     nostr_codec, AppKeys, DeviceEntry, InMemoryStorage, NdrRuntime, RuntimeEffect, StorageAdapter,
-    INVITE_EVENT_KIND,
+    INVITE_EVENT_KIND, INVITE_RESPONSE_KIND, MESSAGE_EVENT_KIND,
 };
 use proptest::prelude::*;
 
@@ -132,6 +132,14 @@ fn prepared_direct_send_persists_before_publish_and_replays_same_event_after_res
         bob_owner.public_key(),
         bob_device.public_key(),
     );
+    let bob_app_keys = bob
+        .ingest_app_keys_snapshot(
+            alice_owner.public_key(),
+            AppKeys::new(vec![DeviceEntry::new(alice_device.public_key(), 1)]),
+            1,
+        )
+        .expect("bob observes alice app keys");
+    apply_persist_effects(&bob, &bob_app_keys);
 
     let send = alice
         .send_text(bob_owner.public_key(), "crash replay".to_string(), None)
@@ -270,6 +278,84 @@ fn sender_key_outer_before_distribution_is_persisted_pending_work() {
             .iter()
             .any(|effect| matches!(effect, RuntimeEffect::PersistRuntimeState { .. })),
         "unknown sender-key outer event should be stored for retry after distribution"
+    );
+}
+
+#[test]
+fn inbound_message_before_invite_response_is_persisted_and_drained_after_response() {
+    let alice_owner = Keys::generate();
+    let alice_device = Keys::generate();
+    let bob_owner = Keys::generate();
+    let bob_device = Keys::generate();
+    let alice_storage = Arc::new(InMemoryStorage::new()) as Arc<dyn StorageAdapter>;
+    let bob_storage = Arc::new(InMemoryStorage::new()) as Arc<dyn StorageAdapter>;
+
+    let alice = runtime(&alice_device, alice_owner.public_key(), alice_storage);
+    let bob = runtime(&bob_device, bob_owner.public_key(), bob_storage.clone());
+    let _alice_init = alice.init().expect("alice init");
+    prepare_alice_to_bob(
+        &alice,
+        &bob,
+        bob_owner.public_key(),
+        bob_device.public_key(),
+    );
+
+    let send = alice
+        .send_text(
+            bob_owner.public_key(),
+            "message before invite response".to_string(),
+            None,
+        )
+        .expect("first-contact send");
+    let events = published_events(&send.effects);
+    let invite_response = events
+        .iter()
+        .find(|event| event.kind.as_u16() as u32 == INVITE_RESPONSE_KIND)
+        .expect("invite response")
+        .clone();
+    let message = events
+        .iter()
+        .find(|event| event.kind.as_u16() as u32 == MESSAGE_EVENT_KIND)
+        .expect("message")
+        .clone();
+
+    let pending = bob
+        .process_received_event(message.clone())
+        .expect("message before invite response should fail closed");
+    assert!(
+        pending
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::PersistRuntimeState { .. })),
+        "unknown first-contact message must be durably retained for retry"
+    );
+    assert!(
+        !pending
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::EmitDecrypted { .. })),
+        "message must not be app-visible before the authenticated invite response is processed"
+    );
+    apply_persist_effects(&bob, &pending);
+    drop(bob);
+
+    let restarted_bob = runtime(&bob_device, bob_owner.public_key(), bob_storage);
+    let startup = restarted_bob
+        .reload_from_storage()
+        .expect("reload pending message");
+    assert!(
+        !startup
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::EmitDecrypted { .. })),
+        "pending message should remain hidden until the invite response arrives"
+    );
+
+    let drained = restarted_bob
+        .process_received_event(invite_response)
+        .expect("invite response should drain pending message");
+    assert!(
+        drained
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::EmitDecrypted { .. })),
+        "processing the invite response must retry and decrypt the retained message"
     );
 }
 
