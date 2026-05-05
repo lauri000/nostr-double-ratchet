@@ -260,6 +260,12 @@ fn inbound_decrypt_persists_before_emitting_decrypted_payload() {
         bob_owner.public_key(),
         bob_device.public_key(),
     );
+    bob.ingest_app_keys_snapshot(
+        alice_owner.public_key(),
+        AppKeys::new(vec![DeviceEntry::new(alice_device.public_key(), 1)]),
+        1,
+    )
+    .expect("bob verifies alice device roster");
 
     let send = alice
         .send_text(
@@ -386,6 +392,12 @@ fn inbound_message_before_invite_response_is_persisted_and_drained_after_respons
             .any(|effect| matches!(effect, RuntimeEffect::EmitDecrypted { .. })),
         "message must not be app-visible before the authenticated invite response is processed"
     );
+    assert!(
+        pending
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::FetchBackfill)),
+        "retained inbound messages should request protocol backfill"
+    );
     drop(bob);
 
     let restarted_bob = runtime(&bob_device, bob_owner.public_key(), bob_storage);
@@ -399,14 +411,34 @@ fn inbound_message_before_invite_response_is_persisted_and_drained_after_respons
         "pending message should remain hidden until the invite response arrives"
     );
 
-    let drained = restarted_bob
+    let after_response = restarted_bob
         .process_received_event(invite_response)
-        .expect("invite response should drain pending message");
+        .expect("invite response should retain pending message until AppKeys verify owner claim");
+    assert!(
+        !after_response
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::EmitDecrypted { .. })),
+        "invite response owner claims must not make retained messages app-visible before AppKeys verification"
+    );
+    assert!(
+        after_response
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::FetchBackfill)),
+        "unverified invite response owner claims should request AppKeys backfill"
+    );
+
+    let drained = restarted_bob
+        .ingest_app_keys_snapshot(
+            alice_owner.public_key(),
+            AppKeys::new(vec![DeviceEntry::new(alice_device.public_key(), 1)]),
+            2,
+        )
+        .expect("AppKeys should verify owner claim and drain pending message");
     assert!(
         drained
             .iter()
             .any(|effect| matches!(effect, RuntimeEffect::EmitDecrypted { .. })),
-        "processing the invite response must retry and decrypt the retained message"
+        "verified AppKeys must retry and decrypt the retained message"
     );
 }
 

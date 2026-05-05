@@ -29,6 +29,7 @@ pub enum RuntimeEffect {
         filters: Vec<Filter>,
     },
     Unsubscribe(String),
+    FetchBackfill,
     PublishUnsigned(UnsignedEvent),
     PublishSigned(Event),
     PublishSignedForInnerEvent {
@@ -295,6 +296,11 @@ struct RuntimeState {
     processed_invite_response_ids: HashSet<String>,
     latest_app_keys_created_at: HashMap<PublicKey, u64>,
     tracked_owner_pubkeys: BTreeSet<PublicKey>,
+}
+
+enum MessageSenderOwnerResolution {
+    Verified(OwnerPubkey),
+    PendingUnverifiedClaim,
 }
 
 struct DirectMessageSubscription {
@@ -1604,7 +1610,7 @@ impl NdrRuntime {
             .unwrap()
             .core
             .observe_invite_response(&mut ctx, &envelope)?;
-        if processed.is_some() {
+        if let Some(processed) = processed {
             self.state
                 .lock()
                 .unwrap()
@@ -1612,6 +1618,9 @@ impl NdrRuntime {
                 .insert(event.id.to_string());
             let mut effects = Vec::new();
             self.persist_state_now()?;
+            if processed.claimed_owner_pubkey.is_some() {
+                effects.push(RuntimeEffect::FetchBackfill);
+            }
             effects.extend(self.retry_pending_outbound()?);
             effects.extend(self.retry_pending_group_fanouts()?);
             effects.extend(self.retry_pending_pairwise_message_events()?);
@@ -1640,9 +1649,11 @@ impl NdrRuntime {
     ) -> Result<Option<Vec<RuntimeEffect>>> {
         let envelope = nostr_codec::parse_message_event(event)
             .map_err(|e| Error::InvalidEvent(e.to_string()))?;
-        let sender_owner = self
-            .resolve_message_sender_owner(envelope.sender)
-            .unwrap_or_else(|| owner(public_device(envelope.sender)));
+        let sender_owner = match self.resolve_message_sender_owner(envelope.sender) {
+            Some(MessageSenderOwnerResolution::Verified(owner_pubkey)) => owner_pubkey,
+            Some(MessageSenderOwnerResolution::PendingUnverifiedClaim) => return Ok(None),
+            None => owner(public_device(envelope.sender)),
+        };
         let mut rng = OsRng;
         let mut ctx = ProtocolContext::new(now(), &mut rng);
         let received =
@@ -1957,6 +1968,7 @@ impl NdrRuntime {
         };
         if changed {
             self.persist_state_now()?;
+            return Ok(vec![RuntimeEffect::FetchBackfill]);
         }
         Ok(Vec::new())
     }
@@ -2254,7 +2266,10 @@ impl NdrRuntime {
             .insert(owner_pubkey);
     }
 
-    fn resolve_message_sender_owner(&self, sender: DevicePubkey) -> Option<OwnerPubkey> {
+    fn resolve_message_sender_owner(
+        &self,
+        sender: DevicePubkey,
+    ) -> Option<MessageSenderOwnerResolution> {
         let snapshot = self.state.lock().unwrap().core.snapshot();
         for user in snapshot.users {
             for record in user.devices {
@@ -2267,7 +2282,10 @@ impl NdrRuntime {
                         .iter()
                         .any(|state| session_matches_sender(state, sender))
                 {
-                    return Some(user.owner_pubkey);
+                    if record.claimed_owner_pubkey.is_some() {
+                        return Some(MessageSenderOwnerResolution::PendingUnverifiedClaim);
+                    }
+                    return Some(MessageSenderOwnerResolution::Verified(user.owner_pubkey));
                 }
             }
         }

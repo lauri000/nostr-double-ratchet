@@ -3,7 +3,7 @@ use std::sync::Arc;
 use nostr::{Event, EventBuilder, Keys, Kind, PublicKey, Tag, Timestamp};
 use nostr_double_ratchet_runtime::{
     nostr_codec, AppKeys, DeviceEntry, InMemoryStorage, NdrRuntime, RuntimeEffect, StorageAdapter,
-    INVITE_EVENT_KIND, MESSAGE_EVENT_KIND,
+    INVITE_EVENT_KIND, INVITE_RESPONSE_KIND, MESSAGE_EVENT_KIND,
 };
 use proptest::prelude::*;
 
@@ -47,6 +47,22 @@ fn apply_persist_effects(_runtime: &NdrRuntime, _effects: &[RuntimeEffect]) {
 fn observe_app_keys(runtime: &NdrRuntime, owner: PublicKey, device: PublicKey) {
     runtime
         .ingest_app_keys_snapshot(owner, AppKeys::new(vec![DeviceEntry::new(device, 1)]), 1)
+        .expect("ingest app keys");
+}
+
+fn observe_app_keys_devices(runtime: &NdrRuntime, owner: PublicKey, devices: Vec<PublicKey>) {
+    runtime
+        .ingest_app_keys_snapshot(
+            owner,
+            AppKeys::new(
+                devices
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, device)| DeviceEntry::new(device, index as u64 + 1))
+                    .collect(),
+            ),
+            10,
+        )
         .expect("ingest app keys");
 }
 
@@ -164,6 +180,120 @@ fn inner_pubkey_p_and_recipient_owner_do_not_affect_runtime_sender_identity() {
     assert_eq!(sender, bob_owner.public_key());
     assert_eq!(conversation_owner, None);
     assert!(content.contains(&forged_owner.public_key().to_hex()));
+}
+
+#[test]
+fn unverified_same_owner_device_claim_queues_message_until_appkeys_verify_owner() {
+    let alice_owner = Keys::generate();
+    let alice_old_device = Keys::generate();
+    let alice_fresh_device = Keys::generate();
+    let bob_owner = Keys::generate();
+    let bob_device = Keys::generate();
+
+    let old = runtime(
+        &alice_old_device,
+        alice_owner.public_key(),
+        Arc::new(InMemoryStorage::new()),
+    );
+    let fresh = runtime(
+        &alice_fresh_device,
+        alice_owner.public_key(),
+        Arc::new(InMemoryStorage::new()),
+    );
+    let bob = runtime(
+        &bob_device,
+        bob_owner.public_key(),
+        Arc::new(InMemoryStorage::new()),
+    );
+
+    let _old_invite = first_invite(&old.init().expect("old alice init"));
+    let bob_invite = first_invite(&bob.init().expect("bob init"));
+    let _ = fresh.init().expect("fresh alice init");
+
+    observe_app_keys_devices(
+        &bob,
+        alice_owner.public_key(),
+        vec![alice_old_device.public_key()],
+    );
+    observe_app_keys(&fresh, bob_owner.public_key(), bob_device.public_key());
+    fresh
+        .process_received_event(bob_invite)
+        .expect("fresh observes bob invite");
+
+    let send = fresh
+        .send_text(
+            bob_owner.public_key(),
+            "fresh device before appkeys".to_string(),
+            None,
+        )
+        .expect("fresh send");
+    let mut invite_response = None;
+    let mut message = None;
+    for event in published_events(&send.effects) {
+        match u32::from(event.kind.as_u16()) {
+            INVITE_RESPONSE_KIND => invite_response = Some(event),
+            MESSAGE_EVENT_KIND => message = Some(event),
+            _ => {}
+        }
+    }
+    let invite_response = invite_response.expect("invite response to bob");
+    let message = message.expect("message to bob");
+
+    let effects = bob
+        .process_received_event(invite_response)
+        .expect("bob observes unverified owner-claim response");
+    assert!(
+        emit_decrypted(&effects).is_empty(),
+        "invite response alone must not emit app-visible messages"
+    );
+
+    let before_appkeys = bob
+        .process_received_event(message.clone())
+        .expect("bob receives message before owner claim is verified");
+    assert!(
+        emit_decrypted(&before_appkeys).is_empty(),
+        "message from a device with only an unverified owner claim must stay pending"
+    );
+    assert!(
+        before_appkeys
+            .iter()
+            .any(|effect| matches!(effect, RuntimeEffect::FetchBackfill)),
+        "pending unverified owner-claim messages should ask the app to backfill AppKeys"
+    );
+
+    let retry = bob
+        .ingest_app_keys_snapshot(
+            alice_owner.public_key(),
+            AppKeys::new(vec![
+                DeviceEntry::new(alice_old_device.public_key(), 1),
+                DeviceEntry::new(alice_fresh_device.public_key(), 2),
+            ]),
+            11,
+        )
+        .expect("bob ingests appkeys that verify fresh device");
+    let decrypted = emit_decrypted(&retry);
+    assert!(
+        decrypted.iter().any(|(sender, _, content, _)| {
+            *sender == alice_owner.public_key() && content.contains("fresh device before appkeys")
+        }),
+        "verified AppKeys should drain the pending message under Alice owner; decrypted={decrypted:?}"
+    );
+    let delivery_id = decrypted
+        .iter()
+        .find_map(|(sender, _, content, event_id)| {
+            (*sender == alice_owner.public_key() && content.contains("fresh device before appkeys"))
+                .then_some(event_id.clone())
+        })
+        .expect("delivery id");
+    bob.ack_decrypted_delivery(&delivery_id)
+        .expect("ack decrypted delivery");
+
+    assert!(
+        bob.process_received_event(message)
+            .map(|effects| emit_decrypted(&effects).is_empty())
+            .unwrap_or(true),
+        "the pending event should drain only once"
+    );
 }
 
 #[test]

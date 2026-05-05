@@ -91,6 +91,7 @@ pub struct Delivery {
 pub struct ProcessedInviteResponse {
     pub owner_pubkey: OwnerPubkey,
     pub device_pubkey: DevicePubkey,
+    pub claimed_owner_pubkey: Option<OwnerPubkey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +295,7 @@ impl SessionManager {
         Ok(Some(ProcessedInviteResponse {
             owner_pubkey,
             device_pubkey: invitee_device_pubkey,
+            claimed_owner_pubkey: record.claimed_owner_pubkey,
         }))
     }
 
