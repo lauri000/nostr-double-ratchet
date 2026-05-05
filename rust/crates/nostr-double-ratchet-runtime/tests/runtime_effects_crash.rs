@@ -1,9 +1,12 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use nostr::{Event, Keys};
 use nostr_double_ratchet_runtime::{
-    nostr_codec, AppKeys, DeviceEntry, InMemoryStorage, NdrRuntime, RuntimeEffect, StorageAdapter,
-    INVITE_EVENT_KIND, INVITE_RESPONSE_KIND, MESSAGE_EVENT_KIND,
+    nostr_codec, AppKeys, DeviceEntry, Error as NdrError, InMemoryStorage, NdrRuntime,
+    RuntimeEffect, StorageAdapter, INVITE_EVENT_KIND, INVITE_RESPONSE_KIND, MESSAGE_EVENT_KIND,
 };
 use proptest::prelude::*;
 
@@ -16,6 +19,46 @@ fn runtime(device: &Keys, owner: nostr::PublicKey, storage: Arc<dyn StorageAdapt
         Some(storage),
         None,
     )
+}
+
+#[derive(Clone)]
+struct FailNextPutStorage {
+    inner: InMemoryStorage,
+    fail_next_put: Arc<AtomicBool>,
+}
+
+impl FailNextPutStorage {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryStorage::new(),
+            fail_next_put: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn fail_next_put(&self) {
+        self.fail_next_put.store(true, Ordering::SeqCst);
+    }
+}
+
+impl StorageAdapter for FailNextPutStorage {
+    fn get(&self, key: &str) -> nostr_double_ratchet_runtime::Result<Option<String>> {
+        self.inner.get(key)
+    }
+
+    fn put(&self, key: &str, value: String) -> nostr_double_ratchet_runtime::Result<()> {
+        if self.fail_next_put.swap(false, Ordering::SeqCst) {
+            return Err(NdrError::Storage("injected write failure".to_string()));
+        }
+        self.inner.put(key, value)
+    }
+
+    fn del(&self, key: &str) -> nostr_double_ratchet_runtime::Result<()> {
+        self.inner.del(key)
+    }
+
+    fn list(&self, prefix: &str) -> nostr_double_ratchet_runtime::Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
 }
 
 fn published_events(effects: &[RuntimeEffect]) -> Vec<Event> {
@@ -47,16 +90,6 @@ fn published_event_ids(effects: &[RuntimeEffect]) -> Vec<String> {
         .collect()
 }
 
-fn apply_persist_effects(runtime: &NdrRuntime, effects: &[RuntimeEffect]) {
-    for effect in effects {
-        if let RuntimeEffect::PersistRuntimeState { key, value } = effect {
-            runtime
-                .persist_runtime_state(key, value.clone())
-                .expect("persist runtime state");
-        }
-    }
-}
-
 fn prepared_send_replay_ids_for_body(body: String) -> (Vec<String>, Vec<String>) {
     let alice_owner = Keys::generate();
     let alice_device = Keys::generate();
@@ -82,7 +115,6 @@ fn prepared_send_replay_ids_for_body(body: String) -> (Vec<String>, Vec<String>)
         .send_text(bob_owner.public_key(), body, None)
         .expect("send");
     let sent_ids = published_event_ids(&send.effects);
-    apply_persist_effects(&alice, &send.effects);
     drop(alice);
 
     let restarted = runtime(&alice_device, alice_owner.public_key(), alice_storage);
@@ -132,36 +164,21 @@ fn prepared_direct_send_persists_before_publish_and_replays_same_event_after_res
         bob_owner.public_key(),
         bob_device.public_key(),
     );
-    let bob_app_keys = bob
-        .ingest_app_keys_snapshot(
-            alice_owner.public_key(),
-            AppKeys::new(vec![DeviceEntry::new(alice_device.public_key(), 1)]),
-            1,
-        )
-        .expect("bob observes alice app keys");
-    apply_persist_effects(&bob, &bob_app_keys);
+    bob.ingest_app_keys_snapshot(
+        alice_owner.public_key(),
+        AppKeys::new(vec![DeviceEntry::new(alice_device.public_key(), 1)]),
+        1,
+    )
+    .expect("bob observes alice app keys");
 
     let send = alice
         .send_text(bob_owner.public_key(), "crash replay".to_string(), None)
         .expect("send");
-    let persist_index = send
-        .effects
-        .iter()
-        .position(|effect| matches!(effect, RuntimeEffect::PersistRuntimeState { .. }))
-        .expect("persist effect");
-    let publish_index = send
-        .effects
-        .iter()
-        .position(|effect| {
-            matches!(
-                effect,
-                RuntimeEffect::PublishSigned(_) | RuntimeEffect::PublishSignedForInnerEvent { .. }
-            )
-        })
-        .expect("publish effect");
     assert!(
-        persist_index < publish_index,
-        "runtime must persist prepared publish before asking the app to publish"
+        send.effects
+            .iter()
+            .all(|effect| !matches!(effect, RuntimeEffect::EmitDecrypted { .. })),
+        "direct send should not emit app-visible decrypted payloads"
     );
 
     let sent_ids = published_event_ids(&send.effects);
@@ -169,8 +186,6 @@ fn prepared_direct_send_persists_before_publish_and_replays_same_event_after_res
         !sent_ids.is_empty(),
         "direct send should produce signed publish effects"
     );
-    apply_persist_effects(&alice, &send.effects);
-
     let restarted = runtime(&alice_device, alice_owner.public_key(), alice_storage);
     let replay = restarted
         .reload_from_storage()
@@ -179,6 +194,51 @@ fn prepared_direct_send_persists_before_publish_and_replays_same_event_after_res
     assert!(
         sent_ids.iter().any(|id| replayed_ids.contains(id)),
         "restart should replay the exact prepared event id without advancing the ratchet; sent={sent_ids:?} replayed={replayed_ids:?}"
+    );
+}
+
+#[test]
+fn prepared_direct_send_storage_failure_returns_no_publish_and_rolls_back_live_state() {
+    let alice_owner = Keys::generate();
+    let alice_device = Keys::generate();
+    let bob_owner = Keys::generate();
+    let bob_device = Keys::generate();
+    let alice_storage = Arc::new(FailNextPutStorage::new());
+    let alice_storage_dyn = alice_storage.clone() as Arc<dyn StorageAdapter>;
+    let bob_storage = Arc::new(InMemoryStorage::new()) as Arc<dyn StorageAdapter>;
+
+    let alice = runtime(&alice_device, alice_owner.public_key(), alice_storage_dyn);
+    let bob = runtime(&bob_device, bob_owner.public_key(), bob_storage);
+    let _alice_init = alice.init().expect("alice init");
+    prepare_alice_to_bob(
+        &alice,
+        &bob,
+        bob_owner.public_key(),
+        bob_device.public_key(),
+    );
+
+    alice_storage.fail_next_put();
+    let failed = alice.send_text(
+        bob_owner.public_key(),
+        "must not publish after failed persist".to_string(),
+        None,
+    );
+    assert!(failed.is_err(), "storage failure must fail the send");
+    assert!(
+        alice.prepared_publish_effects().is_empty(),
+        "failed persistence must roll back staged prepared publishes"
+    );
+
+    let retry = alice
+        .send_text(
+            bob_owner.public_key(),
+            "must publish after retry".to_string(),
+            None,
+        )
+        .expect("retry after failed persist");
+    assert!(
+        !published_event_ids(&retry.effects).is_empty(),
+        "retry after rollback should produce publish effects"
     );
 }
 
@@ -192,7 +252,7 @@ fn inbound_decrypt_persists_before_emitting_decrypted_payload() {
     let bob_storage = Arc::new(InMemoryStorage::new()) as Arc<dyn StorageAdapter>;
 
     let alice = runtime(&alice_device, alice_owner.public_key(), alice_storage);
-    let bob = runtime(&bob_device, bob_owner.public_key(), bob_storage);
+    let bob = runtime(&bob_device, bob_owner.public_key(), bob_storage.clone());
     let _alice_init = alice.init().expect("alice init");
     prepare_alice_to_bob(
         &alice,
@@ -220,19 +280,18 @@ fn inbound_decrypt_persists_before_emitting_decrypted_payload() {
         {
             continue;
         }
-        let persist_index = effects
-            .iter()
-            .position(|effect| matches!(effect, RuntimeEffect::PersistRuntimeState { .. }))
-            .expect("persist effect");
-        let emit_index = effects
-            .iter()
-            .position(|effect| matches!(effect, RuntimeEffect::EmitDecrypted { .. }))
-            .expect("decrypted effect");
+        let restarted_bob = runtime(&bob_device, bob_owner.public_key(), bob_storage);
+        let replay = restarted_bob
+            .reload_from_storage()
+            .expect("reload after app-visible decrypted delivery before app ack");
         assert!(
-            persist_index < emit_index,
-            "receive state must be durable before app-visible decrypted delivery"
+            replay
+                .iter()
+                .any(|effect| matches!(effect, RuntimeEffect::EmitDecrypted { .. })),
+            "receive state and pending app-visible delivery must already be durable"
         );
         saw_decrypted = true;
+        break;
     }
     assert!(saw_decrypted, "receiver should decrypt one message event");
 }
@@ -270,14 +329,13 @@ fn sender_key_outer_before_distribution_is_persisted_pending_work() {
         .into_iter()
         .find(|event| nostr_codec::parse_group_sender_key_message_event(event).is_ok())
         .expect("sender-key outer");
-    let pending = bob.group_handle_outer_event(&outer);
+    let pending = bob
+        .group_handle_outer_event(&outer)
+        .expect("queue pending group outer");
     assert!(pending.events.is_empty());
     assert!(
-        pending
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, RuntimeEffect::PersistRuntimeState { .. })),
-        "unknown sender-key outer event should be stored for retry after distribution"
+        pending.effects.is_empty(),
+        "unknown sender-key outer should be persisted internally without app persistence effects"
     );
 }
 
@@ -323,18 +381,11 @@ fn inbound_message_before_invite_response_is_persisted_and_drained_after_respons
         .process_received_event(message.clone())
         .expect("message before invite response should fail closed");
     assert!(
-        pending
-            .iter()
-            .any(|effect| matches!(effect, RuntimeEffect::PersistRuntimeState { .. })),
-        "unknown first-contact message must be durably retained for retry"
-    );
-    assert!(
         !pending
             .iter()
             .any(|effect| matches!(effect, RuntimeEffect::EmitDecrypted { .. })),
         "message must not be app-visible before the authenticated invite response is processed"
     );
-    apply_persist_effects(&bob, &pending);
     drop(bob);
 
     let restarted_bob = runtime(&bob_device, bob_owner.public_key(), bob_storage);

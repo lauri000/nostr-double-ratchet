@@ -84,8 +84,10 @@ fn deliver_with_outcome_effects(
     let mut group_events = Vec::new();
     let mut group_effects = Vec::new();
     for published in events {
-        let outer = to.group_handle_outer_event(&published.event);
-        if !outer.events.is_empty() || !outer.effects.is_empty() {
+        let outer = to
+            .group_handle_outer_event(&published.event)
+            .expect("handle group outer");
+        if outer.consumed || !outer.events.is_empty() || !outer.effects.is_empty() {
             group_events.extend(outer.events);
             group_effects.extend(outer.effects);
             continue;
@@ -102,11 +104,13 @@ fn deliver_with_outcome_effects(
                 ..
             } = event
             {
-                let outcome = to.group_handle_incoming_payload_outcome(
-                    content.as_bytes(),
-                    sender,
-                    sender_device,
-                );
+                let outcome = to
+                    .group_handle_incoming_payload_outcome(
+                        content.as_bytes(),
+                        sender,
+                        sender_device,
+                    )
+                    .expect("handle group pairwise payload");
                 group_events.extend(outcome.events);
                 group_effects.extend(outcome.effects);
             }

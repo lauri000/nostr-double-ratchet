@@ -39,14 +39,9 @@ fn first_invite(effects: &[RuntimeEffect]) -> Event {
         .expect("invite event")
 }
 
-fn apply_persist_effects(runtime: &NdrRuntime, effects: &[RuntimeEffect]) {
-    for effect in effects {
-        if let RuntimeEffect::PersistRuntimeState { key, value } = effect {
-            runtime
-                .persist_runtime_state(key, value.clone())
-                .expect("persist runtime state");
-        }
-    }
+fn apply_persist_effects(_runtime: &NdrRuntime, _effects: &[RuntimeEffect]) {
+    // Runtime persistence is internal; this helper remains to keep the
+    // adversarial scenarios readable where they model previous app steps.
 }
 
 fn observe_app_keys(runtime: &NdrRuntime, owner: PublicKey, device: PublicKey) {
