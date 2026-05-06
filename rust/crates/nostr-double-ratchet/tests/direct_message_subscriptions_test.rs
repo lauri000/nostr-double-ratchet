@@ -1,7 +1,7 @@
 use nostr::Keys;
 use nostr_double_ratchet_runtime::{
     build_direct_message_backfill_filter, direct_message_subscription_authors,
-    DirectMessageSubscriptionTracker, RuntimeEffect, MESSAGE_EVENT_KIND,
+    DirectMessageSubscriptionTracker, SessionManagerEvent, MESSAGE_EVENT_KIND,
 };
 
 #[test]
@@ -36,19 +36,17 @@ fn tracker_returns_only_new_direct_message_authors() {
 }
 
 #[test]
-fn tracker_can_apply_runtime_effects() {
+fn tracker_can_apply_session_manager_events() {
     let alice = Keys::generate().public_key();
     let mut tracker = DirectMessageSubscriptionTracker::new();
 
-    let added = tracker.apply_runtime_effect(&RuntimeEffect::Subscribe {
+    let added = tracker.apply_session_event(&SessionManagerEvent::Subscribe {
         subid: "ndr-runtime-messages-1".to_string(),
-        filters: vec![nostr::Filter::new()
-            .kind(nostr::Kind::from(MESSAGE_EVENT_KIND as u16))
-            .authors(vec![alice])],
+        filter_json: format!(r#"{{"kinds":[1060],"authors":["{}"]}}"#, alice.to_hex()),
     });
     assert_eq!(added, vec![alice]);
 
-    let removed = tracker.apply_runtime_effect(&RuntimeEffect::Unsubscribe(
+    let removed = tracker.apply_session_event(&SessionManagerEvent::Unsubscribe(
         "ndr-runtime-messages-1".to_string(),
     ));
     assert!(removed.is_empty());

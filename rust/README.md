@@ -7,6 +7,7 @@ Rust implementation and tooling for Double Ratchet messaging on Nostr.
 | Crate | Description |
 |-------|-------------|
 | [nostr-double-ratchet](./crates/nostr-double-ratchet) | Core library: sessions, invites, session manager, groups |
+| [ndr-ffi](./crates/ndr-ffi) | UniFFI bindings for mobile integration |
 
 ## Security Properties (Rust Stack)
 

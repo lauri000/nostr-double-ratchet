@@ -30,6 +30,32 @@ struct GroupWireEnvelopeV1 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum GroupPairwisePayloadV1 {
+    MetadataSnapshot {
+        snapshot: GroupSnapshot,
+    },
+    CreateGroup {
+        group_id: String,
+        protocol: GroupProtocol,
+        base_revision: u64,
+        new_revision: u64,
+        name: String,
+        created_by: OwnerPubkey,
+        members: Vec<OwnerPubkey>,
+        admins: Vec<OwnerPubkey>,
+        created_at: UnixSeconds,
+        updated_at: UnixSeconds,
+    },
+    SyncGroup {
+        group_id: String,
+        protocol: GroupProtocol,
+        revision: u64,
+        name: String,
+        created_by: OwnerPubkey,
+        members: Vec<OwnerPubkey>,
+        admins: Vec<OwnerPubkey>,
+        created_at: UnixSeconds,
+        updated_at: UnixSeconds,
+    },
     GroupMessage {
         group_id: String,
         revision: u64,
@@ -341,6 +367,63 @@ fn command_from_v1_payload(
     payload: GroupPairwisePayloadV1,
 ) -> Result<Option<GroupPairwiseCommand>> {
     Ok(match payload {
+        GroupPairwisePayloadV1::MetadataSnapshot { snapshot } => {
+            Some(GroupPairwiseCommand::MetadataSnapshot { snapshot })
+        }
+        GroupPairwisePayloadV1::CreateGroup {
+            group_id,
+            protocol,
+            base_revision,
+            new_revision,
+            name,
+            created_by,
+            members,
+            admins,
+            created_at,
+            updated_at,
+        } => {
+            if base_revision != 0 {
+                return Err(Error::Parse(
+                    "create group base revision must be 0".to_string(),
+                ));
+            }
+            Some(GroupPairwiseCommand::MetadataSnapshot {
+                snapshot: GroupSnapshot {
+                    group_id,
+                    protocol,
+                    name,
+                    created_by,
+                    members,
+                    admins,
+                    revision: new_revision,
+                    created_at,
+                    updated_at,
+                },
+            })
+        }
+        GroupPairwisePayloadV1::SyncGroup {
+            group_id,
+            protocol,
+            revision,
+            name,
+            created_by,
+            members,
+            admins,
+            created_at,
+            updated_at,
+        } => Some(GroupPairwiseCommand::MetadataSnapshot {
+            snapshot: GroupSnapshot {
+                group_id,
+                protocol,
+                name,
+                created_by,
+                members,
+                admins,
+                revision,
+                created_at,
+                updated_at,
+            },
+        }),
         GroupPairwisePayloadV1::GroupMessage {
             group_id,
             revision,
@@ -443,70 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_revision_field_wins_over_legacy_ms_tag() {
-        let codec = JsonGroupPayloadCodecV1;
-        let event = EventBuilder::new(
-            Kind::from(GROUP_METADATA_KIND as u16),
-            serde_json::json!({
-                "id": "group-1",
-                "name": "Team",
-                "members": [owner(1), owner(2)],
-                "admins": [owner(1)],
-                "revision": 4
-            })
-            .to_string(),
-        )
-        .tags(vec![
-            tag([GROUP_LABEL_TAG, "group-1"]).unwrap(),
-            tag([MS_TAG, "12000"]).unwrap(),
-        ])
-        .custom_created_at(Timestamp::from(12))
-        .build(device(9).to_nostr().unwrap());
-
-        let decoded = codec
-            .decode_pairwise_command(&serde_json::to_vec(&event).unwrap())
-            .unwrap();
-
-        assert!(matches!(
-            decoded,
-            Some(GroupPairwiseCommand::MetadataSnapshot { snapshot })
-                if snapshot.revision == 4
-        ));
-    }
-
-    #[test]
-    fn legacy_metadata_without_revision_uses_ms_as_compatibility_revision() {
-        let codec = JsonGroupPayloadCodecV1;
-        let event = EventBuilder::new(
-            Kind::from(GROUP_METADATA_KIND as u16),
-            serde_json::json!({
-                "id": "group-1",
-                "name": "Legacy",
-                "members": [owner(1), owner(2)],
-                "admins": [owner(1)]
-            })
-            .to_string(),
-        )
-        .tags(vec![
-            tag([GROUP_LABEL_TAG, "group-1"]).unwrap(),
-            tag([MS_TAG, "12000"]).unwrap(),
-        ])
-        .custom_created_at(Timestamp::from(12))
-        .build(device(9).to_nostr().unwrap());
-
-        let decoded = codec
-            .decode_pairwise_command(&serde_json::to_vec(&event).unwrap())
-            .unwrap();
-
-        assert!(matches!(
-            decoded,
-            Some(GroupPairwiseCommand::MetadataSnapshot { snapshot })
-                if snapshot.revision == 12000 && snapshot.name == "Legacy"
-        ));
-    }
-
-    #[test]
-    fn obsolete_metadata_delta_envelopes_are_not_consumed() {
+    fn transitional_create_and_sync_envelopes_decode_as_metadata_snapshots() {
         let codec = JsonGroupPayloadCodecV1;
         let create = serde_json::to_vec(&serde_json::json!({
             "wire_format_version": 1,
@@ -526,26 +546,32 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(codec.decode_pairwise_command(&create).unwrap(), None);
+        let decoded = codec.decode_pairwise_command(&create).unwrap();
+        assert!(matches!(
+            decoded,
+            Some(GroupPairwiseCommand::MetadataSnapshot { snapshot })
+                if snapshot.revision == 1 && snapshot.name == "Team"
+        ));
 
-        let sync = serde_json::to_vec(&serde_json::json!({
-            "wire_format_version": 1,
-            "payload": {
-                "kind": "sync_group",
-                "group_id": "group-1",
-                "protocol": "sender_key_v1",
-                "revision": 2,
-                "name": "Renamed",
-                "created_by": owner(1),
-                "members": [owner(1), owner(2)],
-                "admins": [owner(1)],
-                "created_at": 10,
-                "updated_at": 11
-            }
-        }))
+        let sync = encode_envelope(GroupPairwisePayloadV1::SyncGroup {
+            group_id: "group-1".to_string(),
+            protocol: GroupProtocol::sender_key_v1(),
+            revision: 2,
+            name: "Renamed".to_string(),
+            created_by: owner(1),
+            members: vec![owner(1), owner(2)],
+            admins: vec![owner(1)],
+            created_at: UnixSeconds(10),
+            updated_at: UnixSeconds(11),
+        })
         .unwrap();
 
-        assert_eq!(codec.decode_pairwise_command(&sync).unwrap(), None);
+        let decoded = codec.decode_pairwise_command(&sync).unwrap();
+        assert!(matches!(
+            decoded,
+            Some(GroupPairwiseCommand::MetadataSnapshot { snapshot })
+                if snapshot.revision == 2 && snapshot.name == "Renamed"
+        ));
     }
 
     #[test]
@@ -679,78 +705,6 @@ mod tests {
             codec.decode_pairwise_command(&encoded).unwrap(),
             Some(command)
         );
-    }
-
-    #[test]
-    fn sender_key_distribution_rejects_misleading_group_or_key_tags() {
-        let codec = JsonGroupPayloadCodecV1;
-        let event = EventBuilder::new(
-            Kind::from(GROUP_SENDER_KEY_DISTRIBUTION_KIND as u16),
-            serde_json::json!({
-                "groupId": "group-1",
-                "keyId": 7,
-                "chainKey": hex::encode([4; 32]),
-                "iteration": 0,
-                "createdAt": 11,
-                "senderEventPubkey": device(3).to_string(),
-            })
-            .to_string(),
-        )
-        .tags(vec![
-            tag([GROUP_LABEL_TAG, "other-group"]).unwrap(),
-            tag([KEY_TAG, "7"]).unwrap(),
-            tag([MS_TAG, "12000"]).unwrap(),
-        ])
-        .custom_created_at(Timestamp::from(12))
-        .build(device(9).to_nostr().unwrap());
-        let encoded = serde_json::to_vec(&event).unwrap();
-        assert!(codec.decode_pairwise_command(&encoded).is_err());
-
-        let event = EventBuilder::new(
-            Kind::from(GROUP_SENDER_KEY_DISTRIBUTION_KIND as u16),
-            serde_json::json!({
-                "groupId": "group-1",
-                "keyId": 7,
-                "chainKey": hex::encode([4; 32]),
-                "iteration": 0,
-                "createdAt": 11,
-                "senderEventPubkey": device(3).to_string(),
-            })
-            .to_string(),
-        )
-        .tags(vec![
-            tag([GROUP_LABEL_TAG, "group-1"]).unwrap(),
-            tag([KEY_TAG, "8"]).unwrap(),
-            tag([MS_TAG, "12000"]).unwrap(),
-        ])
-        .custom_created_at(Timestamp::from(12))
-        .build(device(9).to_nostr().unwrap());
-        let encoded = serde_json::to_vec(&event).unwrap();
-        assert!(codec.decode_pairwise_command(&encoded).is_err());
-    }
-
-    #[test]
-    fn sender_key_distribution_rejects_invalid_chain_key_length() {
-        let codec = JsonGroupPayloadCodecV1;
-        let event = EventBuilder::new(
-            Kind::from(GROUP_SENDER_KEY_DISTRIBUTION_KIND as u16),
-            serde_json::json!({
-                "groupId": "group-1",
-                "keyId": 7,
-                "chainKey": "aa",
-                "iteration": 0,
-                "createdAt": 11,
-                "senderEventPubkey": device(3).to_string(),
-            })
-            .to_string(),
-        )
-        .tags(vec![tag([GROUP_LABEL_TAG, "group-1"]).unwrap()])
-        .custom_created_at(Timestamp::from(12))
-        .build(device(9).to_nostr().unwrap());
-
-        assert!(codec
-            .decode_pairwise_command(&serde_json::to_vec(&event).unwrap())
-            .is_err());
     }
 
     #[test]

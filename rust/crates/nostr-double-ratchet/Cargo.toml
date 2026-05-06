@@ -26,6 +26,7 @@ nostr-double-ratchet-nostr = { path = "../nostr-double-ratchet-nostr" }
 nostr-double-ratchet-pairwise-codec = { path = "../nostr-double-ratchet-pairwise-codec" }
 nostr-double-ratchet-runtime = { path = "../nostr-double-ratchet-runtime", features = ["nearby"] }
 tokio.workspace = true
+crossbeam-channel.workspace = true
 urlencoding.workspace = true
 tempfile = "3"
 tokio-tungstenite = "0.24"

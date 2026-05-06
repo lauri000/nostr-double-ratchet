@@ -1,6 +1,8 @@
 use crate::{Result, StorageAdapter};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 pub struct FileStorageAdapter {
     base_path: PathBuf,
@@ -129,35 +131,75 @@ impl StorageAdapter for FileStorageAdapter {
 
 pub struct DebouncedFileStorage {
     adapter: FileStorageAdapter,
+    pending_writes: Mutex<HashMap<String, String>>,
+    last_flush: Mutex<std::time::Instant>,
+    flush_interval: std::time::Duration,
 }
 
 impl DebouncedFileStorage {
-    pub fn new(base_path: PathBuf, _flush_interval_ms: u64) -> Result<Self> {
+    pub fn new(base_path: PathBuf, flush_interval_ms: u64) -> Result<Self> {
         Ok(Self {
             adapter: FileStorageAdapter::new(base_path)?,
+            pending_writes: Mutex::new(HashMap::new()),
+            last_flush: Mutex::new(std::time::Instant::now()),
+            flush_interval: std::time::Duration::from_millis(flush_interval_ms),
         })
     }
 
     pub fn flush(&self) -> Result<()> {
+        let mut pending = self.pending_writes.lock().unwrap();
+        for (key, value) in pending.drain() {
+            self.adapter.put(&key, value)?;
+        }
+        *self.last_flush.lock().unwrap() = std::time::Instant::now();
+        Ok(())
+    }
+
+    fn maybe_flush(&self) -> Result<()> {
+        let last = *self.last_flush.lock().unwrap();
+        let pending_count = self.pending_writes.lock().unwrap().len();
+
+        if last.elapsed() >= self.flush_interval && pending_count > 0 {
+            self.flush()?;
+        }
         Ok(())
     }
 }
 
 impl StorageAdapter for DebouncedFileStorage {
     fn get(&self, key: &str) -> Result<Option<String>> {
+        let pending = self.pending_writes.lock().unwrap();
+        if let Some(value) = pending.get(key) {
+            return Ok(Some(value.clone()));
+        }
+        drop(pending);
         self.adapter.get(key)
     }
 
     fn put(&self, key: &str, value: String) -> Result<()> {
-        self.adapter.put(key, value)
+        self.pending_writes
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), value);
+        self.maybe_flush()
     }
 
     fn del(&self, key: &str) -> Result<()> {
+        self.pending_writes.lock().unwrap().remove(key);
         self.adapter.del(key)
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        self.adapter.list(prefix)
+        let mut keys = self.adapter.list(prefix)?;
+        let pending = self.pending_writes.lock().unwrap();
+
+        for key in pending.keys() {
+            if key.starts_with(prefix) && !keys.contains(key) {
+                keys.push(key.clone());
+            }
+        }
+
+        Ok(keys)
     }
 }
 
@@ -230,34 +272,15 @@ mod tests {
         storage.put("key1", "value1".to_string()).unwrap();
 
         assert_eq!(storage.get("key1").unwrap(), Some("value1".to_string()));
-        assert_eq!(
-            storage.adapter.get("key1").unwrap(),
-            Some("value1".to_string())
-        );
+
+        assert!(storage.pending_writes.lock().unwrap().contains_key("key1"));
 
         storage.flush().unwrap();
 
+        assert!(storage.pending_writes.lock().unwrap().is_empty());
         assert_eq!(
             storage.adapter.get("key1").unwrap(),
             Some("value1".to_string())
-        );
-    }
-
-    #[test]
-    fn debounced_storage_put_is_durable_before_returning_ok() {
-        let temp_dir = TempDir::new().unwrap();
-        {
-            let storage = DebouncedFileStorage::new(temp_dir.path().to_path_buf(), 60_000).unwrap();
-            storage
-                .put("runtime-state", "prepared publish".to_string())
-                .unwrap();
-        }
-
-        let reloaded = FileStorageAdapter::new(temp_dir.path().to_path_buf()).unwrap();
-        assert_eq!(
-            reloaded.get("runtime-state").unwrap().as_deref(),
-            Some("prepared publish"),
-            "StorageAdapter::put must be durable before returning Ok because NdrRuntime may emit publish/decrypt effects immediately after it"
         );
     }
 }

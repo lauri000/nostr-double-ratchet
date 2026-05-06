@@ -1,19 +1,26 @@
+pub mod app_keys_manager;
+pub mod delegate_manager;
 pub mod direct_message_subscriptions;
 pub mod file_storage;
+pub mod message_queue;
 #[cfg(feature = "nearby")]
 pub mod nearby;
 #[cfg(feature = "nearby-mdns")]
 pub mod nearby_lan;
 pub mod protocol_backfill;
+pub mod pubsub;
 pub mod runtime;
 pub mod storage;
 pub mod user_record;
 
+pub use app_keys_manager::AppKeysManager;
+pub use delegate_manager::{DelegateManager, DelegatePayload};
 pub use direct_message_subscriptions::{
     build_direct_message_backfill_filter, direct_message_subscription_authors,
     DirectMessageSubscriptionTracker,
 };
 pub use file_storage::{DebouncedFileStorage, FileStorageAdapter};
+pub use message_queue::{MessageQueue, QueueEntry};
 #[cfg(feature = "nearby")]
 pub use nearby::{
     decode_nearby_frame_json, encode_nearby_frame_json, nearby_frame_body_len_from_header,
@@ -46,15 +53,60 @@ pub use protocol_backfill::{
     NdrProtocolBackfillOptions, DEFAULT_INVITE_BACKFILL_LOOKBACK_SECS,
     DEFAULT_MESSAGE_BACKFILL_LOOKBACK_SECS,
 };
+pub use pubsub::{ChannelPubSub, NostrPubSub, SessionEvent};
 pub use runtime::{
     AcceptInviteResult, GroupOuterSubscriptionPlan, MessagePushSessionStateSnapshot, NdrRuntime,
-    QueuedMessageDiagnostic, QueuedMessageStage, RuntimeAcceptInviteResult, RuntimeEffect,
-    RuntimeGroupCreateResult, RuntimeGroupIncomingResult, RuntimeGroupSnapshotResult,
-    RuntimePublishResult, RuntimeTextSendResult,
+    QueuedMessageDiagnostic, QueuedMessageStage, SessionManagerEvent,
 };
 pub use storage::{InMemoryStorage, StorageAdapter};
 pub use user_record::{DeviceRecord, StoredDeviceRecord, StoredUserRecord, UserRecord};
 
 pub mod utils {
     pub use nostr_double_ratchet_nostr::utils::*;
+}
+
+pub trait InviteRuntimeExt {
+    fn listen(&self, event_tx: &crossbeam_channel::Sender<SessionManagerEvent>) -> Result<()>;
+    fn from_user(
+        user_pubkey: nostr::PublicKey,
+        event_tx: &crossbeam_channel::Sender<SessionManagerEvent>,
+    ) -> Result<()>;
+}
+
+impl InviteRuntimeExt for Invite {
+    fn listen(&self, event_tx: &crossbeam_channel::Sender<SessionManagerEvent>) -> Result<()> {
+        let filter = pubsub::build_filter()
+            .kinds(vec![INVITE_RESPONSE_KIND as u64])
+            .pubkeys(vec![self.inviter_ephemeral_public_key.to_nostr()?])
+            .build();
+        let filter_json = serde_json::to_string(&filter)?;
+        event_tx
+            .send(SessionManagerEvent::Subscribe {
+                subid: format!("invite-response-{}", uuid::Uuid::new_v4()),
+                filter_json,
+            })
+            .map_err(|error| Error::InvalidEvent(error.to_string()))?;
+        Ok(())
+    }
+
+    fn from_user(
+        user_pubkey: nostr::PublicKey,
+        event_tx: &crossbeam_channel::Sender<SessionManagerEvent>,
+    ) -> Result<()> {
+        let filter = nostr::Filter::new()
+            .kind(nostr::Kind::from(INVITE_EVENT_KIND as u16))
+            .authors(vec![user_pubkey])
+            .custom_tag(
+                nostr::SingleLetterTag::lowercase(nostr::Alphabet::L),
+                "double-ratchet/invites",
+            );
+        let filter_json = serde_json::to_string(&filter)?;
+        event_tx
+            .send(SessionManagerEvent::Subscribe {
+                subid: format!("invite-user-{}", uuid::Uuid::new_v4()),
+                filter_json,
+            })
+            .map_err(|error| Error::InvalidEvent(error.to_string()))?;
+        Ok(())
+    }
 }

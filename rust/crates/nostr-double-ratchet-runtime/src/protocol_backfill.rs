@@ -323,7 +323,7 @@ mod tests {
             None,
         );
         assert_eq!(runtime.get_our_pubkey(), local_device.public_key());
-        let _ = runtime.ingest_app_keys_snapshot(
+        runtime.ingest_app_keys_snapshot(
             peer_owner.public_key(),
             AppKeys::new(vec![DeviceEntry::new(peer_device.public_key(), 1)]),
             1,

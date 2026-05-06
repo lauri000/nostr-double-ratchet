@@ -1,8 +1,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crossbeam_channel::{Receiver, Sender};
 use nostr::{Event, Filter, Keys, Kind, PublicKey, UnsignedEvent};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -20,121 +20,29 @@ use crate::{
 const RUNTIME_STATE_KEY: &str = "v2/runtime-state";
 const PROTOCOL_SUBID: &str = "ndr-runtime-protocol";
 const MESSAGE_SUBID: &str = "ndr-runtime-messages";
-const MAX_PENDING_PAIRWISE_MESSAGE_EVENTS: usize = 256;
 
 #[derive(Debug, Clone)]
-pub enum RuntimeEffect {
+pub enum SessionManagerEvent {
     Subscribe {
         subid: String,
-        filters: Vec<Filter>,
+        filter_json: String,
     },
     Unsubscribe(String),
-    FetchBackfill,
-    PublishUnsigned(UnsignedEvent),
+    Publish(UnsignedEvent),
     PublishSigned(Event),
     PublishSignedForInnerEvent {
         event: Event,
         inner_event_id: Option<String>,
         target_device_id: Option<String>,
     },
-    EmitDecrypted {
+    ReceivedEvent(Event),
+    DecryptedMessage {
         sender: PublicKey,
         sender_device: Option<PublicKey>,
         conversation_owner: Option<PublicKey>,
         content: String,
         event_id: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RuntimePublishResult {
-    pub event_ids: Vec<String>,
-    pub effects: Vec<RuntimeEffect>,
-}
-
-impl Deref for RuntimePublishResult {
-    type Target = Vec<String>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.event_ids
-    }
-}
-
-impl PartialEq<Vec<String>> for RuntimePublishResult {
-    fn eq(&self, other: &Vec<String>) -> bool {
-        &self.event_ids == other
-    }
-}
-
-impl PartialEq<RuntimePublishResult> for Vec<String> {
-    fn eq(&self, other: &RuntimePublishResult) -> bool {
-        self == &other.event_ids
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RuntimeTextSendResult {
-    pub inner_event_id: String,
-    pub event_ids: Vec<String>,
-    pub effects: Vec<RuntimeEffect>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RuntimeAcceptInviteResult {
-    pub outcome: AcceptInviteResult,
-    pub effects: Vec<RuntimeEffect>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RuntimeGroupCreateResult {
-    pub outcome: GroupCreateResult,
-    pub effects: Vec<RuntimeEffect>,
-}
-
-impl Deref for RuntimeGroupCreateResult {
-    type Target = GroupCreateResult;
-
-    fn deref(&self) -> &Self::Target {
-        &self.outcome
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RuntimeGroupSnapshotResult {
-    pub snapshot: crate::GroupSnapshot,
-    pub effects: Vec<RuntimeEffect>,
-}
-
-impl Deref for RuntimeGroupSnapshotResult {
-    type Target = crate::GroupSnapshot;
-
-    fn deref(&self) -> &Self::Target {
-        &self.snapshot
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct RuntimeGroupIncomingResult {
-    pub events: Vec<GroupIncomingEvent>,
-    pub effects: Vec<RuntimeEffect>,
-    pub consumed: bool,
-}
-
-impl Deref for RuntimeGroupIncomingResult {
-    type Target = Vec<GroupIncomingEvent>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.events
-    }
-}
-
-impl IntoIterator for RuntimeGroupIncomingResult {
-    type Item = GroupIncomingEvent;
-    type IntoIter = std::vec::IntoIter<GroupIncomingEvent>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.events.into_iter()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -177,13 +85,6 @@ pub struct GroupOuterSubscriptionPlan {
 pub struct GroupPairwiseHandleOutcome {
     pub events: Vec<GroupIncomingEvent>,
     pub consumed: bool,
-    pub effects: Vec<RuntimeEffect>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct GroupSenderKeyRetryResult {
-    events: Vec<GroupIncomingEvent>,
-    changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,10 +100,6 @@ struct StoredRuntimeState {
     pending_group_pairwise_payloads: Vec<PendingGroupPairwisePayload>,
     #[serde(default)]
     pending_group_fanouts: Vec<PendingGroupFanout>,
-    #[serde(default)]
-    pending_pairwise_message_events: Vec<PendingPairwiseMessageEvent>,
-    #[serde(default)]
-    pending_decrypted_deliveries: Vec<PendingDecryptedDelivery>,
     pending_outbound: Vec<PendingOutbound>,
     processed_invite_response_ids: Vec<String>,
     latest_app_keys_created_at: HashMap<String, u64>,
@@ -220,47 +117,11 @@ struct PendingOutbound {
     reason: QueuedMessageStage,
 }
 
-fn same_pending_outbound(
-    pending: &PendingOutbound,
-    recipient_owner: OwnerPubkey,
-    inner_event_id: Option<&str>,
-    remote_payload: &[u8],
-    local_sibling_payload: Option<&[u8]>,
-) -> bool {
-    if pending.recipient_owner != recipient_owner {
-        return false;
-    }
-    match (pending.inner_event_id.as_deref(), inner_event_id) {
-        (Some(existing), Some(next)) => existing == next,
-        (None, None) => {
-            pending.remote_payload == remote_payload
-                && pending.local_sibling_payload.as_deref() == local_sibling_payload
-        }
-        _ => false,
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingPreparedPublish {
     event: Event,
     inner_event_id: Option<String>,
     target_device_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PendingPairwiseMessageEvent {
-    event: Event,
-    created_at_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PendingDecryptedDelivery {
-    sender_owner: OwnerPubkey,
-    sender_device: Option<DevicePubkey>,
-    conversation_owner: Option<OwnerPubkey>,
-    content: String,
-    event_id: Option<String>,
-    created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,7 +149,6 @@ struct LocalSiblingPayload {
     payload: String,
 }
 
-#[derive(Clone)]
 struct RuntimeState {
     core: SessionManager,
     group_manager: GroupManager,
@@ -296,17 +156,10 @@ struct RuntimeState {
     pending_group_sender_key_messages: Vec<nostr_codec::ParsedGroupSenderKeyMessageEvent>,
     pending_group_pairwise_payloads: Vec<PendingGroupPairwisePayload>,
     pending_group_fanouts: Vec<PendingGroupFanout>,
-    pending_pairwise_message_events: Vec<PendingPairwiseMessageEvent>,
-    pending_decrypted_deliveries: Vec<PendingDecryptedDelivery>,
     pending_outbound: Vec<PendingOutbound>,
     processed_invite_response_ids: HashSet<String>,
     latest_app_keys_created_at: HashMap<PublicKey, u64>,
     tracked_owner_pubkeys: BTreeSet<PublicKey>,
-}
-
-enum MessageSenderOwnerResolution {
-    Verified(OwnerPubkey),
-    PendingUnverifiedClaim,
 }
 
 struct DirectMessageSubscription {
@@ -315,6 +168,8 @@ struct DirectMessageSubscription {
 
 pub struct NdrRuntime {
     state: Mutex<RuntimeState>,
+    event_rx: Mutex<Receiver<SessionManagerEvent>>,
+    event_tx: Sender<SessionManagerEvent>,
     storage: Arc<dyn StorageAdapter>,
     our_public_key: PublicKey,
     our_identity_key: [u8; 32],
@@ -354,6 +209,7 @@ impl NdrRuntime {
     ) -> Self {
         let storage = session_storage.unwrap_or_else(|| Arc::new(InMemoryStorage::new()));
         let _group_storage = group_storage.unwrap_or_else(|| Arc::clone(&storage));
+        let (event_tx, event_rx) = crossbeam_channel::unbounded::<SessionManagerEvent>();
         let mut state = RuntimeState::load(storage.as_ref(), owner_public_key, our_identity_key)
             .unwrap_or_else(|| RuntimeState {
                 core: SessionManager::new(owner(owner_public_key), our_identity_key),
@@ -362,8 +218,6 @@ impl NdrRuntime {
                 pending_group_sender_key_messages: Vec::new(),
                 pending_group_pairwise_payloads: Vec::new(),
                 pending_group_fanouts: Vec::new(),
-                pending_pairwise_message_events: Vec::new(),
-                pending_decrypted_deliveries: Vec::new(),
                 pending_outbound: Vec::new(),
                 processed_invite_response_ids: HashSet::new(),
                 latest_app_keys_created_at: HashMap::new(),
@@ -376,6 +230,8 @@ impl NdrRuntime {
 
         Self {
             state: Mutex::new(state),
+            event_rx: Mutex::new(event_rx),
+            event_tx,
             storage,
             our_public_key,
             our_identity_key,
@@ -385,49 +241,43 @@ impl NdrRuntime {
         }
     }
 
-    pub fn init(&self) -> Result<Vec<RuntimeEffect>> {
-        self.with_state_checkpoint(|| {
-            let now = now();
-            let mut effects = Vec::new();
-            {
-                let mut rng = OsRng;
-                let mut ctx = ProtocolContext::new(now, &mut rng);
-                let mut state = self.state.lock().unwrap();
-                let has_local_roster = state.core.snapshot().users.into_iter().any(|user| {
-                    user.owner_pubkey == owner(self.owner_public_key) && user.roster.is_some()
-                });
-                let invite = state.core.ensure_local_invite(&mut ctx)?.clone();
-                if !has_local_roster {
-                    let created_at = invite.created_at;
-                    let local_roster = DeviceRoster::new(
+    pub fn init(&self) -> Result<()> {
+        let now = now();
+        {
+            let mut rng = OsRng;
+            let mut ctx = ProtocolContext::new(now, &mut rng);
+            let mut state = self.state.lock().unwrap();
+            let has_local_roster = state.core.snapshot().users.into_iter().any(|user| {
+                user.owner_pubkey == owner(self.owner_public_key) && user.roster.is_some()
+            });
+            let invite = state.core.ensure_local_invite(&mut ctx)?.clone();
+            if !has_local_roster {
+                let created_at = invite.created_at;
+                let local_roster = DeviceRoster::new(
+                    created_at,
+                    vec![AuthorizedDevice::new(
+                        device(self.our_public_key),
                         created_at,
-                        vec![AuthorizedDevice::new(
-                            device(self.our_public_key),
-                            created_at,
-                        )],
-                    );
-                    state.core.apply_local_roster(local_roster);
-                }
-                drop(state);
-                effects.push(self.publish_local_invite_effect(&invite)?);
+                    )],
+                );
+                state.core.apply_local_roster(local_roster);
             }
-            self.persist_state_now()?;
-            effects.extend(self.replay_pending_decrypted_deliveries());
-            effects.extend(self.replay_pending_prepared_publishes());
-            effects.extend(self.refresh_protocol_subscriptions()?);
-            effects.extend(self.sync_direct_message_subscriptions()?);
-            Ok(effects)
-        })
+            drop(state);
+            self.publish_local_invite(&invite)?;
+        }
+        self.persist_state()?;
+        self.replay_pending_prepared_publishes()?;
+        self.refresh_protocol_subscriptions()?;
+        self.sync_direct_message_subscriptions()
     }
 
-    pub fn setup_user(&self, user_pubkey: PublicKey) -> Result<Vec<RuntimeEffect>> {
+    pub fn setup_user(&self, user_pubkey: PublicKey) -> Result<()> {
         self.observe_owner_if_absent(user_pubkey);
-        let mut effects = self.refresh_protocol_subscriptions()?;
-        effects.extend(self.sync_direct_message_subscriptions()?);
-        Ok(effects)
+        self.refresh_protocol_subscriptions()?;
+        self.sync_direct_message_subscriptions()
     }
 
-    pub fn reload_from_storage(&self) -> Result<Vec<RuntimeEffect>> {
+    pub fn reload_from_storage(&self) -> Result<()> {
         if let Some(loaded) = RuntimeState::load(
             self.storage.as_ref(),
             self.owner_public_key,
@@ -435,62 +285,34 @@ impl NdrRuntime {
         ) {
             *self.state.lock().unwrap() = loaded;
         }
-        let mut effects = self.replay_pending_decrypted_deliveries();
-        effects.extend(self.replay_pending_prepared_publishes());
-        effects.extend(self.refresh_protocol_subscriptions()?);
-        effects.extend(self.sync_direct_message_subscriptions()?);
-        Ok(effects)
+        self.replay_pending_prepared_publishes()?;
+        self.refresh_protocol_subscriptions()?;
+        self.sync_direct_message_subscriptions()
     }
 
-    pub fn prepared_publish_effects(&self) -> Vec<RuntimeEffect> {
-        self.replay_pending_prepared_publishes()
+    pub fn ack_prepared_publish(&self, event_id: &str) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let before = state.pending_prepared_publishes.len();
+        state
+            .pending_prepared_publishes
+            .retain(|pending| pending.event.id.to_string() != event_id);
+        let changed = state.pending_prepared_publishes.len() != before;
+        drop(state);
+        if changed {
+            self.persist_state()?;
+        }
+        Ok(())
     }
 
-    pub fn ack_prepared_publish(&self, event_id: &str) -> Result<Vec<RuntimeEffect>> {
-        self.with_state_checkpoint(|| {
-            let mut state = self.state.lock().unwrap();
-            let before = state.pending_prepared_publishes.len();
-            state
-                .pending_prepared_publishes
-                .retain(|pending| pending.event.id.to_string() != event_id);
-            let changed = state.pending_prepared_publishes.len() != before;
-            drop(state);
-            if changed {
-                self.persist_state_now()?;
-            }
-            Ok(Vec::new())
-        })
-    }
-
-    pub fn ack_decrypted_delivery(&self, event_id: &str) -> Result<Vec<RuntimeEffect>> {
-        self.with_state_checkpoint(|| {
-            let mut state = self.state.lock().unwrap();
-            let before = state.pending_decrypted_deliveries.len();
-            state
-                .pending_decrypted_deliveries
-                .retain(|pending| pending.event_id.as_deref() != Some(event_id));
-            let changed = state.pending_decrypted_deliveries.len() != before;
-            drop(state);
-            if changed {
-                self.persist_state_now()?;
-            }
-            Ok(Vec::new())
-        })
-    }
-
-    pub fn delete_chat(&self, user_pubkey: PublicKey) -> Result<Vec<RuntimeEffect>> {
-        self.with_state_checkpoint(|| {
-            self.state
-                .lock()
-                .unwrap()
-                .core
-                .delete_user(owner(user_pubkey));
-            let mut effects = Vec::new();
-            self.persist_state_now()?;
-            effects.extend(self.refresh_protocol_subscriptions()?);
-            effects.extend(self.sync_direct_message_subscriptions()?);
-            Ok(effects)
-        })
+    pub fn delete_chat(&self, user_pubkey: PublicKey) -> Result<()> {
+        self.state
+            .lock()
+            .unwrap()
+            .core
+            .delete_user(owner(user_pubkey));
+        self.persist_state()?;
+        self.refresh_protocol_subscriptions()?;
+        self.sync_direct_message_subscriptions()
     }
 
     pub fn cleanup_discovery_queue(&self, _max_age_ms: u64) -> Result<usize> {
@@ -501,46 +323,40 @@ impl NdrRuntime {
         &self,
         invite: &Invite,
         owner_pubkey_hint: Option<PublicKey>,
-    ) -> Result<RuntimeAcceptInviteResult> {
-        self.with_state_checkpoint(|| {
-            let invite_owner = owner_pubkey_hint
-                .or_else(|| invite.inviter_owner_pubkey.map(public_owner))
-                .unwrap_or_else(|| public_device(invite.inviter_device_pubkey));
-            let mut invite = invite.clone();
-            invite.inviter_owner_pubkey = Some(owner(invite_owner));
-            {
-                let mut state = self.state.lock().unwrap();
-                state
-                    .core
-                    .observe_device_invite(owner(invite_owner), invite.clone())?;
-                state.core.observe_peer_roster(
-                    owner(invite_owner),
-                    DeviceRoster::new(
-                        now(),
-                        vec![AuthorizedDevice::new(
-                            invite.inviter_device_pubkey,
-                            invite.created_at,
-                        )],
-                    ),
-                );
-            }
-            let mut effects = Vec::new();
-            self.persist_state_now()?;
-            effects.extend(self.refresh_protocol_subscriptions()?);
+    ) -> Result<AcceptInviteResult> {
+        let invite_owner = owner_pubkey_hint
+            .or_else(|| invite.inviter_owner_pubkey.map(public_owner))
+            .unwrap_or_else(|| public_device(invite.inviter_device_pubkey));
+        let mut invite = invite.clone();
+        invite.inviter_owner_pubkey = Some(owner(invite_owner));
+        {
+            let mut state = self.state.lock().unwrap();
+            state
+                .core
+                .observe_device_invite(owner(invite_owner), invite.clone())?;
+            state.core.observe_peer_roster(
+                owner(invite_owner),
+                DeviceRoster::new(
+                    now(),
+                    vec![AuthorizedDevice::new(
+                        invite.inviter_device_pubkey,
+                        invite.created_at,
+                    )],
+                ),
+            );
+        }
+        self.persist_state()?;
+        self.refresh_protocol_subscriptions()?;
 
-            if invite.purpose.as_deref() == Some("link") {
-                effects.extend(self.send_link_bootstrap(invite_owner)?.effects);
-            }
+        if invite.purpose.as_deref() == Some("link") {
+            self.send_link_bootstrap(invite_owner)?;
+        }
 
-            Ok(RuntimeAcceptInviteResult {
-                outcome: AcceptInviteResult {
-                    owner_pubkey: invite_owner,
-                    inviter_device_pubkey: public_device(invite.inviter_device_pubkey),
-                    device_id: public_device(invite.inviter_device_pubkey).to_hex(),
-                    created_new_session: false,
-                },
-                effects,
-            })
+        Ok(AcceptInviteResult {
+            owner_pubkey: invite_owner,
+            inviter_device_pubkey: public_device(invite.inviter_device_pubkey),
+            device_id: public_device(invite.inviter_device_pubkey).to_hex(),
+            created_new_session: false,
         })
     }
 
@@ -549,15 +365,12 @@ impl NdrRuntime {
         recipient: PublicKey,
         text: String,
         options: Option<SendOptions>,
-    ) -> Result<RuntimePublishResult> {
+    ) -> Result<Vec<String>> {
         if text.trim().is_empty() {
-            return Ok(RuntimePublishResult::default());
+            return Ok(Vec::new());
         }
-        let result = self.send_text_with_inner_id(recipient, text, options)?;
-        Ok(RuntimePublishResult {
-            event_ids: result.event_ids,
-            effects: result.effects,
-        })
+        let (_, ids) = self.send_text_with_inner_id(recipient, text, options)?;
+        Ok(ids)
     }
 
     pub fn send_text_with_inner_id(
@@ -565,9 +378,9 @@ impl NdrRuntime {
         recipient: PublicKey,
         text: String,
         options: Option<SendOptions>,
-    ) -> Result<RuntimeTextSendResult> {
+    ) -> Result<(String, Vec<String>)> {
         if text.trim().is_empty() {
-            return Ok(RuntimeTextSendResult::default());
+            return Ok((String::new(), Vec::new()));
         }
         let now = now();
         let now_ms = current_unix_millis();
@@ -588,31 +401,25 @@ impl NdrRuntime {
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_default();
-        let result = self.send_event(recipient, event)?;
-        Ok(RuntimeTextSendResult {
-            inner_event_id: inner_id,
-            event_ids: result.event_ids,
-            effects: result.effects,
-        })
+        let ids = self.send_event(recipient, event)?;
+        Ok((inner_id, ids))
     }
 
     pub fn send_event(
         &self,
         recipient: PublicKey,
         mut event: UnsignedEvent,
-    ) -> Result<RuntimePublishResult> {
+    ) -> Result<Vec<String>> {
         event.ensure_id();
         let inner_id = event.id.as_ref().map(ToString::to_string);
         let remote_payload = serde_json::to_vec(&event)?;
         let local_payload = local_sibling_payload(recipient, &remote_payload)?;
-        self.with_state_checkpoint(|| {
-            self.prepare_and_publish(
-                owner(recipient),
-                remote_payload,
-                Some(local_payload),
-                inner_id,
-            )
-        })
+        self.prepare_and_publish(
+            owner(recipient),
+            remote_payload,
+            Some(local_payload),
+            inner_id,
+        )
     }
 
     pub fn send_reaction(
@@ -621,7 +428,7 @@ impl NdrRuntime {
         message_id: String,
         emoji: String,
         options: Option<SendOptions>,
-    ) -> Result<RuntimePublishResult> {
+    ) -> Result<Vec<String>> {
         let now = now();
         let now_ms = current_unix_millis();
         let expiration = options
@@ -650,9 +457,9 @@ impl NdrRuntime {
         receipt_type: &str,
         message_ids: Vec<String>,
         options: Option<SendOptions>,
-    ) -> Result<RuntimePublishResult> {
+    ) -> Result<Vec<String>> {
         if message_ids.is_empty() {
-            return Ok(RuntimePublishResult::default());
+            return Ok(Vec::new());
         }
         let now = now();
         let now_ms = current_unix_millis();
@@ -682,7 +489,7 @@ impl NdrRuntime {
         &self,
         recipient: PublicKey,
         options: Option<SendOptions>,
-    ) -> Result<RuntimePublishResult> {
+    ) -> Result<Vec<String>> {
         let now = now();
         let now_ms = current_unix_millis();
         let expiration = options
@@ -704,7 +511,7 @@ impl NdrRuntime {
         &self,
         recipient: PublicKey,
         ttl_seconds: u64,
-    ) -> Result<RuntimePublishResult> {
+    ) -> Result<Vec<String>> {
         let ttl = if ttl_seconds == 0 {
             pairwise_codec::ChatSettingsTtl::DisablePeerExpiration
         } else {
@@ -725,24 +532,20 @@ impl NdrRuntime {
         peer_pubkey: PublicKey,
         device_id: Option<String>,
         state: SessionState,
-    ) -> Result<Vec<RuntimeEffect>> {
-        self.with_state_checkpoint(|| {
-            let device_pubkey = device_id
-                .as_deref()
-                .and_then(|value| PublicKey::parse(value).ok())
-                .map(device)
-                .unwrap_or_else(|| device(peer_pubkey));
-            self.state.lock().unwrap().core.import_session_state(
-                owner(peer_pubkey),
-                device_pubkey,
-                state,
-                now(),
-            );
-            let mut effects = Vec::new();
-            self.persist_state_now()?;
-            effects.extend(self.sync_direct_message_subscriptions()?);
-            Ok(effects)
-        })
+    ) -> Result<()> {
+        let device_pubkey = device_id
+            .as_deref()
+            .and_then(|value| PublicKey::parse(value).ok())
+            .map(device)
+            .unwrap_or_else(|| device(peer_pubkey));
+        self.state.lock().unwrap().core.import_session_state(
+            owner(peer_pubkey),
+            device_pubkey,
+            state,
+            now(),
+        );
+        self.persist_state()?;
+        self.sync_direct_message_subscriptions()
     }
 
     pub fn export_active_sessions(&self) -> Vec<(PublicKey, String, SessionState)> {
@@ -882,119 +685,107 @@ impl NdrRuntime {
         owner_pubkey: PublicKey,
         app_keys: AppKeys,
         created_at: u64,
-    ) -> Result<Vec<RuntimeEffect>> {
-        self.with_state_checkpoint(|| {
-            let mut state = self.state.lock().unwrap();
-            let latest = state
-                .latest_app_keys_created_at
-                .get(&owner_pubkey)
-                .copied()
-                .unwrap_or(0);
-            if created_at < latest {
-                return Ok(Vec::new());
-            }
-            state
-                .latest_app_keys_created_at
-                .insert(owner_pubkey, created_at);
-            let roster = DeviceRoster::new(
-                UnixSeconds(created_at),
-                app_keys
-                    .get_all_devices()
-                    .into_iter()
-                    .map(|entry| {
-                        AuthorizedDevice::new(
-                            device(entry.identity_pubkey),
-                            UnixSeconds(entry.created_at),
-                        )
-                    })
-                    .collect(),
-            );
-            if owner_pubkey == self.owner_public_key {
-                if should_replace_provisional_local_roster(
-                    &state.core.snapshot(),
-                    self.owner_public_key,
-                    self.our_public_key,
-                    &roster,
-                ) {
-                    state.core.replace_local_roster(roster);
-                } else {
-                    state.core.apply_local_roster(roster);
-                }
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let latest = state
+            .latest_app_keys_created_at
+            .get(&owner_pubkey)
+            .copied()
+            .unwrap_or(0);
+        if created_at < latest {
+            return;
+        }
+        state
+            .latest_app_keys_created_at
+            .insert(owner_pubkey, created_at);
+        let roster = DeviceRoster::new(
+            UnixSeconds(created_at),
+            app_keys
+                .get_all_devices()
+                .into_iter()
+                .map(|entry| {
+                    AuthorizedDevice::new(
+                        device(entry.identity_pubkey),
+                        UnixSeconds(entry.created_at),
+                    )
+                })
+                .collect(),
+        );
+        if owner_pubkey == self.owner_public_key {
+            if should_replace_provisional_local_roster(
+                &state.core.snapshot(),
+                self.owner_public_key,
+                self.our_public_key,
+                &roster,
+            ) {
+                state.core.replace_local_roster(roster);
             } else {
-                state.core.observe_peer_roster(owner(owner_pubkey), roster);
+                state.core.apply_local_roster(roster);
             }
-            drop(state);
-            let mut effects = Vec::new();
-            self.persist_state_now()?;
-            effects.extend(self.retry_pending_outbound()?);
-            effects.extend(self.retry_pending_group_fanouts()?);
-            effects.extend(self.retry_pending_pairwise_message_events()?);
-            effects.extend(self.refresh_protocol_subscriptions()?);
-            effects.extend(self.sync_direct_message_subscriptions()?);
-            Ok(effects)
-        })
+        } else {
+            state.core.observe_peer_roster(owner(owner_pubkey), roster);
+        }
+        drop(state);
+        let _ = self.persist_state();
+        let _ = self.retry_pending_outbound();
+        let _ = self.retry_pending_group_fanouts();
+        let _ = self.refresh_protocol_subscriptions();
+        let _ = self.sync_direct_message_subscriptions();
     }
 
-    pub fn process_received_event(&self, event: Event) -> Result<Vec<RuntimeEffect>> {
-        self.with_state_checkpoint(|| {
-            let kind = event.kind.as_u16() as u32;
-            let event_id = event.id.to_string();
-            if kind == MESSAGE_EVENT_KIND {
-                if let Some(effect) = self.pending_decrypted_delivery_effect_by_event_id(&event_id)
-                {
-                    return Ok(vec![effect]);
-                }
-            }
-            let mut effects = match kind {
-                APP_KEYS_EVENT_KIND if crate::is_app_keys_event(&event) => {
-                    AppKeys::from_event(&event)
-                        .map_err(Into::into)
-                        .and_then(|app_keys| {
-                            self.ingest_app_keys_snapshot(
-                                event.pubkey,
-                                app_keys,
-                                event.created_at.as_secs(),
-                            )
-                        })
-                }
-                INVITE_EVENT_KIND => self.process_invite_event(&event),
-                INVITE_RESPONSE_KIND => self.process_invite_response_event(&event),
-                MESSAGE_EVENT_KIND => self.process_message_event(&event, Some(event_id)),
-                _ => Ok(Vec::new()),
-            }?;
-            effects.extend(self.sync_direct_message_subscriptions()?);
-            Ok(effects)
-        })
+    pub fn process_received_event(&self, event: Event) {
+        let kind = event.kind.as_u16() as u32;
+        let event_id = event.id.to_string();
+        let result = match kind {
+            APP_KEYS_EVENT_KIND if crate::is_app_keys_event(&event) => AppKeys::from_event(&event)
+                .map(|app_keys| {
+                    self.ingest_app_keys_snapshot(
+                        event.pubkey,
+                        app_keys,
+                        event.created_at.as_secs(),
+                    )
+                }),
+            INVITE_EVENT_KIND => self.process_invite_event(&event),
+            INVITE_RESPONSE_KIND => self.process_invite_response_event(&event),
+            MESSAGE_EVENT_KIND => self.process_message_event(&event, Some(event_id)),
+            _ => Ok(()),
+        };
+        if result.is_ok() {
+            let _ = self.sync_direct_message_subscriptions();
+        }
     }
 
-    pub fn sync_direct_message_subscriptions(&self) -> Result<Vec<RuntimeEffect>> {
+    pub fn sync_direct_message_subscriptions(&self) -> Result<()> {
         let next_authors = self.get_all_message_push_author_pubkeys();
         let mut current = self.direct_message_subscription.lock().unwrap();
         if current
             .as_ref()
             .is_some_and(|subscription| subscription.authors == next_authors)
         {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        let mut effects = Vec::new();
         if current.is_some() {
-            effects.push(RuntimeEffect::Unsubscribe(MESSAGE_SUBID.to_string()));
+            self.event_tx
+                .send(SessionManagerEvent::Unsubscribe(MESSAGE_SUBID.to_string()))
+                .map_err(|_| Error::Storage("event queue closed".to_string()))?;
         }
         if next_authors.is_empty() {
             *current = None;
-            return Ok(effects);
+            return Ok(());
         }
         let filter = Filter::new()
             .kind(Kind::from(MESSAGE_EVENT_KIND as u16))
             .authors(next_authors.clone());
-        effects.push(RuntimeEffect::Subscribe {
-            subid: MESSAGE_SUBID.to_string(),
-            filters: vec![filter],
-        });
+        self.event_tx
+            .send(SessionManagerEvent::Subscribe {
+                subid: MESSAGE_SUBID.to_string(),
+                filter_json: serde_json::to_string(&filter)?,
+            })
+            .map_err(|_| Error::Storage("event queue closed".to_string()))?;
         *current = Some(DirectMessageSubscription {
             authors: next_authors,
         });
-        Ok(effects)
+        Ok(())
     }
 
     pub fn pending_invite_response_owner_pubkeys(&self) -> Vec<PublicKey> {
@@ -1015,14 +806,6 @@ impl NdrRuntime {
         self.state.lock().unwrap().core.snapshot().local_invite
     }
 
-    pub fn session_manager_snapshot(&self) -> SessionManagerSnapshot {
-        self.state.lock().unwrap().core.snapshot()
-    }
-
-    pub fn group_manager_snapshot(&self) -> GroupManagerSnapshot {
-        self.state.lock().unwrap().group_manager.snapshot()
-    }
-
     pub fn get_owner_pubkey(&self) -> PublicKey {
         self.owner_public_key
     }
@@ -1039,11 +822,11 @@ impl NdrRuntime {
 
     pub fn with_group_context<R>(
         &self,
-        f: impl FnOnce(&mut SessionManager, &mut GroupManager) -> R,
+        f: impl FnOnce(&mut SessionManager, &mut GroupManager, &Sender<SessionManagerEvent>) -> R,
     ) -> R {
         let mut state = self.state.lock().unwrap();
         let (core, group_manager) = state.core_and_group_mut();
-        f(core, group_manager)
+        f(core, group_manager, &self.event_tx)
     }
 
     pub fn sync_groups(&self, _groups: Vec<crate::GroupSnapshot>) -> Result<()> {
@@ -1091,115 +874,98 @@ impl NdrRuntime {
         &self,
         name: String,
         member_owners: Vec<PublicKey>,
-    ) -> Result<RuntimeGroupCreateResult> {
-        self.with_state_checkpoint(|| {
-            let now = now();
-            let mut rng = OsRng;
-            let mut ctx = ProtocolContext::new(now, &mut rng);
-            let result = {
-                let mut state = self.state.lock().unwrap();
-                let (core, group_manager) = state.core_and_group_mut();
-                group_manager.create_group_with_protocol(
-                    core,
-                    &mut ctx,
-                    name,
-                    member_owners.into_iter().map(owner).collect(),
-                    GroupProtocol::sender_key_v1(),
-                )?
-            };
-            let mut effects = self
-                .publish_group_prepared_send(&result.prepared, None)?
-                .effects;
-            self.persist_state_now()?;
-            effects.extend(self.refresh_protocol_subscriptions()?);
-            effects.extend(self.sync_direct_message_subscriptions()?);
-            Ok(RuntimeGroupCreateResult {
-                outcome: result,
-                effects,
-            })
-        })
+    ) -> Result<GroupCreateResult> {
+        let now = now();
+        let mut rng = OsRng;
+        let mut ctx = ProtocolContext::new(now, &mut rng);
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            let (core, group_manager) = state.core_and_group_mut();
+            group_manager.create_group_with_protocol(
+                core,
+                &mut ctx,
+                name,
+                member_owners.into_iter().map(owner).collect(),
+                GroupProtocol::sender_key_v1(),
+            )?
+        };
+        self.publish_group_prepared_send(&result.prepared, None)?;
+        self.persist_state()?;
+        self.refresh_protocol_subscriptions()?;
+        self.sync_direct_message_subscriptions()?;
+        Ok(result)
     }
 
-    pub fn update_group_name(
-        &self,
-        group_id: &str,
-        name: String,
-    ) -> Result<RuntimeGroupSnapshotResult> {
-        self.with_state_checkpoint(|| {
-            let now = now();
-            let mut rng = OsRng;
-            let mut ctx = ProtocolContext::new(now, &mut rng);
-            let (snapshot, prepared) = {
-                let mut state = self.state.lock().unwrap();
-                let (core, group_manager) = state.core_and_group_mut();
-                let prepared = group_manager.update_name(core, &mut ctx, group_id, name)?;
-                let snapshot = group_manager
-                    .group(group_id)
-                    .ok_or_else(|| crate::DomainError::InvalidState("unknown group".to_string()))?;
-                (snapshot, prepared)
-            };
-            let mut effects = self.publish_group_prepared_send(&prepared, None)?.effects;
-            self.persist_state_now()?;
-            effects.extend(self.refresh_protocol_subscriptions()?);
-            Ok(RuntimeGroupSnapshotResult { snapshot, effects })
-        })
+    pub fn update_group_name(&self, group_id: &str, name: String) -> Result<crate::GroupSnapshot> {
+        let now = now();
+        let mut rng = OsRng;
+        let mut ctx = ProtocolContext::new(now, &mut rng);
+        let (snapshot, prepared) = {
+            let mut state = self.state.lock().unwrap();
+            let (core, group_manager) = state.core_and_group_mut();
+            let prepared = group_manager.update_name(core, &mut ctx, group_id, name)?;
+            let snapshot = group_manager
+                .group(group_id)
+                .ok_or_else(|| crate::DomainError::InvalidState("unknown group".to_string()))?;
+            (snapshot, prepared)
+        };
+        self.publish_group_prepared_send(&prepared, None)?;
+        self.persist_state()?;
+        self.refresh_protocol_subscriptions()?;
+        Ok(snapshot)
     }
 
     pub fn add_group_members(
         &self,
         group_id: &str,
         members: Vec<PublicKey>,
-    ) -> Result<RuntimeGroupSnapshotResult> {
-        self.with_state_checkpoint(|| {
-            let now = now();
-            let mut rng = OsRng;
-            let mut ctx = ProtocolContext::new(now, &mut rng);
-            let (snapshot, prepared) = {
-                let mut state = self.state.lock().unwrap();
-                let (core, group_manager) = state.core_and_group_mut();
-                let prepared = group_manager.add_members(
-                    core,
-                    &mut ctx,
-                    group_id,
-                    members.into_iter().map(owner).collect(),
-                )?;
-                let snapshot = group_manager
-                    .group(group_id)
-                    .ok_or_else(|| crate::DomainError::InvalidState("unknown group".to_string()))?;
-                (snapshot, prepared)
-            };
-            let mut effects = self.publish_group_prepared_send(&prepared, None)?.effects;
-            self.persist_state_now()?;
-            effects.extend(self.refresh_protocol_subscriptions()?);
-            effects.extend(self.sync_direct_message_subscriptions()?);
-            Ok(RuntimeGroupSnapshotResult { snapshot, effects })
-        })
+    ) -> Result<crate::GroupSnapshot> {
+        let now = now();
+        let mut rng = OsRng;
+        let mut ctx = ProtocolContext::new(now, &mut rng);
+        let (snapshot, prepared) = {
+            let mut state = self.state.lock().unwrap();
+            let (core, group_manager) = state.core_and_group_mut();
+            let prepared = group_manager.add_members(
+                core,
+                &mut ctx,
+                group_id,
+                members.into_iter().map(owner).collect(),
+            )?;
+            let snapshot = group_manager
+                .group(group_id)
+                .ok_or_else(|| crate::DomainError::InvalidState("unknown group".to_string()))?;
+            (snapshot, prepared)
+        };
+        self.publish_group_prepared_send(&prepared, None)?;
+        self.persist_state()?;
+        self.refresh_protocol_subscriptions()?;
+        self.sync_direct_message_subscriptions()?;
+        Ok(snapshot)
     }
 
     pub fn remove_group_member(
         &self,
         group_id: &str,
         member: PublicKey,
-    ) -> Result<RuntimeGroupSnapshotResult> {
-        self.with_state_checkpoint(|| {
-            let now = now();
-            let mut rng = OsRng;
-            let mut ctx = ProtocolContext::new(now, &mut rng);
-            let (snapshot, prepared) = {
-                let mut state = self.state.lock().unwrap();
-                let (core, group_manager) = state.core_and_group_mut();
-                let prepared =
-                    group_manager.remove_members(core, &mut ctx, group_id, vec![owner(member)])?;
-                let snapshot = group_manager
-                    .group(group_id)
-                    .ok_or_else(|| crate::DomainError::InvalidState("unknown group".to_string()))?;
-                (snapshot, prepared)
-            };
-            let mut effects = self.publish_group_prepared_send(&prepared, None)?.effects;
-            self.persist_state_now()?;
-            effects.extend(self.refresh_protocol_subscriptions()?);
-            Ok(RuntimeGroupSnapshotResult { snapshot, effects })
-        })
+    ) -> Result<crate::GroupSnapshot> {
+        let now = now();
+        let mut rng = OsRng;
+        let mut ctx = ProtocolContext::new(now, &mut rng);
+        let (snapshot, prepared) = {
+            let mut state = self.state.lock().unwrap();
+            let (core, group_manager) = state.core_and_group_mut();
+            let prepared =
+                group_manager.remove_members(core, &mut ctx, group_id, vec![owner(member)])?;
+            let snapshot = group_manager
+                .group(group_id)
+                .ok_or_else(|| crate::DomainError::InvalidState("unknown group".to_string()))?;
+            (snapshot, prepared)
+        };
+        self.publish_group_prepared_send(&prepared, None)?;
+        self.persist_state()?;
+        self.refresh_protocol_subscriptions()?;
+        Ok(snapshot)
     }
 
     pub fn set_group_admin(
@@ -1207,29 +973,27 @@ impl NdrRuntime {
         group_id: &str,
         member: PublicKey,
         is_admin: bool,
-    ) -> Result<RuntimeGroupSnapshotResult> {
-        self.with_state_checkpoint(|| {
-            let now = now();
-            let mut rng = OsRng;
-            let mut ctx = ProtocolContext::new(now, &mut rng);
-            let (snapshot, prepared) = {
-                let mut state = self.state.lock().unwrap();
-                let (core, group_manager) = state.core_and_group_mut();
-                let prepared = if is_admin {
-                    group_manager.add_admins(core, &mut ctx, group_id, vec![owner(member)])?
-                } else {
-                    group_manager.remove_admins(core, &mut ctx, group_id, vec![owner(member)])?
-                };
-                let snapshot = group_manager
-                    .group(group_id)
-                    .ok_or_else(|| crate::DomainError::InvalidState("unknown group".to_string()))?;
-                (snapshot, prepared)
+    ) -> Result<crate::GroupSnapshot> {
+        let now = now();
+        let mut rng = OsRng;
+        let mut ctx = ProtocolContext::new(now, &mut rng);
+        let (snapshot, prepared) = {
+            let mut state = self.state.lock().unwrap();
+            let (core, group_manager) = state.core_and_group_mut();
+            let prepared = if is_admin {
+                group_manager.add_admins(core, &mut ctx, group_id, vec![owner(member)])?
+            } else {
+                group_manager.remove_admins(core, &mut ctx, group_id, vec![owner(member)])?
             };
-            let mut effects = self.publish_group_prepared_send(&prepared, None)?.effects;
-            self.persist_state_now()?;
-            effects.extend(self.refresh_protocol_subscriptions()?);
-            Ok(RuntimeGroupSnapshotResult { snapshot, effects })
-        })
+            let snapshot = group_manager
+                .group(group_id)
+                .ok_or_else(|| crate::DomainError::InvalidState("unknown group".to_string()))?;
+            (snapshot, prepared)
+        };
+        self.publish_group_prepared_send(&prepared, None)?;
+        self.persist_state()?;
+        self.refresh_protocol_subscriptions()?;
+        Ok(snapshot)
     }
 
     pub fn send_group_message(
@@ -1237,26 +1001,20 @@ impl NdrRuntime {
         group_id: &str,
         payload: Vec<u8>,
         inner_event_id: Option<String>,
-    ) -> Result<RuntimePublishResult> {
-        self.with_state_checkpoint(|| {
-            let now = now();
-            let mut rng = OsRng;
-            let mut ctx = ProtocolContext::new(now, &mut rng);
-            let prepared = {
-                let mut state = self.state.lock().unwrap();
-                let (core, group_manager) = state.core_and_group_mut();
-                group_manager.send_message(core, &mut ctx, group_id, payload)?
-            };
-            let mut result = self.publish_group_prepared_send(&prepared, inner_event_id)?;
-            self.persist_state_now()?;
-            result
-                .effects
-                .extend(self.refresh_protocol_subscriptions()?);
-            result
-                .effects
-                .extend(self.sync_direct_message_subscriptions()?);
-            Ok(result)
-        })
+    ) -> Result<Vec<String>> {
+        let now = now();
+        let mut rng = OsRng;
+        let mut ctx = ProtocolContext::new(now, &mut rng);
+        let prepared = {
+            let mut state = self.state.lock().unwrap();
+            let (core, group_manager) = state.core_and_group_mut();
+            group_manager.send_message(core, &mut ctx, group_id, payload)?
+        };
+        let ids = self.publish_group_prepared_send(&prepared, inner_event_id)?;
+        self.persist_state()?;
+        self.refresh_protocol_subscriptions()?;
+        self.sync_direct_message_subscriptions()?;
+        Ok(ids)
     }
 
     pub fn group_handle_incoming_payload(
@@ -1264,14 +1022,13 @@ impl NdrRuntime {
         payload: &[u8],
         from_owner_pubkey: PublicKey,
         from_sender_device_pubkey: Option<PublicKey>,
-    ) -> Result<Vec<GroupIncomingEvent>> {
-        Ok(self
-            .group_handle_incoming_payload_outcome(
-                payload,
-                from_owner_pubkey,
-                from_sender_device_pubkey,
-            )?
-            .events)
+    ) -> Vec<GroupIncomingEvent> {
+        self.group_handle_incoming_payload_outcome(
+            payload,
+            from_owner_pubkey,
+            from_sender_device_pubkey,
+        )
+        .events
     }
 
     pub fn group_handle_incoming_payload_outcome(
@@ -1279,22 +1036,7 @@ impl NdrRuntime {
         payload: &[u8],
         from_owner_pubkey: PublicKey,
         from_sender_device_pubkey: Option<PublicKey>,
-    ) -> Result<GroupPairwiseHandleOutcome> {
-        self.with_state_checkpoint(|| {
-            self.group_handle_incoming_payload_outcome_inner(
-                payload,
-                from_owner_pubkey,
-                from_sender_device_pubkey,
-            )
-        })
-    }
-
-    fn group_handle_incoming_payload_outcome_inner(
-        &self,
-        payload: &[u8],
-        from_owner_pubkey: PublicKey,
-        from_sender_device_pubkey: Option<PublicKey>,
-    ) -> Result<GroupPairwiseHandleOutcome> {
+    ) -> GroupPairwiseHandleOutcome {
         let is_group_payload = self
             .state
             .lock()
@@ -1305,12 +1047,8 @@ impl NdrRuntime {
         let sender_device = from_sender_device_pubkey.map(device);
         let mut events = Vec::new();
         let mut persist = false;
-        let mut sender_key_resyncs = Vec::new();
         {
-            let mut rng = OsRng;
-            let mut ctx = ProtocolContext::new(now(), &mut rng);
             let mut state = self.state.lock().unwrap();
-            let before_groups = state.group_manager.groups();
             let result = match sender_device {
                 Some(device_pubkey) => state.group_manager.handle_pairwise_payload(
                     sender_owner,
@@ -1321,34 +1059,6 @@ impl NdrRuntime {
             };
             match result {
                 Ok(Some(event)) => {
-                    if let GroupIncomingEvent::MetadataUpdated(snapshot) = &event {
-                        if snapshot.protocol.is_sender_key_v1() {
-                            let previous_members = before_groups
-                                .iter()
-                                .find(|group| group.group_id == snapshot.group_id)
-                                .map(|group| group.members.iter().copied().collect::<BTreeSet<_>>())
-                                .unwrap_or_default();
-                            let newly_added = snapshot
-                                .members
-                                .iter()
-                                .copied()
-                                .filter(|member| !previous_members.contains(member))
-                                .collect::<Vec<_>>();
-                            if !newly_added.is_empty() {
-                                let (core, group_manager) = state.core_and_group_mut();
-                                if let Ok(Some(prepared)) = group_manager
-                                    .distribute_existing_sender_key_to_members(
-                                        core,
-                                        &mut ctx,
-                                        &snapshot.group_id,
-                                        newly_added,
-                                    )
-                                {
-                                    sender_key_resyncs.push(prepared);
-                                }
-                            }
-                        }
-                    }
                     events.push(event);
                     persist = true;
                 }
@@ -1371,35 +1081,23 @@ impl NdrRuntime {
         }
         if !events.is_empty() {
             events.extend(self.retry_pending_group_pairwise_payloads());
-            let sender_key_retry = self.retry_pending_group_sender_key_messages();
-            persist |= sender_key_retry.changed;
-            events.extend(sender_key_retry.events);
-        }
-        let mut effects = Vec::new();
-        for prepared in sender_key_resyncs {
-            let result = self.publish_group_prepared_send(&prepared, None)?;
-            effects.extend(result.effects);
+            events.extend(self.retry_pending_group_sender_key_messages());
         }
         if persist || !events.is_empty() {
-            self.persist_state_now()?;
+            let _ = self.persist_state();
         }
         if !events.is_empty() {
-            effects.extend(self.refresh_protocol_subscriptions()?);
+            let _ = self.refresh_protocol_subscriptions();
         }
-        Ok(GroupPairwiseHandleOutcome {
+        GroupPairwiseHandleOutcome {
             events,
             consumed: is_group_payload,
-            effects,
-        })
+        }
     }
 
-    pub fn group_handle_outer_event(&self, outer: &Event) -> Result<RuntimeGroupIncomingResult> {
-        self.with_state_checkpoint(|| self.group_handle_outer_event_inner(outer))
-    }
-
-    fn group_handle_outer_event_inner(&self, outer: &Event) -> Result<RuntimeGroupIncomingResult> {
+    pub fn group_handle_outer_event(&self, outer: &Event) -> Vec<GroupIncomingEvent> {
         let Ok(parsed) = nostr_codec::parse_group_sender_key_message_event(outer) else {
-            return Ok(RuntimeGroupIncomingResult::default());
+            return Vec::new();
         };
         let Some(message) = self.group_sender_key_message_from_parsed(&parsed) else {
             let mut state = self.state.lock().unwrap();
@@ -1407,12 +1105,8 @@ impl NdrRuntime {
                 state.pending_group_sender_key_messages.push(parsed);
             }
             drop(state);
-            self.persist_state_now()?;
-            return Ok(RuntimeGroupIncomingResult {
-                events: Vec::new(),
-                effects: Vec::new(),
-                consumed: true,
-            });
+            let _ = self.persist_state();
+            return Vec::new();
         };
         let mut state = self.state.lock().unwrap();
         match state
@@ -1421,44 +1115,27 @@ impl NdrRuntime {
         {
             Ok(GroupSenderKeyHandleResult::Event(event)) => {
                 drop(state);
-                self.persist_state_now()?;
-                let effects = self.refresh_protocol_subscriptions()?;
-                Ok(RuntimeGroupIncomingResult {
-                    events: vec![event],
-                    effects,
-                    consumed: true,
-                })
+                let _ = self.persist_state();
+                let _ = self.refresh_protocol_subscriptions();
+                vec![event]
             }
             Ok(GroupSenderKeyHandleResult::PendingDistribution { .. }) => {
                 if !state.pending_group_sender_key_messages.contains(&parsed) {
                     state.pending_group_sender_key_messages.push(parsed);
                 }
                 drop(state);
-                self.persist_state_now()?;
-                Ok(RuntimeGroupIncomingResult {
-                    events: Vec::new(),
-                    effects: Vec::new(),
-                    consumed: true,
-                })
+                let _ = self.persist_state();
+                Vec::new()
             }
             Ok(GroupSenderKeyHandleResult::PendingRevision { .. }) => {
                 if !state.pending_group_sender_key_messages.contains(&parsed) {
                     state.pending_group_sender_key_messages.push(parsed);
                 }
                 drop(state);
-                self.persist_state_now()?;
-                Ok(RuntimeGroupIncomingResult {
-                    events: Vec::new(),
-                    effects: Vec::new(),
-                    consumed: true,
-                })
+                let _ = self.persist_state();
+                Vec::new()
             }
-            Ok(GroupSenderKeyHandleResult::Ignored) => Ok(RuntimeGroupIncomingResult {
-                events: Vec::new(),
-                effects: Vec::new(),
-                consumed: true,
-            }),
-            Err(_) => Ok(RuntimeGroupIncomingResult::default()),
+            Ok(GroupSenderKeyHandleResult::Ignored) | Err(_) => Vec::new(),
         }
     }
 
@@ -1497,15 +1174,14 @@ impl NdrRuntime {
         events
     }
 
-    fn retry_pending_group_sender_key_messages(&self) -> GroupSenderKeyRetryResult {
+    fn retry_pending_group_sender_key_messages(&self) -> Vec<GroupIncomingEvent> {
         let pending =
             std::mem::take(&mut self.state.lock().unwrap().pending_group_sender_key_messages);
         if pending.is_empty() {
-            return GroupSenderKeyRetryResult::default();
+            return Vec::new();
         }
         let mut events = Vec::new();
         let mut still_pending = Vec::new();
-        let mut changed = false;
         {
             let mut state = self.state.lock().unwrap();
             for parsed in pending {
@@ -1528,23 +1204,20 @@ impl NdrRuntime {
                     .group_manager
                     .handle_sender_key_message(message.clone())
                 {
-                    Ok(GroupSenderKeyHandleResult::Event(event)) => {
-                        events.push(event);
-                        changed = true;
-                    }
+                    Ok(GroupSenderKeyHandleResult::Event(event)) => events.push(event),
                     Ok(GroupSenderKeyHandleResult::PendingDistribution { .. }) => {
                         still_pending.push(parsed)
                     }
                     Ok(GroupSenderKeyHandleResult::PendingRevision { .. }) => {
                         still_pending.push(parsed)
                     }
-                    Ok(GroupSenderKeyHandleResult::Ignored) => changed = true,
-                    Err(_) => changed = true,
+                    Ok(GroupSenderKeyHandleResult::Ignored) => {}
+                    Err(_) => {}
                 }
             }
             state.pending_group_sender_key_messages = still_pending;
         }
-        GroupSenderKeyRetryResult { events, changed }
+        events
     }
 
     fn group_sender_key_message_from_parsed(
@@ -1565,6 +1238,10 @@ impl NdrRuntime {
             created_at: parsed.created_at,
             ciphertext: parsed.ciphertext.clone(),
         })
+    }
+
+    pub fn drain_events(&self) -> Vec<SessionManagerEvent> {
+        self.event_rx.lock().unwrap().try_iter().collect()
     }
 
     pub fn queued_message_diagnostics(
@@ -1593,7 +1270,7 @@ impl NdrRuntime {
         Ok(diagnostics)
     }
 
-    fn process_invite_event(&self, event: &Event) -> Result<Vec<RuntimeEffect>> {
+    fn process_invite_event(&self, event: &Event) -> Result<()> {
         let invite = nostr_codec::parse_invite_event(event)
             .map_err(|e| Error::InvalidEvent(e.to_string()))?;
         let invite_owner = invite
@@ -1605,15 +1282,12 @@ impl NdrRuntime {
             .unwrap()
             .core
             .observe_device_invite(owner(invite_owner), invite)?;
-        let mut effects = Vec::new();
-        self.persist_state_now()?;
-        effects.extend(self.retry_pending_outbound()?);
-        effects.extend(self.retry_pending_group_fanouts()?);
-        effects.extend(self.retry_pending_pairwise_message_events()?);
-        Ok(effects)
+        self.persist_state()?;
+        self.retry_pending_outbound()?;
+        self.retry_pending_group_fanouts()
     }
 
-    fn process_invite_response_event(&self, event: &Event) -> Result<Vec<RuntimeEffect>> {
+    fn process_invite_response_event(&self, event: &Event) -> Result<()> {
         if self
             .state
             .lock()
@@ -1621,7 +1295,7 @@ impl NdrRuntime {
             .processed_invite_response_ids
             .contains(&event.id.to_string())
         {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let envelope = nostr_codec::parse_invite_response_event(event)
             .map_err(|e| Error::InvalidEvent(e.to_string()))?;
@@ -1633,50 +1307,27 @@ impl NdrRuntime {
             .unwrap()
             .core
             .observe_invite_response(&mut ctx, &envelope)?;
-        if let Some(processed) = processed {
+        if processed.is_some() {
             self.state
                 .lock()
                 .unwrap()
                 .processed_invite_response_ids
                 .insert(event.id.to_string());
-            let mut effects = Vec::new();
-            self.persist_state_now()?;
-            if processed.claimed_owner_pubkey.is_some() {
-                effects.push(RuntimeEffect::FetchBackfill);
-            }
-            effects.extend(self.retry_pending_outbound()?);
-            effects.extend(self.retry_pending_group_fanouts()?);
-            effects.extend(self.retry_pending_pairwise_message_events()?);
-            effects.extend(self.refresh_protocol_subscriptions()?);
-            effects.extend(self.sync_direct_message_subscriptions()?);
-            return Ok(effects);
+            self.persist_state()?;
+            self.retry_pending_outbound()?;
+            self.retry_pending_group_fanouts()?;
+            self.refresh_protocol_subscriptions()?;
+            self.sync_direct_message_subscriptions()?;
         }
-        Ok(Vec::new())
+        Ok(())
     }
 
-    fn process_message_event(
-        &self,
-        event: &Event,
-        event_id: Option<String>,
-    ) -> Result<Vec<RuntimeEffect>> {
-        match self.try_process_message_event(event, event_id)? {
-            Some(effects) => Ok(effects),
-            None => self.queue_pending_pairwise_message_event(event),
-        }
-    }
-
-    fn try_process_message_event(
-        &self,
-        event: &Event,
-        event_id: Option<String>,
-    ) -> Result<Option<Vec<RuntimeEffect>>> {
+    fn process_message_event(&self, event: &Event, event_id: Option<String>) -> Result<()> {
         let envelope = nostr_codec::parse_message_event(event)
             .map_err(|e| Error::InvalidEvent(e.to_string()))?;
-        let sender_owner = match self.resolve_message_sender_owner(envelope.sender) {
-            Some(MessageSenderOwnerResolution::Verified(owner_pubkey)) => owner_pubkey,
-            Some(MessageSenderOwnerResolution::PendingUnverifiedClaim) => return Ok(None),
-            None => owner(public_device(envelope.sender)),
-        };
+        let sender_owner = self
+            .resolve_message_sender_owner(envelope.sender)
+            .unwrap_or_else(|| owner(public_device(envelope.sender)));
         let mut rng = OsRng;
         let mut ctx = ProtocolContext::new(now(), &mut rng);
         let received =
@@ -1686,21 +1337,24 @@ impl NdrRuntime {
                 .core
                 .receive(&mut ctx, sender_owner, &envelope)?;
         let Some(received) = received else {
-            return Ok(None);
+            return Ok(());
         };
+        self.persist_state()?;
+        let sender = public_owner(received.owner_pubkey);
         let (conversation_owner, payload) = decode_local_sibling_payload(&received.payload)
             .map(|(owner, payload)| (Some(owner), payload))
             .unwrap_or((None, received.payload));
         let content = String::from_utf8(payload).map_err(|e| Error::Decryption(e.to_string()))?;
-        self.stage_pending_decrypted_delivery(PendingDecryptedDelivery {
-            sender_owner: received.owner_pubkey,
-            sender_device: Some(received.device_pubkey),
-            conversation_owner: conversation_owner.map(owner),
-            content,
-            event_id,
-            created_at_ms: current_unix_millis(),
-        })
-        .map(Some)
+        self.event_tx
+            .send(SessionManagerEvent::DecryptedMessage {
+                sender,
+                sender_device: Some(public_device(received.device_pubkey)),
+                conversation_owner,
+                content,
+                event_id,
+            })
+            .map_err(|_| Error::Storage("event queue closed".to_string()))?;
+        Ok(())
     }
 
     fn prepare_and_publish(
@@ -1709,7 +1363,7 @@ impl NdrRuntime {
         remote_payload: Vec<u8>,
         local_sibling_payload: Option<Vec<u8>>,
         inner_event_id: Option<String>,
-    ) -> Result<RuntimePublishResult> {
+    ) -> Result<Vec<String>> {
         let now = now();
         let mut rng = OsRng;
         let mut ctx = ProtocolContext::new(now, &mut rng);
@@ -1748,36 +1402,21 @@ impl NdrRuntime {
             } else {
                 QueuedMessageStage::Device
             };
-            {
-                let mut state = self.state.lock().unwrap();
-                if let Some(existing) = state.pending_outbound.iter_mut().find(|pending| {
-                    same_pending_outbound(
-                        pending,
-                        recipient_owner,
-                        inner_event_id.as_deref(),
-                        &remote_payload,
-                        local_sibling_payload.as_deref(),
-                    )
-                }) {
-                    existing.reason = reason;
-                } else {
-                    state.pending_outbound.push(PendingOutbound {
-                        recipient_owner,
-                        remote_payload,
-                        local_sibling_payload,
-                        inner_event_id,
-                        created_at_ms: current_unix_millis(),
-                        reason,
-                    });
-                }
-            }
-            let mut effects = Vec::new();
-            self.persist_state_now()?;
-            effects.extend(self.refresh_protocol_subscriptions()?);
-            return Ok(RuntimePublishResult {
-                event_ids: Vec::new(),
-                effects,
-            });
+            self.state
+                .lock()
+                .unwrap()
+                .pending_outbound
+                .push(PendingOutbound {
+                    recipient_owner,
+                    remote_payload,
+                    local_sibling_payload,
+                    inner_event_id,
+                    created_at_ms: current_unix_millis(),
+                    reason,
+                });
+            self.persist_state()?;
+            self.refresh_protocol_subscriptions()?;
+            return Ok(Vec::new());
         }
 
         let mut event_ids = Vec::new();
@@ -1790,9 +1429,10 @@ impl NdrRuntime {
                 &mut event_ids,
             )?);
         }
-        let mut effects = self.stage_prepared_publishes(pending)?;
-        effects.extend(self.sync_direct_message_subscriptions()?);
-        Ok(RuntimePublishResult { event_ids, effects })
+        self.stage_prepared_publishes(pending)?;
+        self.persist_state()?;
+        self.sync_direct_message_subscriptions()?;
+        Ok(event_ids)
     }
 
     fn prepared_publishes_from_prepared(
@@ -1828,9 +1468,8 @@ impl NdrRuntime {
         &self,
         prepared: &GroupPreparedSend,
         inner_event_id: Option<String>,
-    ) -> Result<RuntimePublishResult> {
+    ) -> Result<Vec<String>> {
         let mut event_ids = Vec::new();
-        let mut effects = Vec::new();
         let queued_remote = self.queue_group_pending_fanouts(
             &prepared.group_id,
             &prepared.remote,
@@ -1842,7 +1481,7 @@ impl NdrRuntime {
             inner_event_id.clone(),
         );
         if queued_remote || queued_local {
-            self.persist_state_now()?;
+            self.persist_state()?;
         }
         let mut pending = self.group_prepared_publishes_from_prepared(
             &prepared.remote,
@@ -1854,8 +1493,8 @@ impl NdrRuntime {
             inner_event_id,
             &mut event_ids,
         )?);
-        effects.extend(self.stage_prepared_publishes(pending)?);
-        Ok(RuntimePublishResult { event_ids, effects })
+        self.stage_prepared_publishes(pending)?;
+        Ok(event_ids)
     }
 
     fn queue_group_pending_fanouts(
@@ -1928,18 +1567,15 @@ impl NdrRuntime {
         prepared: &GroupPreparedPublish,
         inner_event_id: Option<String>,
         event_ids: &mut Vec<String>,
-    ) -> Result<Vec<RuntimeEffect>> {
+    ) -> Result<()> {
         let pending =
             self.group_prepared_publishes_from_prepared(prepared, inner_event_id, event_ids)?;
         self.stage_prepared_publishes(pending)
     }
 
-    fn stage_prepared_publishes(
-        &self,
-        pending: Vec<PendingPreparedPublish>,
-    ) -> Result<Vec<RuntimeEffect>> {
+    fn stage_prepared_publishes(&self, pending: Vec<PendingPreparedPublish>) -> Result<()> {
         if pending.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         {
             let mut state = self.state.lock().unwrap();
@@ -1954,158 +1590,46 @@ impl NdrRuntime {
                 }
             }
         }
-        let mut effects = Vec::new();
-        self.persist_state_now()?;
+        self.persist_state()?;
         for next in pending {
-            effects.push(Self::prepared_publish_effect(&next));
+            self.emit_prepared_publish(&next)?;
         }
-        Ok(effects)
+        Ok(())
     }
 
-    fn queue_pending_pairwise_message_event(&self, event: &Event) -> Result<Vec<RuntimeEffect>> {
-        let event_id = event.id.to_string();
-        let changed = {
-            let mut state = self.state.lock().unwrap();
-            if state
-                .pending_pairwise_message_events
-                .iter()
-                .any(|pending| pending.event.id.to_string() == event_id)
-            {
-                false
-            } else {
-                state
-                    .pending_pairwise_message_events
-                    .push(PendingPairwiseMessageEvent {
-                        event: event.clone(),
-                        created_at_ms: current_unix_millis(),
-                    });
-                let overflow = state
-                    .pending_pairwise_message_events
-                    .len()
-                    .saturating_sub(MAX_PENDING_PAIRWISE_MESSAGE_EVENTS);
-                if overflow > 0 {
-                    state.pending_pairwise_message_events.drain(0..overflow);
-                }
-                true
-            }
-        };
-        if changed {
-            self.persist_state_now()?;
-            return Ok(vec![RuntimeEffect::FetchBackfill]);
-        }
-        Ok(Vec::new())
-    }
-
-    fn retry_pending_pairwise_message_events(&self) -> Result<Vec<RuntimeEffect>> {
-        let pending =
-            std::mem::take(&mut self.state.lock().unwrap().pending_pairwise_message_events);
-        if pending.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut effects = Vec::new();
-        let mut still_pending = Vec::new();
-        let mut drained_any = false;
-        for pending_event in pending {
-            let event_id = pending_event.event.id.to_string();
-            match self.try_process_message_event(&pending_event.event, Some(event_id))? {
-                Some(next_effects) => {
-                    drained_any = true;
-                    effects.extend(next_effects);
-                }
-                None => still_pending.push(pending_event),
-            }
-        }
-
-        self.state.lock().unwrap().pending_pairwise_message_events = still_pending;
-        if drained_any {
-            self.persist_state_now()?;
-        }
-        Ok(effects)
-    }
-
-    fn stage_pending_decrypted_delivery(
-        &self,
-        pending: PendingDecryptedDelivery,
-    ) -> Result<Vec<RuntimeEffect>> {
-        {
-            let mut state = self.state.lock().unwrap();
-            let already_pending = pending.event_id.as_ref().is_some_and(|event_id| {
-                state
-                    .pending_decrypted_deliveries
-                    .iter()
-                    .any(|existing| existing.event_id.as_ref() == Some(event_id))
-            });
-            if !already_pending {
-                state.pending_decrypted_deliveries.push(pending.clone());
-            }
-        }
-        let mut effects = Vec::new();
-        self.persist_state_now()?;
-        effects.push(Self::decrypted_delivery_effect(&pending));
-        Ok(effects)
-    }
-
-    fn pending_decrypted_delivery_effect_by_event_id(
-        &self,
-        event_id: &str,
-    ) -> Option<RuntimeEffect> {
-        self.state
-            .lock()
-            .unwrap()
-            .pending_decrypted_deliveries
-            .iter()
-            .find(|pending| pending.event_id.as_deref() == Some(event_id))
-            .map(Self::decrypted_delivery_effect)
-    }
-
-    fn replay_pending_decrypted_deliveries(&self) -> Vec<RuntimeEffect> {
-        self.state
-            .lock()
-            .unwrap()
-            .pending_decrypted_deliveries
-            .iter()
-            .map(Self::decrypted_delivery_effect)
-            .collect()
-    }
-
-    fn decrypted_delivery_effect(pending: &PendingDecryptedDelivery) -> RuntimeEffect {
-        RuntimeEffect::EmitDecrypted {
-            sender: public_owner(pending.sender_owner),
-            sender_device: pending.sender_device.map(public_device),
-            conversation_owner: pending.conversation_owner.map(public_owner),
-            content: pending.content.clone(),
-            event_id: pending.event_id.clone(),
-        }
-    }
-
-    fn replay_pending_prepared_publishes(&self) -> Vec<RuntimeEffect> {
-        self.state
+    fn replay_pending_prepared_publishes(&self) -> Result<()> {
+        let pending = self
+            .state
             .lock()
             .unwrap()
             .pending_prepared_publishes
-            .clone()
-            .into_iter()
-            .map(|pending| Self::prepared_publish_effect(&pending))
-            .collect()
-    }
-
-    fn prepared_publish_effect(pending: &PendingPreparedPublish) -> RuntimeEffect {
-        if pending.inner_event_id.is_some() || pending.target_device_id.is_some() {
-            RuntimeEffect::PublishSignedForInnerEvent {
-                event: pending.event.clone(),
-                inner_event_id: pending.inner_event_id.clone(),
-                target_device_id: pending.target_device_id.clone(),
-            }
-        } else {
-            RuntimeEffect::PublishSigned(pending.event.clone())
+            .clone();
+        for pending in pending {
+            self.emit_prepared_publish(&pending)?;
         }
+        Ok(())
     }
 
-    fn retry_pending_outbound(&self) -> Result<Vec<RuntimeEffect>> {
+    fn emit_prepared_publish(&self, pending: &PendingPreparedPublish) -> Result<()> {
+        if pending.inner_event_id.is_some() || pending.target_device_id.is_some() {
+            self.event_tx
+                .send(SessionManagerEvent::PublishSignedForInnerEvent {
+                    event: pending.event.clone(),
+                    inner_event_id: pending.inner_event_id.clone(),
+                    target_device_id: pending.target_device_id.clone(),
+                })
+                .map_err(|_| Error::Storage("event queue closed".to_string()))?;
+        } else {
+            self.event_tx
+                .send(SessionManagerEvent::PublishSigned(pending.event.clone()))
+                .map_err(|_| Error::Storage("event queue closed".to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn retry_pending_outbound(&self) -> Result<()> {
         let pending = std::mem::take(&mut self.state.lock().unwrap().pending_outbound);
         let mut still_pending = Vec::new();
-        let mut effects = Vec::new();
         for pending_send in pending {
             let result = self.prepare_and_publish(
                 pending_send.recipient_owner,
@@ -2113,9 +1637,8 @@ impl NdrRuntime {
                 pending_send.local_sibling_payload.clone(),
                 pending_send.inner_event_id.clone(),
             );
-            match result {
-                Ok(result) => effects.extend(result.effects),
-                Err(_) => still_pending.push(pending_send),
+            if result.is_err() {
+                still_pending.push(pending_send);
             }
         }
         self.state
@@ -2123,18 +1646,16 @@ impl NdrRuntime {
             .unwrap()
             .pending_outbound
             .extend(still_pending);
-        self.persist_state_now()?;
-        Ok(effects)
+        self.persist_state()
     }
 
-    fn retry_pending_group_fanouts(&self) -> Result<Vec<RuntimeEffect>> {
+    fn retry_pending_group_fanouts(&self) -> Result<()> {
         let pending = std::mem::take(&mut self.state.lock().unwrap().pending_group_fanouts);
         if pending.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         let mut still_pending = Vec::new();
-        let mut effects = Vec::new();
         for pending_fanout in pending {
             let now = now();
             let mut rng = OsRng;
@@ -2168,11 +1689,11 @@ impl NdrRuntime {
 
             let still_has_gap = !prepared.relay_gaps.is_empty();
             let mut event_ids = Vec::new();
-            effects.extend(self.publish_group_prepared(
+            self.publish_group_prepared(
                 &prepared,
                 pending_fanout.inner_event_id.clone(),
                 &mut event_ids,
-            )?);
+            )?;
             if still_has_gap {
                 still_pending.push(pending_fanout);
             }
@@ -2183,13 +1704,12 @@ impl NdrRuntime {
             .unwrap()
             .pending_group_fanouts
             .extend(still_pending);
-        self.persist_state_now()?;
-        effects.extend(self.refresh_protocol_subscriptions()?);
-        effects.extend(self.sync_direct_message_subscriptions()?);
-        Ok(effects)
+        self.persist_state()?;
+        self.refresh_protocol_subscriptions()?;
+        self.sync_direct_message_subscriptions()
     }
 
-    fn send_link_bootstrap(&self, invite_owner: PublicKey) -> Result<RuntimePublishResult> {
+    fn send_link_bootstrap(&self, invite_owner: PublicKey) -> Result<()> {
         let now = now();
         let expires_at = now.get().saturating_add(60);
         let event = pairwise_codec::typing_event(
@@ -2198,18 +1718,21 @@ impl NdrRuntime {
                 .with_expiration(expires_at),
         )
         .map_err(|e| Error::InvalidEvent(e.to_string()))?;
-        self.send_event(invite_owner, event)
+        self.send_event(invite_owner, event).map(|_| ())
     }
 
-    fn publish_local_invite_effect(&self, invite: &Invite) -> Result<RuntimeEffect> {
+    fn publish_local_invite(&self, invite: &Invite) -> Result<()> {
         let event = nostr_codec::invite_unsigned_event(invite)
             .map_err(|e| Error::InvalidEvent(e.to_string()))?;
         let keys = Keys::new(nostr::SecretKey::from_slice(&self.our_identity_key)?);
         let signed = event.sign_with_keys(&keys)?;
-        Ok(RuntimeEffect::PublishSigned(signed))
+        self.event_tx
+            .send(SessionManagerEvent::PublishSigned(signed))
+            .map_err(|_| Error::Storage("event queue closed".to_string()))?;
+        Ok(())
     }
 
-    fn refresh_protocol_subscriptions(&self) -> Result<Vec<RuntimeEffect>> {
+    fn refresh_protocol_subscriptions(&self) -> Result<()> {
         let mut filters = Vec::new();
         let owners = self.protocol_owner_pubkeys();
         if !owners.is_empty() {
@@ -2235,12 +1758,18 @@ impl NdrRuntime {
             );
         }
         if filters.is_empty() {
-            return Ok(vec![RuntimeEffect::Unsubscribe(PROTOCOL_SUBID.to_string())]);
+            self.event_tx
+                .send(SessionManagerEvent::Unsubscribe(PROTOCOL_SUBID.to_string()))
+                .map_err(|_| Error::Storage("event queue closed".to_string()))?;
+            return Ok(());
         }
-        Ok(vec![RuntimeEffect::Subscribe {
-            subid: PROTOCOL_SUBID.to_string(),
-            filters,
-        }])
+        self.event_tx
+            .send(SessionManagerEvent::Subscribe {
+                subid: PROTOCOL_SUBID.to_string(),
+                filter_json: serde_json::to_string(&filters)?,
+            })
+            .map_err(|_| Error::Storage("event queue closed".to_string()))?;
+        Ok(())
     }
 
     fn protocol_owner_pubkeys(&self) -> Vec<PublicKey> {
@@ -2289,10 +1818,7 @@ impl NdrRuntime {
             .insert(owner_pubkey);
     }
 
-    fn resolve_message_sender_owner(
-        &self,
-        sender: DevicePubkey,
-    ) -> Option<MessageSenderOwnerResolution> {
+    fn resolve_message_sender_owner(&self, sender: DevicePubkey) -> Option<OwnerPubkey> {
         let snapshot = self.state.lock().unwrap().core.snapshot();
         for user in snapshot.users {
             for record in user.devices {
@@ -2305,10 +1831,7 @@ impl NdrRuntime {
                         .iter()
                         .any(|state| session_matches_sender(state, sender))
                 {
-                    if record.claimed_owner_pubkey.is_some() {
-                        return Some(MessageSenderOwnerResolution::PendingUnverifiedClaim);
-                    }
-                    return Some(MessageSenderOwnerResolution::Verified(user.owner_pubkey));
+                    return Some(user.owner_pubkey);
                 }
             }
         }
@@ -2341,31 +1864,7 @@ impl NdrRuntime {
             .collect()
     }
 
-    fn state_checkpoint(&self) -> RuntimeState {
-        self.state.lock().unwrap().clone()
-    }
-
-    fn restore_state(&self, checkpoint: RuntimeState) {
-        *self.state.lock().unwrap() = checkpoint;
-    }
-
-    fn with_state_checkpoint<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
-        let checkpoint = self.state_checkpoint();
-        match operation() {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                self.restore_state(checkpoint);
-                Err(error)
-            }
-        }
-    }
-
-    fn persist_state_now(&self) -> Result<()> {
-        let value = self.serialize_state()?;
-        self.storage.put(RUNTIME_STATE_KEY, value)
-    }
-
-    fn serialize_state(&self) -> Result<String> {
+    fn persist_state(&self) -> Result<()> {
         let state = self.state.lock().unwrap();
         let stored = StoredRuntimeState {
             core: state.core.snapshot(),
@@ -2374,8 +1873,6 @@ impl NdrRuntime {
             pending_group_sender_key_messages: state.pending_group_sender_key_messages.clone(),
             pending_group_pairwise_payloads: state.pending_group_pairwise_payloads.clone(),
             pending_group_fanouts: state.pending_group_fanouts.clone(),
-            pending_pairwise_message_events: state.pending_pairwise_message_events.clone(),
-            pending_decrypted_deliveries: state.pending_decrypted_deliveries.clone(),
             pending_outbound: state.pending_outbound.clone(),
             processed_invite_response_ids: state
                 .processed_invite_response_ids
@@ -2389,7 +1886,8 @@ impl NdrRuntime {
                 .collect(),
             tracked_owner_pubkeys: state.tracked_owner_pubkeys.iter().copied().collect(),
         };
-        Ok(serde_json::to_string(&stored)?)
+        self.storage
+            .put(RUNTIME_STATE_KEY, serde_json::to_string(&stored)?)
     }
 }
 
@@ -2420,8 +1918,6 @@ impl RuntimeState {
             pending_group_sender_key_messages: stored.pending_group_sender_key_messages,
             pending_group_pairwise_payloads: stored.pending_group_pairwise_payloads,
             pending_group_fanouts: stored.pending_group_fanouts,
-            pending_pairwise_message_events: stored.pending_pairwise_message_events,
-            pending_decrypted_deliveries: stored.pending_decrypted_deliveries,
             pending_outbound: stored.pending_outbound,
             processed_invite_response_ids: stored
                 .processed_invite_response_ids
@@ -2442,8 +1938,6 @@ impl RuntimeState {
                 pending_group_sender_key_messages: Vec::new(),
                 pending_group_pairwise_payloads: Vec::new(),
                 pending_group_fanouts: Vec::new(),
-                pending_pairwise_message_events: Vec::new(),
-                pending_decrypted_deliveries: Vec::new(),
                 pending_outbound: Vec::new(),
                 processed_invite_response_ids: HashSet::new(),
                 latest_app_keys_created_at: HashMap::new(),
