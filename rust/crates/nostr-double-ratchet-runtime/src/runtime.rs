@@ -180,6 +180,12 @@ pub struct GroupPairwiseHandleOutcome {
     pub effects: Vec<RuntimeEffect>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct GroupSenderKeyRetryResult {
+    events: Vec<GroupIncomingEvent>,
+    changed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredRuntimeState {
     core: SessionManagerSnapshot,
@@ -1365,7 +1371,9 @@ impl NdrRuntime {
         }
         if !events.is_empty() {
             events.extend(self.retry_pending_group_pairwise_payloads());
-            events.extend(self.retry_pending_group_sender_key_messages());
+            let sender_key_retry = self.retry_pending_group_sender_key_messages();
+            persist |= sender_key_retry.changed;
+            events.extend(sender_key_retry.events);
         }
         let mut effects = Vec::new();
         for prepared in sender_key_resyncs {
@@ -1445,9 +1453,12 @@ impl NdrRuntime {
                     consumed: true,
                 })
             }
-            Ok(GroupSenderKeyHandleResult::Ignored) | Err(_) => {
-                Ok(RuntimeGroupIncomingResult::default())
-            }
+            Ok(GroupSenderKeyHandleResult::Ignored) => Ok(RuntimeGroupIncomingResult {
+                events: Vec::new(),
+                effects: Vec::new(),
+                consumed: true,
+            }),
+            Err(_) => Ok(RuntimeGroupIncomingResult::default()),
         }
     }
 
@@ -1486,14 +1497,15 @@ impl NdrRuntime {
         events
     }
 
-    fn retry_pending_group_sender_key_messages(&self) -> Vec<GroupIncomingEvent> {
+    fn retry_pending_group_sender_key_messages(&self) -> GroupSenderKeyRetryResult {
         let pending =
             std::mem::take(&mut self.state.lock().unwrap().pending_group_sender_key_messages);
         if pending.is_empty() {
-            return Vec::new();
+            return GroupSenderKeyRetryResult::default();
         }
         let mut events = Vec::new();
         let mut still_pending = Vec::new();
+        let mut changed = false;
         {
             let mut state = self.state.lock().unwrap();
             for parsed in pending {
@@ -1516,20 +1528,23 @@ impl NdrRuntime {
                     .group_manager
                     .handle_sender_key_message(message.clone())
                 {
-                    Ok(GroupSenderKeyHandleResult::Event(event)) => events.push(event),
+                    Ok(GroupSenderKeyHandleResult::Event(event)) => {
+                        events.push(event);
+                        changed = true;
+                    }
                     Ok(GroupSenderKeyHandleResult::PendingDistribution { .. }) => {
                         still_pending.push(parsed)
                     }
                     Ok(GroupSenderKeyHandleResult::PendingRevision { .. }) => {
                         still_pending.push(parsed)
                     }
-                    Ok(GroupSenderKeyHandleResult::Ignored) => {}
-                    Err(_) => {}
+                    Ok(GroupSenderKeyHandleResult::Ignored) => changed = true,
+                    Err(_) => changed = true,
                 }
             }
             state.pending_group_sender_key_messages = still_pending;
         }
-        events
+        GroupSenderKeyRetryResult { events, changed }
     }
 
     fn group_sender_key_message_from_parsed(

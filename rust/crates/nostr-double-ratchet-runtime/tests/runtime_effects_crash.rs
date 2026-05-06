@@ -5,8 +5,9 @@ use std::sync::{
 
 use nostr::{Event, Keys};
 use nostr_double_ratchet_runtime::{
-    nostr_codec, AppKeys, DeviceEntry, Error as NdrError, InMemoryStorage, NdrRuntime,
-    RuntimeEffect, StorageAdapter, INVITE_EVENT_KIND, INVITE_RESPONSE_KIND, MESSAGE_EVENT_KIND,
+    nostr_codec, AppKeys, DeviceEntry, Error as NdrError, GroupIncomingEvent, InMemoryStorage,
+    NdrRuntime, RuntimeEffect, StorageAdapter, INVITE_EVENT_KIND, INVITE_RESPONSE_KIND,
+    MESSAGE_EVENT_KIND,
 };
 use proptest::prelude::*;
 
@@ -140,6 +141,41 @@ fn prepare_alice_to_bob(
             1,
         )
         .expect("alice observes bob app keys");
+}
+
+fn deliver_group_runtime_events(events: &[Event], to: &NdrRuntime) -> Vec<GroupIncomingEvent> {
+    let mut group_events = Vec::new();
+    for event in events {
+        let outer = to
+            .group_handle_outer_event(event)
+            .expect("handle group outer");
+        if outer.consumed || !outer.events.is_empty() || !outer.effects.is_empty() {
+            group_events.extend(outer.events);
+            continue;
+        }
+        let effects = to
+            .process_received_event(event.clone())
+            .expect("process relay event");
+        for effect in effects {
+            if let RuntimeEffect::EmitDecrypted {
+                sender,
+                sender_device,
+                content,
+                ..
+            } = effect
+            {
+                let outcome = to
+                    .group_handle_incoming_payload_outcome(
+                        content.as_bytes(),
+                        sender,
+                        sender_device,
+                    )
+                    .expect("handle pairwise group payload");
+                group_events.extend(outcome.events);
+            }
+        }
+    }
+    group_events
 }
 
 #[test]
@@ -342,6 +378,76 @@ fn sender_key_outer_before_distribution_is_persisted_pending_work() {
     assert!(
         pending.effects.is_empty(),
         "unknown sender-key outer should be persisted internally without app persistence effects"
+    );
+}
+
+#[test]
+fn stale_sender_key_outer_is_consumed_without_retry_queue() {
+    let alice_owner = Keys::generate();
+    let alice_device = Keys::generate();
+    let bob_owner = Keys::generate();
+    let bob_device = Keys::generate();
+    let alice_storage = Arc::new(InMemoryStorage::new()) as Arc<dyn StorageAdapter>;
+    let bob_storage = Arc::new(InMemoryStorage::new()) as Arc<dyn StorageAdapter>;
+
+    let alice = runtime(&alice_device, alice_owner.public_key(), alice_storage);
+    let bob = runtime(&bob_device, bob_owner.public_key(), bob_storage);
+    let _alice_init = alice.init().expect("alice init");
+    prepare_alice_to_bob(
+        &alice,
+        &bob,
+        bob_owner.public_key(),
+        bob_device.public_key(),
+    );
+    bob.ingest_app_keys_snapshot(
+        alice_owner.public_key(),
+        AppKeys::new(vec![DeviceEntry::new(alice_device.public_key(), 1)]),
+        1,
+    )
+    .expect("bob observes alice app keys");
+
+    let create = alice
+        .create_group("stale sender key".to_string(), vec![bob_owner.public_key()])
+        .expect("create group");
+    let create_events = published_events(&create.effects);
+    let create_group_events = deliver_group_runtime_events(&create_events, &bob);
+    assert!(
+        create_group_events
+            .iter()
+            .any(|event| matches!(event, GroupIncomingEvent::MetadataUpdated(snapshot) if snapshot.group_id == create.group.group_id)),
+        "bob should know the group before stale sender-key replay"
+    );
+
+    let old_send = alice
+        .send_group_message(&create.group.group_id, b"old revision".to_vec(), None)
+        .expect("old group send");
+    let old_outer = published_events(&old_send.effects)
+        .into_iter()
+        .find(|event| nostr_codec::parse_group_sender_key_message_event(event).is_ok())
+        .expect("old sender-key outer");
+
+    let update = alice
+        .update_group_name(&create.group.group_id, "new revision".to_string())
+        .expect("update group");
+    let update_events = published_events(&update.effects);
+    let update_group_events = deliver_group_runtime_events(&update_events, &bob);
+    assert!(
+        update_group_events
+            .iter()
+            .any(|event| matches!(event, GroupIncomingEvent::MetadataUpdated(snapshot) if snapshot.revision >= 2)),
+        "bob should advance to a newer group revision"
+    );
+
+    let ignored = bob
+        .group_handle_outer_event(&old_outer)
+        .expect("handle stale sender-key outer");
+    assert!(
+        ignored.consumed,
+        "stale parsed sender-key outers are ignored group events and must not fall through to pairwise parsing"
+    );
+    assert!(
+        ignored.events.is_empty() && ignored.effects.is_empty(),
+        "ignored stale sender-key outer should not emit app events or retry effects"
     );
 }
 
